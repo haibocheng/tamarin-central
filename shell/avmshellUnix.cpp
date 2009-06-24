@@ -77,6 +77,8 @@ namespace avmshell
 		
 		#if defined SOLARIS
 			sp = _getsp();
+		#elif defined AVMPLUS_ARM
+			asm("mov %0, %%sp" : "=r" (sp));
 		#else
 			#ifdef AVMPLUS_64BIT
 				asm("mov %%rsp,%0" : "=r" (sp));
