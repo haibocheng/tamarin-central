@@ -61,6 +61,8 @@ namespace avmplus
 		{
 			return construct(argc,argv);
 		}
+        
+		DECLARE_SLOTS_FunctionClass;
 	};
 
 	class FunctionObject : public ClassClosure
@@ -69,16 +71,20 @@ namespace avmplus
 		FunctionObject(VTable* cvtable, MethodEnv* call) : ClassClosure(cvtable), _call(call) { AvmAssert(_call != NULL); }
 		Atom AS3_call(Atom thisAtom, Atom *argv, int argc);
 		Atom AS3_apply(Atom thisAtom, Atom argArray);
-#ifdef DEBUGGER
+#if defined(DEBUGGER) || defined(VMCFG_AOT)
 		virtual MethodEnv* getCallMethodEnv() { return _call; }
 #endif
 		virtual Atom construct(int argc, Atom* argv);
 		virtual Atom call(int argc, Atom* argv);
+		virtual CodeContext* getFunctionCodeContext() const;
 		int get_length();
+		virtual Stringp implToString() const;
 	protected:
 		virtual Atom get_coerced_receiver(Atom a);
 	protected:
 		DWB(MethodEnv*) _call;
+		
+		DECLARE_SLOTS_FunctionObject;
 	};
 }
 

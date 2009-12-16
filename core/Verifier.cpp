@@ -36,17 +36,10 @@
  * ***** END LICENSE BLOCK ***** */
 
 #include "avmplus.h"
-
-#if defined FEATURE_NANOJIT
-    #include "CodegenLIR.h"
-#endif
-
-#include "FrameState.h"
+#include "FrameState.h" // FIXME required because FrameState has dependencies on the jitters
 
 namespace avmplus
 {
-#undef DEBUG_EARLY_BINDING
-
 #ifdef AVMPLUS_VERIFYALL
 	class VerifyallWriter : public NullWriter {
 		MethodInfo *info;
@@ -67,7 +60,7 @@ namespace avmplus
 
 		void writeOp1(FrameState* state, const byte *pc, AbcOpcode opcode, uint32_t opd1, Traits *type) {
 			if (opcode == OP_newfunction) {
-				MethodInfo *f = type->pool->getMethodInfo(opd1);
+				MethodInfo *f = info->pool()->getMethodInfo(opd1);
 				AvmAssert(f->declaringTraits() == type);
 				core->enqFunction(f);
 				core->enqTraits(type);
@@ -87,11 +80,12 @@ namespace avmplus
     }
 #endif
     
-    Verifier::Verifier(MethodInfo* info, Toplevel* toplevel
+    Verifier::Verifier(MethodInfo* info, Toplevel* toplevel, AbcEnv* abc_env
 #ifdef AVMPLUS_VERBOSE
         , bool secondTry
 #endif
-        ) : ms(info->getMethodSignature())
+        ) : blockStates(NULL)
+		  , ms(info->getMethodSignature())
     {
 #ifdef AVMPLUS_VERBOSE
         this->secondTry = secondTry;
@@ -100,9 +94,20 @@ namespace avmplus
 		this->core   = info->pool()->core;
         this->pool   = info->pool();
         this->toplevel = toplevel;
+        this->abc_env  = abc_env;
+
+		// do these checks early before we allocate any resources.
+		if (!info->abc_body_pos()) {
+			// no body was supplied in abc
+			toplevel->throwVerifyError(kNotImplementedError, core->toErrorString(info));
+		}
+        if (info->declaringTraits() == NULL) {
+            // scope hasn't been captured yet.
+            verifyFailed(kCannotVerifyUntilReferencedError);
+        }
 
         #ifdef AVMPLUS_VERBOSE
-        this->verbose = pool->verbose;
+        this->verbose = pool->isVerbose(VB_verify);
         #endif
 
         max_stack = ms->max_stack();
@@ -125,33 +130,22 @@ namespace avmplus
         
         exceptions_pos = pos;
 
-        blockStates = NULL;
         state       = NULL;
         labelCount = 0;
 
-        if (info->declaringTraits() == NULL)
-        {
-            // scope hasn't been captured yet.
-            verifyFailed(kCannotVerifyUntilReferencedError);
-        }
+		#ifdef VMCFG_PRECOMP_NAMES
+		pool->initPrecomputedMultinames();
+		#endif
     }
 
     Verifier::~Verifier()
     {
-        if (blockStates)
-        {
-            MMgc::GC* gc = core->GetGC();
-            for(int i=0, n=blockStates->size(); i<n; i++)
-            {
-                FrameState* state = blockStates->at(i);
-                if (state)
-                {
-                    gc->Free(state);
-                }
-            }
-            blockStates->clear();
-            delete blockStates;
-        }
+		mmfx_delete( this->state );
+		if (blockStates) {
+			for(int i = 0, n=blockStates->size(); i < n; i++)
+				mmfx_delete( blockStates->at(i) );
+			delete blockStates;
+		}
     }
 
     /**
@@ -211,11 +205,7 @@ namespace avmplus
 
 		this->coder = coder;
 
-        if ( (state = newFrameState()) == 0 ){
-            verifyFailed(kCorruptABCError);
-        }
-        for (int i=0, n=frameSize; i < n; i++)
-            state->setType(i, NULL);
+	state = mmfx_new( FrameState(this) );
 
         if (info->needRest())
         {
@@ -260,8 +250,7 @@ namespace avmplus
         // initial scope chain types 
         int outer_depth = 0;
 
-        const ScopeTypeChain* scope = info->declaringScope();
-        if (!scope && info->declaringTraits()->init != info)
+        if (info->hasNoScopeAndNotClassInitializer())
         {
             // this can occur when an activation scope inside a class instance method
             // contains a nested getter, setter, or method.  In that case the scope 
@@ -271,21 +260,14 @@ namespace avmplus
             verifyFailed(kNoScopeError, core->toErrorString(info));
         }
 
+        const ScopeTypeChain* scope = info->declaringScope();
         state->scopeDepth = outer_depth;
 
         // resolve catch block types
         parseExceptionHandlers();
 
-        // Save initial state
-        FrameState* initialState = newFrameState();
-        if( !initialState->init(state) ) 
-            verifyFailed(kCorruptABCError);
-
         int actualCount = 0;
         blockEnd = false;    // extended basic block ending
-
-        // always load the entry state, no merge on second pass
-    	state->init(initialState);
 
 		TRY(core, kCatchAction_Rethrow) {
 
@@ -314,8 +296,8 @@ namespace avmplus
 			}
 
 			bool unreachable = false;
-			FrameState* blockState;
-			if ( blockStates && (blockState = blockStates->get((uintptr)pc)) != 0 )
+			FrameState* blockState = blockStates ? blockStates->get(pc) : NULL;
+			if (blockState)
 			{
 				if (!blockEnd || !blockState->initialized)
 				{
@@ -330,7 +312,7 @@ namespace avmplus
 				// now load the merged state
 				state->init(blockState);
 				state->targetOfBackwardsBranch = blockState->targetOfBackwardsBranch;
-				state->pc = pc - code_pos;
+				state->pc = (int)(pc - code_pos);
 
 				// found the start of a new basic block
 				coder->writeBlockStart(state);
@@ -347,8 +329,8 @@ namespace avmplus
                         // free the block early.
                     #else
                         // lir and translator are okay with this
-						blockStates->remove((uintptr)pc);
-						core->GetGC()->Free(blockState);
+						blockStates->remove(pc);
+						mmfx_delete( blockState );
                     #endif
 				}
 			}
@@ -364,7 +346,7 @@ namespace avmplus
 				}
 			}
 
-			state->pc = pc - code_pos;
+			state->pc = (int)(pc - code_pos);
 			int sp = state->sp();
 
 			if (info->abc_exceptions())
@@ -385,9 +367,9 @@ namespace avmplus
 							// TODO check stack is empty because catch handlers assume so.
 							int saveStackDepth = state->stackDepth;
 							int saveScopeDepth = state->scopeDepth;
+							Value stackEntryZero = saveStackDepth > 0 ? state->stackValue(0) : state->value(0);
 							state->stackDepth = 0;
 							state->scopeDepth = outer_depth;
-							Value stackEntryZero = state->stackValue(0);
 
 							// add edge from try statement to catch block
 							const byte* target = code_pos + handler->target;
@@ -399,13 +381,14 @@ namespace avmplus
 
 							state->stackDepth = saveStackDepth;
 							state->scopeDepth = saveScopeDepth;
-							state->stackValue(0) = stackEntryZero;
+							if (saveStackDepth > 0)
+								state->stackValue(0) = stackEntryZero;
 
 							// Search forward for OP_killreg in the try block
 							// Set these registers to killed in the catch state
 							if (pc == code_pos + handler->from)
 							{
-								FrameState *catchState = blockStates->get((uintptr)target);
+								FrameState *catchState = blockStates->get(target);
 								AvmAssert(catchState != 0);
 
                                 for (const byte *temp = pc; temp <= code_pos + handler->to; )
@@ -629,7 +612,7 @@ namespace avmplus
 				if (imm30 == 0 || imm30 >= pool->constantStringCount)
 					verifyFailed(kCpoolIndexRangeError, core->toErrorString(imm30), core->toErrorString(pool->constantStringCount));
 				coder->write(state, pc, opcode);
-				state->push(STRING_TYPE, pool->cpool_string[imm30] != NULL);
+				state->push(STRING_TYPE, pool->getString(imm30) != NULL);
 				break;
 
 			case OP_pushint: 
@@ -690,20 +673,24 @@ namespace avmplus
 				break;
 			}
 			case OP_getlocal:
+			{
 				checkStack(0,1);
+				Value& v = checkLocal(imm30);
 				coder->write(state, pc, opcode);
-				state->push(checkLocal(imm30));
+				state->push(v);
 				break;
-
+			}
 			case OP_getlocal0:
 			case OP_getlocal1:
 			case OP_getlocal2:
 			case OP_getlocal3:
+			{
 				checkStack(0,1);
+				Value& v = checkLocal(opcode-OP_getlocal0);
 				coder->write(state, pc, opcode);
-				state->push(checkLocal(opcode-OP_getlocal0));
+				state->push(v);
 				break;
-			
+			}
 			case OP_kill:
 			{
 				//checkStack(0,0)
@@ -735,24 +722,8 @@ namespace avmplus
 				checkStack(0,1);
 				MethodInfo* f = checkMethodInfo(imm30);
 				// duplicate-function-definition handling now happens inside makeIntoPrototypeFunction()
-				f->makeIntoPrototypeFunction(toplevel);
-				Traits* ftraits = f->declaringTraits();
-				// make sure the traits of the base vtable matches the base traits
-				// This is also caught by an assert in VTable.cpp, however that turns
-				// out to be too late and may cause crashes
-				if (toplevel->functionClass != 0 &&
-                    ftraits->base != toplevel->functionClass->ivtable()->traits )
-				{
-					AvmAssertMsg(0, "Verify failed:OP_newfunction");
- 					if (toplevel->verifyErrorClass() != NULL)
- 						verifyFailed(kInvalidBaseClassError);
-				}
-				ftraits->set_scope(ScopeTypeChain::create(core->GetGC(), scope, state, NULL, NULL));
-				if (f->activationTraits())
-				{
-					// ISSUE - if nested functions, need to capture scope, not make a copy
-					f->activationTraits()->set_scope(ftraits->scope());
-				}
+				const ScopeTypeChain* fscope = ScopeTypeChain::create(core->GetGC(), core->traits.function_itraits, scope, state, NULL, NULL);
+				Traits* ftraits = f->makeIntoPrototypeFunction(toplevel, fscope);
 				coder->writeOp1(state, pc, opcode, imm30, ftraits);
 				state->push(ftraits, true);
 				break;
@@ -796,7 +767,7 @@ namespace avmplus
 				Traits *itraits = ctraits->itraits;
 
 				// add a type constraint for the "this" scope of static methods
-				ScopeTypeChain* cscope = ScopeTypeChain::create(core->GetGC(), scope, state, NULL, ctraits);
+				const ScopeTypeChain* cscope = ScopeTypeChain::create(core->GetGC(), ctraits, scope, state, NULL, ctraits);
 
 				if (state->scopeDepth > 0)
 				{
@@ -809,13 +780,13 @@ namespace avmplus
 				}
 
 				// add a type constraint for the "this" scope of instance methods
-				ScopeTypeChain* iscope = ScopeTypeChain::create(core->GetGC(), cscope, NULL, ctraits, itraits);
-
-				ctraits->set_scope(cscope);
-				itraits->set_scope(iscope);
+				const ScopeTypeChain* iscope = ScopeTypeChain::create(core->GetGC(), itraits, cscope, NULL, ctraits, itraits);
 
 				ctraits->resolveSignatures(toplevel);
 				itraits->resolveSignatures(toplevel);
+
+				ctraits->init_declaringScopes(cscope);
+				itraits->init_declaringScopes(iscope);
 
 				emitCoerce(CLASS_TYPE, state->sp()); 
 				coder->writeOp1(state, pc, opcode, imm30, ctraits);
@@ -834,19 +805,18 @@ namespace avmplus
 					// error, def name must be CT constant, regular name
 					verifyFailed(kIllegalOpMultinameError, core->toErrorString(opcode), core->toErrorString(&multiname));
 				}
-				coder->writeOp1(state, pc, opcode, imm30);
 				MethodInfo* script = pool->getNamedScript(&multiname);
-				if (script != (MethodInfo*)BIND_NONE && script != (MethodInfo*)BIND_AMBIGUOUS)
-				{
+				Traits* resultType;
+				if (script != (MethodInfo*)BIND_NONE && script != (MethodInfo*)BIND_AMBIGUOUS) {
 					// found a single matching traits
-					state->push(script->declaringTraits(), true);
-				}
-				else
-				{
+					resultType = script->declaringTraits();
+				} else {
 					// no traits, or ambiguous reference.  use Object, anticipating
 					// a runtime exception
-					state->push(OBJECT_TYPE, true);
+					resultType = OBJECT_TYPE;
 				}
+				coder->writeOp1(state, pc, opcode, imm30, resultType);
+				state->push(resultType, true);
 				break;
 			}
 
@@ -860,10 +830,12 @@ namespace avmplus
 
 				uint32_t n=2;
 				checkPropertyMultiname(n, multiname);
-
+				
+				Traitsp declarer = NULL;
 				Value& obj = state->peek(n);
-				Binding b = toplevel->getBinding(obj.traits, &multiname);
-				bool needsSetContext = true;
+				Binding b = (opcode == OP_initproperty) ? 
+							toplevel->getBindingAndDeclarer(obj.traits, multiname, declarer) : 
+							toplevel->getBinding(obj.traits, &multiname);
 				Traits* propTraits = readBinding(obj.traits, b);
 
 				emitCheckNull(sp-(n-1));
@@ -871,7 +843,7 @@ namespace avmplus
 				if (AvmCore::isSlotBinding(b) && 
 					// it's a var, or a const being set from the init function
 					(!AvmCore::isConstBinding(b) || 
-						(obj.traits->init == info && opcode == OP_initproperty)))
+						(opcode == OP_initproperty && declarer->init == info)))
 				{
 				    emitCoerce(propTraits, state->sp());
 					coder->writeOp2(state, pc, OP_setslot, (uint32_t)AvmCore::bindingToSlotId(b), sp-(n-1), propTraits);
@@ -898,21 +870,16 @@ namespace avmplus
 				    break;
 				}
 
-				#ifdef DEBUG_EARLY_BINDING
-				core->console << "verify setproperty " << obj.traits << " " << &multiname->getName() << " from within " << info << "\n";
-				#endif
-
 				if( obj.traits == VECTORINT_TYPE  || obj.traits == VECTORUINT_TYPE ||
 					obj.traits == VECTORDOUBLE_TYPE )
 				{
 					bool attr = multiname.isAttr();
 					Traits* indexType = state->value(state->sp()-1).traits;
 
-					bool maybeIntegerIndex = !attr && multiname.isRtname() && multiname.contains(core->publicNamespace);
-
+					// NOTE a dynamic name should have the same version as the current pool
+					bool maybeIntegerIndex = !attr && multiname.isRtname() && multiname.containsAnyPublicNamespace();
 					if( maybeIntegerIndex && (indexType == UINT_TYPE || indexType == INT_TYPE) )
 					{
-						needsSetContext = false;
 						if(obj.traits == VECTORINT_TYPE)
 							emitCoerce(INT_TYPE, state->sp());
 						else if(obj.traits == VECTORUINT_TYPE)
@@ -924,9 +891,6 @@ namespace avmplus
 
 				// default - do getproperty at runtime
 
-				if (needsSetContext)
-				    coder->writeSetContext(state, NULL);
-		
 				coder->writeOp2(state, pc, opcode, imm30, n, propTraits);
 				state->pop(n);
 				break;
@@ -1096,9 +1060,8 @@ namespace avmplus
 				// resolve operand into a traits, and test if value is that type
 				checkTypeName(imm30); // CONSTANT_Multiname
 				coder->write(state, pc, opcode);
-				state->pop(2);
-				state->push(OBJECT_TYPE);
-				state->push(INT_TYPE);
+				state->pop(1);
+				state->push(BOOLEAN_TYPE);
 				break;
 
 			case OP_istypelate: 
@@ -1123,12 +1086,20 @@ namespace avmplus
 				checkStack(1,1);
 				// this is the ECMA ToString and ToXMLString operators, so the result must not be null
 				// (ToXMLString is split into two variants - escaping elements and attributes)
-				emitToString(opcode, sp, pc);     // lir only
-				coder->write(state, pc, opcode);  // wc only
+				coder->write(state, pc, opcode);
+				state->pop_push(1, STRING_TYPE, true);
 				break;
 
 			case OP_callstatic: 
 			{
+                //  Ensure that the method is eligible for callstatic.
+                //  Note: This fails when called by verifyEarly(), since the
+                //  data structures being checked have not been initialized.
+                //  Need to either rearrange the initialization sequence or 
+                //  mark this verify pass as "needs late retry."
+                if ( ! abc_env->getMethod(imm30) )
+                    verifyFailed(kCorruptABCError);
+
 				MethodInfo* m = checkMethodInfo(imm30);
 				const uint32_t argc = imm30b;
 				checkStack(argc+1, 1);
@@ -1138,6 +1109,8 @@ namespace avmplus
 				{
 					verifyFailed(kDanglingFunctionError, core->toErrorString(m), core->toErrorString(info));
 				}
+
+				emitCoerceArgs(m, argc);
 
 				Traits *resultType = mms->returnTraits();
 				emitCheckNull(sp-argc);
@@ -1289,11 +1262,6 @@ namespace avmplus
 					MethodSignaturep mms = m->getMethodSignature();
 					resultType = mms->returnTraits();
 				}
-				else {
-                    #ifdef DEBUG_EARLY_BINDING
-				    core->console << "verify callsuper " << base << " " << multiname.getName() << " from within " << info << "\n";
-                    #endif
-				}
 
 				emitCheckNull(sp-(n-1));
 				coder->writeOp2(state, pc, opcode, imm30, argc, base);
@@ -1373,7 +1341,6 @@ namespace avmplus
 				AvmAssert(f != NULL);
 
 				emitCoerceArgs(f, argc);
-				coder->writeSetContext(state, f);
 				emitCheckNull(sp-argc);
 				coder->writeOp2(state, pc, opcode, 0, argc, baseTraits);				
 				state->pop(argc+1);
@@ -1412,7 +1379,7 @@ namespace avmplus
 				{
 					// extra constraints on type of pushscope allowed
 					Traits* requiredType = scope->getScopeTraitsAt(scope->size+state->scopeDepth);
-					if (!scopeTraits || !scopeTraits->containsInterface(requiredType))
+					if (!scopeTraits || !scopeTraits->subtypeof(requiredType))
 					{
 						verifyFailed(kIllegalOperandTypeError, core->toErrorString(scopeTraits), core->toErrorString(requiredType));
 					}
@@ -1452,9 +1419,9 @@ namespace avmplus
 				checkStack(0, 1);
 				if (!info->needActivation())
 					verifyFailed(kInvalidNewActivationError);
-				info->activationTraits()->resolveSignatures(toplevel);
-				coder->write(state, pc, opcode, info->activationTraits());
-				state->push(info->activationTraits(), true);
+				Traits* atraits = info->resolveActivation(toplevel);
+				coder->write(state, pc, opcode, atraits);
+				state->push(atraits, true);
 				break;
 			}
 			case OP_newcatch: 
@@ -1656,16 +1623,12 @@ namespace avmplus
 				Traits* rhst = rhs.traits;
 				if ((lhst == STRING_TYPE && lhs.notNull) || (rhst == STRING_TYPE && rhs.notNull))
 				{
-				    emitToString(OP_convert_s, sp-1, pc);
-					emitToString(OP_convert_s, sp, pc);
-					coder->write(state, pc, OP_concat, STRING_TYPE);
+					coder->write(state, pc, OP_add, STRING_TYPE);
 					state->pop_push(2, STRING_TYPE, true);
 				}
 				else if (lhst && lhst->isNumeric() && rhst && rhst->isNumeric())
 				{
-				    emitCoerce(NUMBER_TYPE, sp-1);
-					emitCoerce(NUMBER_TYPE, sp);
-					coder->write(state, pc, OP_add_d, NUMBER_TYPE);
+					coder->write(state, pc, OP_add, NUMBER_TYPE);
 					state->pop_push(2, NUMBER_TYPE);
 				}
 				else
@@ -1826,6 +1789,20 @@ namespace avmplus
 			// loads
 			case OP_li8:
 			case OP_li16:
+                if (pc+1 < code_end && 
+                    ((opcode == OP_li8 && pc[1] == OP_sxi8) || (opcode == OP_li16 && pc[1] == OP_sxi16)))
+                {
+                    checkStack(1,1);
+                    emitCoerce(INT_TYPE, sp);
+                    coder->write(state, pc, (opcode == OP_li8) ? OP_lix8 : OP_lix16);
+                    state->pop_push(1, INT_TYPE);
+                    // ++pc; // do not skip the sign-extend; if it's the target
+                    // of an implicit label, skipping it would cause verification failure.
+                    // instead, just emit it, and rely on LIR to ignore sxi instructions
+                    // in these situations.
+                    break;
+                }
+                // else fall thru
 			case OP_li32:
 			case OP_lf32:
 			case OP_lf64:
@@ -1950,10 +1927,10 @@ namespace avmplus
 		emitCheckNull(sp-(n-1));
 		
 		if (emitCallpropertyMethod(opcode, t, b, multiname, multiname_index, argc, pc))
-			goto callproperty_done;
+			return;
 		
 		if (emitCallpropertySlot(opcode, sp, t, b, argc, pc))
-			goto callproperty_done;
+			return;
 
 		coder->writeOp2(state, pc, opcode, multiname_index, argc);
 
@@ -1961,12 +1938,6 @@ namespace avmplus
 		state->pop_push(n, NULL);
 		if (opcode == OP_callpropvoid)
 			state->pop();
-		
-	callproperty_done:
-		;
-        #ifdef DEBUG_EARLY_BINDING
-		core->console << "verify callproperty " << t << " " << multiname->getName() << " from within " << info << "\n";
-        #endif
 	}
 
 	bool Verifier::emitCallpropertyMethod(AbcOpcode opcode, Traits* t, Binding b, Multiname& multiname, uint32_t multiname_index, uint32_t argc, const byte* pc) 
@@ -1993,8 +1964,7 @@ namespace avmplus
 		Traits* resultType = mms->returnTraits();
 
 		emitCoerceArgs(m, argc);
-		coder->writeSetContext(state, m);
-		if (!t->isInterface)
+		if (!t->isInterface())
 		{
 		    coder->writeOp2(state, pc, OP_callmethod, disp_id, argc, resultType);
 			if (opcode == OP_callpropvoid)
@@ -2054,8 +2024,7 @@ namespace avmplus
 		else
 		if (slotType == core->traits.string_ctraits)
 		{
-   		    emitToString(OP_convert_s, sp, pc);     // lir only
-			coder->write(state, pc, OP_convert_s);  // wc only
+			coder->write(state, pc, OP_convert_s);
 			state->setType(sp, STRING_TYPE, true); 
 		}
 		else
@@ -2216,12 +2185,6 @@ namespace avmplus
 			state->pop_push(n, propType);
 			return;
 		}
-
-		#ifdef DEBUG_EARLY_BINDING
-		core->console << "verify getproperty " << obj.traits << " " << multiname->getName() << " from within " << info << "\n";
-		#endif
-
-		bool needsSetContext = true;
 		if( !propType )
 		{
 			if( obj.traits == VECTORINT_TYPE  || obj.traits == VECTORUINT_TYPE ||
@@ -2229,12 +2192,10 @@ namespace avmplus
 			{
 				bool attr = multiname.isAttr();
 				Traits* indexType = state->value(state->sp()).traits;
-
-				bool maybeIntegerIndex = !attr && multiname.isRtname() && multiname.contains(core->publicNamespace);
-
+				// NOTE a dynamic name should have the same version as the current pool
+				bool maybeIntegerIndex = !attr && multiname.isRtname() && multiname.containsAnyPublicNamespace();
 				if( maybeIntegerIndex && (indexType == UINT_TYPE || indexType == INT_TYPE) )
 				{
-					needsSetContext = false;
 					if(obj.traits == VECTORINT_TYPE)
 						propType = INT_TYPE;
 					else if(obj.traits == VECTORUINT_TYPE)
@@ -2247,9 +2208,6 @@ namespace avmplus
 
 		// default - do getproperty at runtime
 
-		if (needsSetContext)
-			coder->writeSetContext(state, NULL);
-		
 		coder->writeOp2(state, pc, OP_getproperty, imm30, n, propType);
 		state->pop_push(n, propType);
 	}
@@ -2282,41 +2240,21 @@ namespace avmplus
 		}
 	}
 
-	FrameState *Verifier::getFrameState(sintptr targetpc)
+	FrameState *Verifier::getFrameState(int target_off)
 	{
-		const byte *target = code_pos + targetpc;
+		if (!blockStates)
+			blockStates = new (core->GetGC()) GCSortedMap<const byte*, FrameState*, LIST_NonGCObjects>(core->GetGC());
+		const byte *target = code_pos + target_off;
 		FrameState *targetState;
 		// get state for target address or create a new one if none exists
-		if (!blockStates)
+		if ( (targetState = blockStates->get(target)) == 0 ) 
 		{
-			blockStates = new (core->GetGC()) SortedIntMap<FrameState*>(core->GetGC(), 128);
-		}
-		if ( (targetState = blockStates->get((uintptr)target)) == 0 ) 
-		{
-			targetState = newFrameState();
-			targetState->pc = target - code_pos;
-			blockStates->put((uintptr)target, targetState);
+			targetState = mmfx_new( FrameState(this) );
+			targetState->pc = int(target - code_pos);
+			blockStates->put(target, targetState);
 			labelCount++;
 		}
 		return targetState;
-	}
-	
-    // NOTE CodegenLIR implements string conv using writeOp1() while
-    // WordcodeEmitter implements it using write(). so this method
-    // only emits lir. this is necessary because the semantics of 
-    // string conversion are different in the interpreter than they
-    // are in lir.
-	void Verifier::emitToString(AbcOpcode opcode, int i, const byte *pc)
-	{
-		Traits *st = STRING_TYPE;
-		Value& value = state->value(i);
-		Traits *in = value.traits;
-		if (in != st || !value.notNull || opcode != OP_convert_s)
-		{
-		    coder->writeOp1(state, pc, opcode, i, in);  // lir only
-			value.traits = st;
-			value.notNull = true;
-		}
 	}
 
     #if defined FEATURE_NANOJIT
@@ -2326,13 +2264,17 @@ namespace avmplus
 		if (!value.notNull)
 		{
 		    coder->writeCheckNull(state, i);
-			for (int j=0, n = frameSize; j < n; j++) 
-			{
-				// also mark all copies of value.ins as non-null
-				Value &v2 = state->value(j);
-				if (v2.ins == value.ins)
-					v2.notNull = true;
-			}
+			value.notNull = true;
+            if (value.ins != NULL)
+            {
+                for (int j=0, n = frameSize; j < n; j++) 
+                {
+                    // also mark all copies of value.ins as non-null
+                    Value &v2 = state->value(j);
+                    if (v2.ins == value.ins)
+                        v2.notNull = true;
+                }
+            }
 		}
 	}
     #else
@@ -2555,7 +2497,7 @@ namespace avmplus
 		if (!secondTry && !verbose)
 		{
 			// capture the verify trace even if verbose is false.
-			Verifier v2(info, toplevel, true);
+			Verifier v2(info, toplevel, abc_env, true);
 			v2.verbose = true;
 			CodeWriter stubWriter;
 			v2.verify(&stubWriter);
@@ -2569,8 +2511,7 @@ namespace avmplus
 
     void Verifier::checkTarget(const byte* target)
     {
-		FrameState *targetState = getFrameState(target-code_pos);
-		AvmAssert(targetState != 0);
+		FrameState *targetState = getFrameState((int)(target-code_pos));
 		if (!targetState->initialized)
 		{
 			//if (verbose)
@@ -2631,8 +2572,6 @@ namespace avmplus
 
 			const int scopeTop  = scopeBase + targetState->scopeDepth;
 			const int stackTop  = stackBase + targetState->stackDepth;
-			Value* targetValues = &targetState->value(0);
-			Value* curValues = &state->value(0);
 			for (int i=0, n=stackTop; i < n; i++)
 			{
 				if (i >= scopeTop && i < stackBase) 
@@ -2641,8 +2580,8 @@ namespace avmplus
 					continue;
 				}
 
-				Value& curValue = curValues[i];
-				Value& targetValue = targetValues[i];
+				Value& curValue = state->value(i);
+				Value& targetValue = targetState->value(i);
 				if (curValue.killed || targetValue.killed) 
 				{
 					// this reg has been killed in one or both states;
@@ -2746,7 +2685,7 @@ namespace avmplus
 		return common;
 	}
 
-    Atom Verifier::checkCpoolOperand(uint32_t index, int requiredAtomType)
+    void Verifier::checkCpoolOperand(uint32_t index, int requiredAtomType)
     {
 		switch( requiredAtomType )
 		{
@@ -2754,21 +2693,19 @@ namespace avmplus
 			if( !index || index >= pool->constantStringCount )
 			{
 				verifyFailed(kCpoolIndexRangeError, core->toErrorString(index), core->toErrorString(pool->constantStringCount));
-				return undefinedAtom;
 			}
-			return pool->cpool_string[index]->atom();
+			break;
 
 		case kObjectType:
-			if( !index || index >= pool->constantMnCount )
+			if( !index || index >= pool->cpool_mn_offsets.size() )
 			{
-				verifyFailed(kCpoolIndexRangeError, core->toErrorString(index), core->toErrorString(pool->constantMnCount));
-				return undefinedAtom;
+				verifyFailed(kCpoolIndexRangeError, core->toErrorString(index), core->toErrorString(pool->cpool_mn_offsets.size()));
 			}
-			return pool->cpool_mn[index];
+			break;
 
 		default:
 			verifyFailed(kCpoolEntryWrongTypeError, core->toErrorString(index));
-			return undefinedAtom;
+			break;
 		}
     }
 
@@ -2849,7 +2786,7 @@ namespace avmplus
 			size_t extra = sizeof(ExceptionHandler)*(exception_count-1);
 			ExceptionHandlerTable* table = new (core->GetGC(), extra) ExceptionHandlerTable(exception_count);
 			ExceptionHandler *handler = table->exceptions;
-			for (int i=0; i<exception_count; i++) 
+			for (int i=0; i < exception_count; i++, handler++) 
 			{
 				handler->from = toplevel->readU30(pos);
 				handler->to = toplevel->readU30(pos);
@@ -2872,7 +2809,7 @@ namespace avmplus
 				{
 					core->console << "            exception["<<i<<"] from="<< handler->from
 						<< " to=" << handler->to
-						<< " target=" << (uint64_t)handler->target 
+						<< " target=" << handler->target 
 						<< " type=" << t
 						<< " name=";
 					if (name_index != 0)
@@ -2895,24 +2832,12 @@ namespace avmplus
 				// handler->traits = t
 				WB(core->GetGC(), table, &handler->traits, t);
 
-				Traits* scopeTraits;
-				
-				if (name_index == 0)
-				{
-					scopeTraits = OBJECT_TYPE;
-				}
-				else
-				{
-					scopeTraits = Traits::newCatchTraits(toplevel, pool, scopePosInPool, qn.getName(), qn.getNamespace());
-				}
-				
+				Traits* scopeTraits = name_index == 0 ? OBJECT_TYPE :
+					Traits::newCatchTraits(toplevel, pool, scopePosInPool, qn.getName(), qn.getNamespace());
+
 				// handler->scopeTraits = scopeTraits
 				WB(core->GetGC(), table, &handler->scopeTraits, scopeTraits);
-
-				
 				getFrameState(handler->target)->targetOfBackwardsBranch = true;
-
-				handler++;
 			}
 
 			info->set_abc_exceptions(core->GetGC(), table);
@@ -3005,62 +2930,90 @@ namespace avmplus
 	}
     #endif /* AVMPLUS_VERBOSE */
 
-	FrameState* Verifier::newFrameState()
+	FrameState::FrameState(Verifier* verifier)
+		: verifier(verifier), 
+	#if defined FEATURE_NANOJIT
+		label(),
+	#endif
+		  pc(0), scopeDepth(0), stackDepth(0), withBase(-1),
+		  initialized(false), targetOfBackwardsBranch(false),
+		  insideTryBlock(false)
 	{
-		size_t extra = (frameSize-1)*sizeof(Value);
-		return new (core->GetGC(), extra) FrameState(this);
+		locals = (Value*)mmfx_alloc_opt(sizeof(Value) * verifier->frameSize, MMgc::kZero);
+	}
+
+	FrameState::~FrameState() {
+		mmfx_free( locals );
 	}
 
 #if defined FEATURE_CFGWRITER
-    CFGWriter::CFGWriter (AvmCore *core, CodeWriter* coder) 
-	    : core(core), coder(coder), label(0), edge(0) {
-	    this->blocks = new (core->GetGC()) SortedIntMap<Block*>(core->GetGC(), 128);
-	    this->edges = new (core->GetGC()) SortedIntMap<Edge*>(core->GetGC(), 128);
-		blocks->put(0, new (core->GetGC()) Block(core->GetGC(), label++, 0));
-		current = blocks->at(0);
+	Block::Block(uint32_t label, int32_t begin) 
+		: label(label), begin(begin), end(0), succ(0)
+		, pred_count(0)
+	{}
+
+	Block::~Block()
+	{}
+
+	Edge::Edge(uint32_t src, uint32_t snk)
+		: src(src), snk(snk)
+	{}
+
+    CFGWriter::CFGWriter (MethodInfo* info, CodeWriter* coder) 
+	    : NullWriter(coder), info(info), label(0), edge(0) {
+	        blocks.put(0, mmfx_new( Block(label++, 0)));
+		current = blocks.at(0);
 		current->pred_count = -1;
     }
 
-	CFGWriter::~CFGWriter () 
-	{
-	    Block* b;
-		core->console << "\n";
-		for (int i = 0; i < blocks->size(); i++) {
-		  b = blocks->at(i);
-		  core->console << "B" << b->label << " @"; // << (int)b->begin << ", @" << (int)b->end;
-		  core->console << " preds=[";
-		  for (uint32_t j = 0; j < b->preds->size(); j++) {
-			if(j!=0) core->console << ",";
-			core->console << "B" << b->preds->get(j);
-		  }
-		  core->console << "] succs=[";
-		  for (uint32_t j = 0; j < b->succs->size(); j++) {
-			if(j!=0) core->console << ",";
-			core->console << "B" << b->succs->get(j);
-		  }
-		  core->console << "]\n";
-		}
-		Edge* e;
-		for (int i = 0; i < edges->size(); i++) {
-		  e = edges->at(i);
-		  core->console << "E" << i << ": " << "B" << e->src << " --> " << "B" << e->snk << "\n";
-		}
+	CFGWriter::~CFGWriter() {
+		for (int i=0, n=blocks.size(); i < n; i++)
+			mmfx_delete( blocks.at(i) );
+		for (int i=0, n=edges.size(); i < n; i++)
+			mmfx_delete( edges.at(i) );
 	}
 
-	void CFGWriter::writePrologue(FrameState* state)
+	void CfgWriter::cleanup()
 	{
-		(void)state;
+		// this is only called on abnormal paths where the dtor wouldn't otherwise run at all.
+		coder->cleanup();
+		this->~CFGWriter();
 	}
 
 	void CFGWriter::writeEpilogue(FrameState* state)
 	{
-		(void)state;
+	    Block* b;
+		AvmCore *core = info->pool()->core;
+		core->console << "CFG " << info << "\n";
+		for (int i = 0; i < blocks.size(); i++) {
+		  b = blocks.at(i);
+		  core->console << "B" << b->label; // << " @" << (int)b->begin << ", @" << (int)b->end;
+		  core->console << " preds=[";
+		  for (uint32_t j = 0; j < b->preds.size(); j++) {
+			if(j!=0) core->console << ",";
+			core->console << "B" << b->preds.get(j);
+		  }
+		  core->console << "] succs=[";
+		  for (uint32_t j = 0; j < b->succs.size(); j++) {
+			if(j!=0) core->console << ",";
+			core->console << "B" << b->succs.get(j);
+		  }
+		  core->console << "]\n";
+		}
+		Edge* e;
+		for (int i = 0; i < edges.size(); i++) {
+		  e = edges.at(i);
+		  core->console << "E" << i << ": " << "B" << e->src << " --> " << "B" << e->snk << "\n";
+		}
+		core->console << "\n";
+
+		coder->writeEpilogue(state);
 	}
 
-	void CFGWriter::write(FrameState* state, const byte* pc, AbcOpcode opcode)
+	void CFGWriter::write(FrameState* state, const byte* pc, AbcOpcode opcode, Traits*type)
 	{
 	  //AvmLog ("%i: %s\n", state->pc, opcodeInfo[opcode].name);
-	  Block* b = blocks->get(state->pc);
+	  Block* b = blocks.get(state->pc);
 	  if (b) {
 		current = b;
 	  }
@@ -3070,12 +3023,12 @@ namespace avmplus
 	  {
 	    //core->console << "  " << (uint32_t)state->pc << ":" << opcodeInfo[opcode].name << "\n";
 		//core->console << "label @ " << (uint32_t)state->pc << "\n";
-		Block *b = blocks->get(state->pc);
+		Block *b = blocks.get(state->pc);
 		// if there isn't a block for the current pc, then create one
 		if (!b) {
-		  b = new (core->GetGC()) Block(core->GetGC(), label++, state->pc);
+		  b = mmfx_new(Block(label++, state->pc));
 		  //b->pred_count++;
-		  blocks->put(state->pc, b);
+		  blocks.put(state->pc, b);
 		  current = b;
 		}
 		break;
@@ -3087,13 +3040,13 @@ namespace avmplus
 		break;
 	  }
 
-		if (coder) coder->write(state, pc, opcode);
+		coder->write(state, pc, opcode, type);
 	}
 
 	void CFGWriter::writeOp1(FrameState* state, const byte *pc, AbcOpcode opcode, uint32_t opd1, Traits *type)
 	{
 	  //AvmLog ("%i: %s\n", state->pc, opcodeInfo[opcode].name);
-	  Block* b=blocks->get(state->pc);
+	  Block* b=blocks.get(state->pc);
 	  if (b) {
 		current = b;
 	  }
@@ -3118,26 +3071,26 @@ namespace avmplus
 		{
 		  //core->console << "  " << (uint32_t)state->pc << ":" << opcodeInfo[opcode].name;
 		  //core->console << " " << (uint32_t)state->pc+opd1+4 << "\n";
-		  Block *b = blocks->get(state->pc+4);
+		  Block *b = blocks.get(state->pc+4);
 
 		  // if there isn't a block for the next pc, then create one
 		  if (!b) {
-			b = new (core->GetGC()) Block(core->GetGC(), label++, state->pc+4);
-			blocks->put(state->pc+4, b);
+			b = mmfx_new( Block(label++, state->pc+4) );
+			blocks.put(state->pc+4, b);
 		  }
 		  if (opcode != OP_jump) {
 			  b->pred_count++;
-			  b->preds->add(current->label);
-			  current->succs->add(b->label);
-			  edges->put(edge++, new (core->GetGC()) Edge(current->label, b->label));
+			  b->preds.add(current->label);
+			  current->succs.add(b->label);
+			  edges.put(edge++, mmfx_new(Edge(current->label, b->label)));
 		  }
 			  
 
 		  // if there isn't a block for target then create one
-		  b = blocks->get(state->pc+4+opd1);
+		  b = blocks.get(state->pc+4+opd1);
 		  if (!b) {
-			b = new (core->GetGC()) Block(core->GetGC(), label++, state->pc+4+opd1);
-			blocks->put(state->pc+4+opd1, b);
+			b = mmfx_new( Block(label++, state->pc+4+opd1));
+			blocks.put(state->pc+4+opd1, b);
 		  }
 
 		  if ((int)opd1>0) 
@@ -3148,10 +3101,10 @@ namespace avmplus
 		  { 
 			  b->pred_count = -1;
 		  }
-		  b->preds->add(current->label);
-		  current->succs->add(b->label);
+		  b->preds.add(current->label);
+		  current->succs.add(b->label);
 		  current->end = state->pc+4;
-		  edges->put(edge++, new (core->GetGC()) Edge(current->label, b->label));
+		  edges.put(edge++, mmfx_new(Edge(current->label, b->label)));
 
 		  //core->console << "label " << (uint32_t)state->pc+opd1+4 << "\n";
 		  //core->console << "    edge " << (uint32_t)state->pc << " -> " << (uint32_t)state->pc+opd1+4 << "\n";
@@ -3161,21 +3114,21 @@ namespace avmplus
 		  //core->console << " " << (int)opd1 << "\n";
 		    break;
         }
-		if (coder) coder->writeOp1(state, pc, opcode, opd1, type);
 
+		coder->writeOp1(state, pc, opcode, opd1, type);
 	}
 
 	void CFGWriter::writeOp2(FrameState* state, const byte *pc, AbcOpcode opcode, uint32_t opd1, uint32_t opd2, Traits* type)
 	{
 	  //AvmLog ("%i: %s\n", state->pc, opcodeInfo[opcode].name);
-	  Block* b=blocks->get(state->pc);
+	  Block* b=blocks.get(state->pc);
 	  if (b) {
 		current = b;
 	  }
 
 	  //AvmLog ("%i: %s %i %i\n", state->pc, opcodeInfo[opcode].name, opd1, opd2);
 	  //core->console << "  " << (uint32_t)state->pc << ":" << opcodeInfo[opcode].name << " " << opd1 << " " << opd2 << "\n";
-		if (coder) coder->writeOp2 (state, pc, opcode, opd1, opd2, type);
+		coder->writeOp2 (state, pc, opcode, opd1, opd2, type);
 	}
     #endif // FEATURE_CFGWRITER
 }

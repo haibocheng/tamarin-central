@@ -41,47 +41,16 @@
  
 namespace MMgc
 {
-	GCWeakRef* GCObject::GetWeakRef() const
-	{
-		return GC::GetWeakRef(this);
-	}
-
-	GCWeakRef* GCFinalizedObject::GetWeakRef() const
-	{
-		return GC::GetWeakRef(this);
-	}
-  
-	void* GCFinalizedObject::operator new(size_t size, GC *gc, size_t extra)
-	{
-		return gc->Alloc(size + extra, GC::kFinalize|GC::kContainsPointers|GC::kZero);
-	}
-
-	void GCFinalizedObject::operator delete (void *gcObject)
-	{
-		GC::GetGC(gcObject)->Free(gcObject);
-	}		
-
-	void* GCFinalizedObjectOptIn::operator new(size_t size, GC *gc, size_t extra)
-	{
-		return gc->Alloc(size + extra, GC::kContainsPointers|GC::kZero);
-	}
-
-	void GCFinalizedObjectOptIn::operator delete (void *gcObject)
-	{
-		GC::GetGC(gcObject)->Free(gcObject);
-	}		
-
-#if defined(MMGC_MEMORY_INFO)
+#ifdef MMGC_RC_HISTORY
+	
 	void RCObject::DumpHistory()
 	{			
 		GCDebugMsg(false, "Ref count modification history for object 0x%x:\n", this);
-#if 0
-		StackTrace **traces = history.GetData();
-		for(int i=0, n=history.Count(); i<n; i++)
+		for(uint32_t i=0, n=history.Count(); i<n; i++)
 		{
-			PrintStackTrace(traces[i]);
+			PrintStackTrace(history.Get(i));
 		}
-#endif
 	}
+
 #endif
 }

@@ -68,7 +68,7 @@ namespace avmshell
 			domainToplevel = core->initShellBuiltins();
 		}
 		
-		domainEnv = new (core->GetGC()) DomainEnv(core, domain, parentDomain->domainEnv);
+		domainEnv = new (core->GetGC()) DomainEnv(core, domain, parentDomain ? parentDomain->domainEnv : (DomainEnv*)NULL);
 	}
 
 	Atom DomainObject::loadBytes(ByteArrayObject *b)
@@ -85,10 +85,13 @@ namespace avmshell
 		ScriptBuffer code = core->newScriptBuffer(len);
 		VMPI_memcpy(code.getBuffer(), &b->GetByteArray()[0], len); 
 		Toplevel *toplevel = domainToplevel;
+
+		uint32_t api = core->getAPI(NULL);
 		return core->handleActionBlock(code, 0,
 								  domainEnv,
 								  toplevel,
-								  NULL, codeContext);
+								  NULL, codeContext, 
+								  api);
 	}
 
 	ScriptObject* DomainObject::finddef(const Multiname& multiname,
@@ -106,8 +109,7 @@ namespace avmshell
 		if (script->global == NULL)
 		{
 			script->initGlobal();
-			Atom argv[1] = { script->global->atom() };
-			script->coerceEnter(0, argv);
+			script->coerceEnter(script->global->atom());
 		}
 
 		return script->global;
@@ -132,18 +134,16 @@ namespace avmshell
 		Stringp className;
 		if (dot >= 0) {
 			Stringp uri = core->internString(name->substring(0, dot));
-			ns = core->internNamespace(core->newNamespace(uri));
+			ns = core->internNamespace(core->newNamespace(uri, Namespace::NS_Public, core->getAPI(NULL)));
 			className = core->internString(name->substring(dot+1, name->length()));
 		} else {
-			ns = core->publicNamespace;
+			ns = core->findPublicNamespace();
 			className = core->internString(name);
 		}
 
 		Multiname multiname(ns, className);
 
-		ShellCodeContext* codeContext = (ShellCodeContext*)core->codeContext();
-		
-		ScriptObject *container = finddef(multiname, codeContext->domainEnv());
+		ScriptObject *container = finddef(multiname, domainEnv);
 		if (!container) {
 			toplevel()->throwTypeError(kClassNotFoundError, core->toErrorString(&multiname));
 		}
@@ -185,14 +185,14 @@ namespace avmshell
  		return Domain::GLOBAL_MEMORY_MIN_SIZE;
  	}
 
- 	ScriptObject *DomainObject::get_domainMemory() const
+ 	ByteArrayObject* DomainObject::get_domainMemory() const
  	{
- 		return domainEnv->domain()->globalMemory();
+ 		return (ByteArrayObject*)domainEnv->domain()->get_globalMemory();
  	}
  
- 	void DomainObject::set_domainMemory(ScriptObject *mem)
+ 	void DomainObject::set_domainMemory(ByteArrayObject* mem)
  	{
- 		if(!domainEnv->domain()->setGlobalMemory(mem))
+ 		if(!domainEnv->domain()->set_globalMemory(mem))
  			toplevel()->throwError(kEndOfFileError);
  	}
 

@@ -49,12 +49,12 @@ namespace avmplus
 	{
 	public:
 	
-		ScriptObject(VTable* vtable, ScriptObject* delegate,
-					 int capacity = InlineHashtable::kDefaultCapacity);
+		ScriptObject(VTable* vtable, ScriptObject* delegate);
+		ScriptObject(VTable* vtable, ScriptObject* delegate, int capacity);
 		~ScriptObject();
 
 		ScriptObject* getDelegate() const { return delegate; }
-		void setDelegate(ScriptObject *d) { WBRC(MMgc::GC::GetGC(this), this, &delegate, d); }
+		void setDelegate(ScriptObject *d) { delegate = d; }
 
 		Atom atom() const {
 			return kObjectType|(uintptr)this; 
@@ -80,19 +80,40 @@ namespace avmplus
 			return vtable->toplevel();
 		}
 
-		DomainEnv* domainEnv() const;
-
-		virtual InlineHashtable* getTable() const {
-			AvmAssert(vtable->traits->getHashtableOffset() != 0);
-			return (InlineHashtable*)((byte*)this + vtable->traits->getHashtableOffset());
-		}
-
-		bool isValidDynamicName(const Multiname* m) const {
-			return m->contains(core()->publicNamespace) && !m->isAnyName() && !m->isAttr();
-		}
+		InlineHashtable* getTable() const;
+		
+		inline InlineHashtable* getTableNoInit() const
+		{
+			union {
+				uint8_t* p;
+				InlineHashtable* iht;
+				HeapHashtable** hht;
+			};
+			p = (uint8_t*)this + vtable->traits->getHashtableOffset();
+			if(!vtable->traits->isDictionary)
+			{
+				return iht;
+			}
+			else
+			{
+				//DictionaryObjects store pointer to HeapHashtable at
+				//the hashtable offset
+				return (*hht)->get_ht();
+			}
+		}		
 		
 		Atom getSlotAtom(uint32_t slot);
-		void setSlotAtom(uint32_t slot, Atom atom);
+		
+		// like getSlotAtom, but assume the resulting Atom is a ScriptObject...
+		// if it is not, return NULL. useful for callers that expect only
+		// a ScriptObject and reject other types (eg callproperty). If the
+		// slot in question is usually a ScriptObject, it's substantially faster
+		// to call this (vs getSlotAtom).
+		ScriptObject* getSlotObject(uint32_t slot);
+
+		// NOTE, this now does the equivalent of Toplevel::coerce() internally;
+		// it is not necessary to call coerce() prior to calling this!
+		void coerceAndSetSlotAtom(uint32_t slot, Atom atom);
 
 		virtual Atom getDescendants(const Multiname* name) const;
 
@@ -188,6 +209,18 @@ namespace avmplus
 		// return true iff the object is a toplevel script init object.
         bool isGlobalObject() const;
 
+		virtual Stringp implToString() const;
+
+		// this really shouldn't exist here, but AIR currently plays some games with subclassing
+		// "Function" that use C++ classes that don't descend from FunctionObject. Easier to fix
+		// by rooting this method here than by fixing AIR at this time. 
+		virtual CodeContext* getFunctionCodeContext() const { AvmAssert(0); return NULL; }
+
+		// this really shouldn't exist here, but is the simplest solution to the divergent
+        // versions of ByteArray between Tamarin and Flash/AIR. When we someday unify them,
+        // this should be able to go away.
+		virtual GlobalMemoryProvider* getGlobalMemoryProvider() { AvmAssert(0); return NULL; }
+		
 #ifdef AVMPLUS_VERBOSE
 	public:
 		virtual Stringp format(AvmCore* core) const;
@@ -196,11 +229,18 @@ namespace avmplus
 #ifdef DEBUGGER
 	public:
 		virtual uint64 size() const;
+#endif
+#if defined(DEBUGGER) || defined(VMCFG_AOT)
+	public:
 		virtual MethodEnv* getCallMethodEnv() { return NULL; }
 #endif
+		
+	private:
+		void initHashtable(int capacity = InlineHashtable::kDefaultCapacity);
+		
 	// ------------------------ DATA SECTION BEGIN
-	public:		VTable* const		vtable;
-	private:	ScriptObject*		delegate;     // __proto__ in AS2, archetype in semantics
+	public:		VTable* const			vtable;
+	private:	DRCWB(ScriptObject*)	delegate;     // __proto__ in AS2, archetype in semantics
 	// ------------------------ DATA SECTION END
 	};
 }

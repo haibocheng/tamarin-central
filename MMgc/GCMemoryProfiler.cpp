@@ -38,20 +38,19 @@
 
 #include "MMgc.h"
 
-#if defined(MMGC_MEMORY_INFO) || defined(MMGC_MEMORY_PROFILER)
-
 namespace MMgc
 {
 
 #ifdef MMGC_MEMORY_PROFILER
 	// increase this to get more info
-	const int kMaxStackTrace = 16; // RtlCaptureStackBackTrace stops working when this is 32
 	const int kNumTypes = 10;
 	const int kNumTracesPerType = 5;
 
 	// include total and swept memory totals in memory profiling dumps as opposed to just "live"
 	const bool showTotal = false;	
 	const bool showSwept = false;
+
+	bool simpleDump;
 
 	class StackTrace : public GCAllocObject
 	{
@@ -62,43 +61,65 @@ namespace MMgc
 			VMPI_memcpy(ips, trace, kMaxStackTrace * sizeof(uintptr_t));
 		}
 		uintptr_t ips[kMaxStackTrace];
-		size_t skip;
 		size_t size;
 		size_t totalSize;
 		size_t sweepSize;
 		const char *package;
 		const char *category;
 		const char *name;
-		size_t count;
-		size_t totalCount;
-		size_t sweepCount;
+		uint32_t count;
+		uint32_t totalCount;
+		uint32_t sweepCount;
 		StackTrace *master;
+		uint8_t skip;
+	};
+
+	struct AllocInfo : public GCAllocObject
+	{
+		StackTrace* allocTrace;
+
+		// memory optimization:  askSize is N/A after the object is deleted,
+		// and deleteTrace is only used to report writing to deleted memory,
+		union {
+			size_t askSize;
+			StackTrace* deleteTrace;
+		};
 	};
 
 	GCThreadLocal<const char*> memtag;
 	GCThreadLocal<const void*> memtype;
 
 	MemoryProfiler::MemoryProfiler() : 
-		traceTable(128, GCHashtable::OPTION_MALLOC | GCHashtable::OPTION_MT),
-		stackTraceMap(128, GCHashtable::OPTION_MALLOC | GCHashtable::OPTION_MT),
-		nameTable(128, GCHashtable::OPTION_MALLOC | GCHashtable::OPTION_STRINGS)
+		stackTraceMap(128),
+		stringsTable(4),
+		nameTable(128),
+		allocInfoTable(128)
 	{
+		VMPI_setupPCResolution();
+		simpleDump = !VMPI_hasSymbols();
 	}
 
 	MemoryProfiler::~MemoryProfiler()
 	{
-		GCHashtableIterator traceIter(&stackTraceMap);
+		GCStackTraceHashtable_VMPI::Iterator traceIter(&stackTraceMap);
 		const void *obj;
 		while((obj = traceIter.nextKey()) != NULL)
 		{
 			StackTrace *trace = (StackTrace*)traceIter.value();
 			delete trace;
 		}
-		GCHashtableIterator nameIter(&nameTable);
+		GCHashtable_VMPI::Iterator nameIter(&nameTable);
 		while((obj = nameIter.nextKey()) != NULL)
 		{
 			VMPI_free((void*)nameIter.value());			
 		}
+
+		GCHashtable_VMPI::Iterator allocIter(&allocInfoTable);
+		while((obj = allocIter.nextKey()) != NULL)
+		{
+			delete (AllocInfo*)allocIter.value();
+		}
+		VMPI_desetupPCResolution();		
 	}
 
 	const char *MemoryProfiler::GetAllocationNameFromTrace(StackTrace *trace)
@@ -138,14 +159,23 @@ namespace MMgc
 
 	StackTrace *MemoryProfiler::GetAllocationTrace(const void *obj)
 	{
-		return (StackTrace*)traceTable.get(obj);
+		AllocInfo* info = (AllocInfo*)allocInfoTable.get(obj);
+		GCAssert(info != NULL);
+		return info ? info->allocTrace : NULL;
+	}
+
+	StackTrace *MemoryProfiler::GetDeletionTrace(const void *obj)
+	{
+		AllocInfo* info = (AllocInfo*)allocInfoTable.get(obj);
+		GCAssert(info != NULL);
+		return info ? info->deleteTrace : NULL;
 	}
 
 	const char * MemoryProfiler::GetAllocationName(const void *obj)
 	{
-		StackTrace *trace = (StackTrace*)traceTable.get(obj);
-		if(trace)
-			return GetAllocationNameFromTrace(trace);
+		AllocInfo *info = (AllocInfo*)allocInfoTable.get(obj);
+		if(info)
+			return GetAllocationNameFromTrace(info->allocTrace);
 		return NULL;
 	}
 
@@ -176,13 +206,22 @@ namespace MMgc
 		(void)askSize;
 
 		StackTrace *trace = GetStackTrace();
-		traceTable.put(item, trace);
 
 		ChangeSize(trace, (int)gotSize);
 
+		AllocInfo* info = (AllocInfo*) allocInfoTable.get(item);
+		if(!info)
+		{
+			info = new AllocInfo;
+			allocInfoTable.put(item, info);
+		}
+
+		info->askSize = askSize;
+		info->allocTrace = trace;
+
 		if(memtype)
 		{
-			trace->master = (StackTrace*)traceTable.get(memtype);
+			trace->master = GetAllocationTrace(memtype);
 			memtype = NULL;
 		}
 		
@@ -195,14 +234,17 @@ namespace MMgc
 
 	void MemoryProfiler::RecordDeallocation(const void *item, size_t size)
 	{
-		StackTrace *trace = (StackTrace*)traceTable.get(item);
+		// This should be a remove, but calling remove a lot has performance issues
+		// When we fix the perf issues with GCHashtable::remove, we should change this back to a remove.
+		AllocInfo* info = (AllocInfo*) allocInfoTable.get(item);
 
-		ChangeSize(trace, -1 * int(size));
+		GCAssert(info != NULL);
+
+		ChangeSize(info->allocTrace, -1 * int(size));
 		// FIXME: how to know this is a sweep?
 
 		// store deletion trace
-		StackTrace *deletion_trace = GetStackTrace();
-		traceTable.put((const void*)(uintptr_t(item)+1), deletion_trace);
+		info->deleteTrace = GetStackTrace();
 
 #if 0
 		if(poison == 0xba) {
@@ -226,14 +268,24 @@ namespace MMgc
 		return st;
 	}
 	
+	size_t MemoryProfiler::GetAskSize(const void* item)
+	{
+		AllocInfo* info = (AllocInfo*) allocInfoTable.get(item);
+		//failing this assert means that either FinalizeHook() was called before GetAsk()
+		//or this item is being double deleted
+		GCAssert(info != NULL); 
+		return info ? info->askSize : 0;
+	}
+
 	class PackageGroup : public GCAllocObject
 	{
 	public:
-		PackageGroup(const char *name) : name(name), size(0), count(0), categories(16, GCHashtable::OPTION_MALLOC) {}
+		PackageGroup(const char *name) : name(name), size(0), count(0), categories(16) {}
 		const char *name;
 		size_t size;
-		size_t count;
-		GCHashtable categories; // key == category name, value == CategoryGroup*
+		uint32_t count;
+		// Note: it's important to use the VMPI variant of GCHashtable for this.
+		GCHashtable_VMPI categories; // key == category name, value == CategoryGroup*
 	};
 
 	// data structure to gather allocations by type with the top 5 traces
@@ -246,24 +298,46 @@ namespace MMgc
 		}
 		const char *name;
 		size_t size;
-		size_t count;
+		uint32_t count;
 		// biggest kNumTracesPerType traces
 		StackTrace *traces[kNumTracesPerType ? kNumTracesPerType : 1];
 	};
 
 	const char *MemoryProfiler::Intern(const char *name, size_t len)
 	{
-		// input doesn't have to be zero terminated
-		char *buff = (char*)alloca(len+1);
+		char tmp[100];
+		// input doesn't have to be zero terminated, so zero terminate in buff
+		char *buff = len < 100 ? tmp : (char*)VMPI_alloc(len+1);
+		if (buff == NULL)
+		{
+			// Well, we try
+			len = 99;
+			buff = tmp;
+		}
 		VMPI_strncpy(buff, name, len);
 		buff[len]='\0';
-		char *iname = (char*)nameTable.get(buff);
+		char *iname = (char*)stringsTable.get(buff);
 		if(iname)
+		{
+			if (buff != tmp)
+				VMPI_free(buff);
 			return iname;
-		iname = (char*)VMPI_alloc(len+1);
-		VMPI_strncpy(iname, name, len);
-		iname[len]='\0';
-		nameTable.put(iname, iname);
+		}
+		if (buff == tmp)
+		{
+			iname = (char*)VMPI_alloc(len+1);
+			if (iname == NULL)
+				GCHeap::GetGCHeap()->Abort();
+			VMPI_strcpy(iname, buff);
+		}
+		else
+		{
+			iname = buff;
+			buff = tmp;
+		}
+		stringsTable.put(iname, iname);
+		if (buff != tmp)
+			VMPI_free(buff);
 		return iname;
 	}
 
@@ -290,14 +364,21 @@ namespace MMgc
 
 	void MemoryProfiler::DumpFatties()
 	{
-		GCHashtable packageTable(128, GCHashtable::OPTION_MALLOC);
+		if( simpleDump ) 
+		{
+			DumpSimple();
+			return;
+		}
+
+		// Note: it's important to use the VMPI variant of GCHashtable for this.
+		GCHashtable_VMPI packageTable(128);
 
 		size_t residentSize=0;
-		size_t residentCount=0;
+		uint32_t residentCount=0;
 		size_t packageCount=0;
 
 		// rip through all allocation sites and sort into package and categories
-		GCHashtableIterator iter(&stackTraceMap);
+		GCStackTraceHashtable_VMPI::Iterator iter(&stackTraceMap);
 		const void *obj;
 		while((obj = iter.nextKey()) != NULL)
 		{
@@ -317,7 +398,7 @@ namespace MMgc
 
 			residentSize += size;
 
-			size_t count = trace->master != NULL ? 0 : trace->count;
+			uint32_t count = trace->master != NULL ? 0 : trace->count;
 			residentCount += trace->count;
 
 			const char *pack = GetPackage(trace);
@@ -354,10 +435,12 @@ namespace MMgc
 		}
 
 		// reporting time....
-		PackageGroup **packages = (PackageGroup**)alloca(packageCount*sizeof(PackageGroup*));
+		PackageGroup **packages = (PackageGroup**)VMPI_alloc(packageCount*sizeof(PackageGroup*));
+		if (packages == NULL)
+			return;
 		VMPI_memset(packages, 0, packageCount*sizeof(PackageGroup*));
 
-		GCHashtableIterator pack_iter(&packageTable);
+		GCHashtable_VMPI::Iterator pack_iter(&packageTable);
 		const char *package;
 		while((package = (const char*)pack_iter.nextKey()) != NULL)
 		{
@@ -384,9 +467,11 @@ namespace MMgc
 				continue;
 
 			// sort CategoryGroup's into this array
-			CategoryGroup **residentFatties = (CategoryGroup**) alloca(numTypes * sizeof(CategoryGroup *));
+			CategoryGroup **residentFatties = (CategoryGroup**) VMPI_alloc(numTypes * sizeof(CategoryGroup *));
+			if (residentFatties == NULL)
+				return;
 			VMPI_memset(residentFatties, 0, numTypes * sizeof(CategoryGroup *));
-			GCHashtableIterator iter(&pg->categories);
+			GCHashtable_VMPI::Iterator iter(&pg->categories);
 			const char *name;
 			while((name = (const char*)iter.nextKey()) != NULL)
 			{
@@ -407,7 +492,7 @@ namespace MMgc
 				}			
 			}
 			
-			GCLog("%s - %3.1f%% - %u kb %u items, avg %u b\n", pg->name, PERCENT(residentSize, pg->size),  (unsigned int)pg->size>>10, pg->count, (unsigned int)(pg->count ? pg->size/pg->count : 0));
+			GCLog("%s - %3.1f%% - %u kb %u items, avg %u b\n", pg->name, PERCENT(residentSize, pg->size),  (unsigned int)(pg->size>>10), pg->count, (unsigned int)(pg->count ? pg->size/pg->count : 0));
 				
 			// result capping
 			if(numTypes > kNumTypes)
@@ -418,12 +503,12 @@ namespace MMgc
 				CategoryGroup *tg = residentFatties[i];
 				if(!tg) 
 					break;
-				GCLog("\t%s - %3.1f%% - %u kb %u items, avg %u b\n", tg->name, PERCENT(residentSize, tg->size), (unsigned int)tg->size>>10, tg->count, (unsigned int)(tg->count ? tg->size/tg->count : 0));
+				GCLog("\t%s - %3.1f%% - %u kb %u items, avg %u b\n", tg->name, PERCENT(residentSize, tg->size), (unsigned int)(tg->size>>10), tg->count, (unsigned int)(tg->count ? tg->size/tg->count : 0));
 				for(int j=0; j < kNumTracesPerType; j++) {
 					StackTrace *trace = tg->traces[j];
 					if(trace) {
 						size_t size = trace->size;
-						size_t count = trace->count;
+						uint32_t count = trace->count;
 						if(showSwept) {
 							size = trace->sweepSize;
 							count = trace->sweepCount;
@@ -436,19 +521,67 @@ namespace MMgc
 					}
 				}
 			}
+			
+			VMPI_free(residentFatties);
 		}
 
-		GCHashtableIterator pi(&packageTable);
+		GCHashtable_VMPI::Iterator pi(&packageTable);
 		while(pi.nextKey() != NULL)
 		{
 			PackageGroup* pg = (PackageGroup*)pi.value();
-			GCHashtableIterator iter(&pg->categories);
+			GCHashtable_VMPI::Iterator iter(&pg->categories);
 			while(iter.nextKey() != NULL)
 				delete (CategoryGroup*)iter.value();
 			delete pg;
 		}
+		
+		VMPI_free(packages);
 	}
 	
+	void MemoryProfiler::DumpSimple()
+	{
+		// rip through all allocation sites and dump them all without any sorting
+		// useful on WinMo or other platforms where we don't have symbol names
+		// at runtime, and just need to dump the raw addresses (which makes sorting impossible)
+		GCStackTraceHashtable_VMPI::Iterator iter(&stackTraceMap);
+		const void *obj;
+		size_t num_traces = 0; 
+		// Get a stack trace with VMPI_captureStackTrace as the top address - this will be used to calculate the
+		// base address to translate the addresses into relative addresses later
+		uintptr_t trace[kMaxStackTrace];
+		VMPI_memset(trace, 0, sizeof(trace));
+
+		VMPI_captureStackTrace(trace, kMaxStackTrace, 1);
+
+		GCLog("ReferenceAddress VMPI_captureStackTrace 0x%x \n", trace[0]);
+
+		while((obj = iter.nextKey()) != NULL)
+		{
+			++num_traces;
+			StackTrace *trace = (StackTrace*)iter.value();
+			size_t size;
+			uint64_t count;
+
+			if(showSwept) {
+				size = trace->sweepSize;
+				count = trace->sweepCount;
+			} else if(showTotal) {
+				size = trace->totalSize;
+				count = trace->totalCount;
+			} else {
+				size = trace->size;
+				count = trace->count;
+			}
+
+			if(size == 0)
+				continue;
+
+			GCLog("%u b - %u items - ", size, count);
+			PrintStackTrace(trace);
+		}
+		GCLog("%u traces");
+	}
+
 	void SetMemTag(const char *s)
 	{
 		if(GCHeap::GetGCHeap()->GetProfiler() != NULL)
@@ -462,7 +595,7 @@ namespace MMgc
 	{
 		if(GCHeap::GetGCHeap()->GetProfiler() != NULL)
 		{
-			GCAssertMsg(s == NULL || MMgc::GetAllocationName(s) != NULL, "Unknown allocation");
+			GCAssertMsg(s == NULL || GCHeap::GetGCHeap()->GetProfiler()->GetAllocationTrace(s) != NULL, "Unknown allocation");
 			if(memtype != NULL || s == NULL) {
 				memtype = s;
 			}
@@ -476,30 +609,37 @@ namespace MMgc
 		*tp++ = '\n';
 		for(int i=0; trace[i] != 0; i++) {
 			char buff[256];
+			if( !simpleDump )
+			{
 			*tp++ = '\t';		*tp++ = '\t';		*tp++ = '\t';		
-			if(VMPI_getFunctionNameFromPC(trace[i], buff, sizeof(buff)) == false)
+			}
+
+			bool found_name;
+			if((found_name = VMPI_getFunctionNameFromPC(trace[i], buff, sizeof(buff))) == false)
 			{
 				VMPI_snprintf(buff, sizeof(buff), "0x%llx", (unsigned long long)trace[i]);
 			}
-			VMPI_strncpy(tp, buff, sizeof(buff));
+			VMPI_strcpy(tp, buff);
 			tp += VMPI_strlen(buff);
 
 			uint32_t lineNum;
-			if(VMPI_getFileAndLineInfoFromPC(trace[i], buff, sizeof(buff), &lineNum) == false)
-			{
-				VMPI_snprintf(buff, sizeof(buff), "0x%llx", (unsigned long long)trace[i]);
-			}
-			else
+			if(VMPI_getFileAndLineInfoFromPC(trace[i], buff, sizeof(buff), &lineNum))
 			{
 				VMPI_snprintf(buff, sizeof(buff), "%s:%d", buff, lineNum);
+
+				// Don't bother with file, linenumber, and address if we're just printing the address anyways
+				if( found_name )
+				{
+					*tp++ = '(';
+					VMPI_strcpy(tp, buff);
+					tp += VMPI_strlen(buff);
+					*tp++ = ')';
+					tp += VMPI_sprintf(tp, " - 0x%x", (unsigned int) trace[i]);
+				}
 			}
-			*tp++ = '(';
-			VMPI_strncpy(tp, buff, sizeof(buff));
-			tp += VMPI_strlen(buff);
-			*tp++ = ')';
-			tp += VMPI_sprintf(tp, " - 0x%x", (unsigned int) trace[i]);
 			*tp++ = '\n';
-			if(tp - out > 1500) {
+
+			if(tp - out > 200) {
 				*tp = '\0';
 				GCLog(out);
 				tp = out;
@@ -527,7 +667,7 @@ namespace MMgc
 	void PrintDeleteStackTrace(const void *item)
 	{
 		if(GCHeap::GetGCHeap()->GetProfiler()) {
-			StackTrace *trace = GCHeap::GetGCHeap()->GetProfiler()->GetAllocationTrace((const void*)(uintptr_t(item)+1));
+			StackTrace *trace = GCHeap::GetGCHeap()->GetProfiler()->GetDeletionTrace(item);
 			GCAssertMsg(trace != NULL, "Trace was null");
 			PrintStackTrace(trace);
 		}
@@ -540,40 +680,13 @@ namespace MMgc
 		return NULL;
 	}
 
-	void ChangeSizeForObject(const void *object, int size)
-	{
-		if(GCHeap::GetGCHeap()->GetProfiler()) {
-			StackTrace *st = GCHeap::GetGCHeap()->GetProfiler()->GetAllocationTrace(object);
-			if(st)
-				st->size += size;
-			GCAssert(int(st->size) >= 0);
-		}
-	}
-
-	unsigned GCStackTraceHashtable::equals(const void *k, const void *k2)
-	{
-		if(k == NULL || k2 == NULL)
-			return false;
-		return VMPI_memcmp(k, k2, kMaxStackTrace * sizeof(void*)) == 0;
-	}
-
-	unsigned GCStackTraceHashtable::hash(const void *k)
-	{
-		const int *array = (const int*)k;
-		int hash = 0;
-		for(int i=0;i<kMaxStackTrace; i++)
-			hash += array[i];
-		return hash;
-	}
-
 #else
 
 	void PrintAllocStackTrace(const void *) {}
 	void PrintDeleteStackTrace(const void *) {}
 	const char* GetAllocationName(const void *) { return NULL; }
-	void ChangeSizeForObject(const void *, int ) {}
 
-#endif
+#endif //MMGC_MEMORY_PROFILER
 
 
 #ifdef MMGC_MEMORY_INFO
@@ -626,9 +739,9 @@ namespace MMgc
 
 	void DebugFreeHelper(const void *item, int poison, size_t wholeSize)
 	{
-		int32_t *ip = (int32_t*) item;
-		int32_t size = *ip;
- 		int32_t *endMarker = ip + 2 + (size>>2);
+		uint32_t *ip = (uint32_t*) item;
+		uint32_t size = *ip;
+ 		uint32_t *endMarker = ip + 2 + (size>>2);
 
 		// clean up
 		*ip = 0;
@@ -638,12 +751,12 @@ namespace MMgc
 		if(size == 0)
 			return;
 
-		if (*endMarker != (int32_t)0xdeadbeef)
+		if (*endMarker != 0xdeadbeef)
 		{
 			// if you get here, you have a buffer overrun.  The stack trace about to
 			// be printed tells you where the block was allocated from.  To find the
 			// overrun, put a memory breakpoint on the location endMarker is pointing to.
-			GCDebugMsg("Memory overwrite detected\n", false);
+			GCDebugMsg(false, "Memory overwrite detected\n");
 			PrintAllocStackTrace(item);
 			GCAssert(false);
 		}
@@ -673,5 +786,4 @@ namespace MMgc
 
 } // namespace MMgc
 
-#endif // defined(MMGC_MEMORY_INFO) || defined(MMGC_MEMORY_PROFILER)
 

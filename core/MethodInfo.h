@@ -45,21 +45,20 @@
 
 namespace avmplus
 {
-	typedef uintptr_t (*GprMethodProc)(MethodEnv*, int, uint32 *);
-	typedef double (*FprMethodProc)(MethodEnv*, int, uint32 *);
+	// signature for method invocation when caller coerces args and boxes results
+	typedef uintptr_t (*GprMethodProc)(MethodEnv*, int32_t, uint32_t *);
+	typedef double (*FprMethodProc)(MethodEnv*, int32_t, uint32_t *);
+
+	// signature for invocation when callee coerces & boxes,
+	// caller is calling an unknown function with an unknown signature
+	typedef Atom (*AtomMethodProc)(MethodEnv*, int, Atom*);
 
 #ifdef DEBUGGER
 	class AbcFile;
 	class DebuggerMethodInfo : public MMgc::GCObject
 	{
 	private:
-		inline explicit DebuggerMethodInfo(int32_t _local_count, uint32_t _codeSize, int32_t _max_scopes) :
-			firstSourceLine(0),
-			lastSourceLine(0),
-			offsetInAbc(0),
-			codeSize(_codeSize), 
-			local_count(_local_count), 
-			max_scopes(_max_scopes) {}
+		explicit DebuggerMethodInfo(int32_t _local_count, uint32_t _codeSize, int32_t _max_scopes);
 
 	public:
 
@@ -78,111 +77,129 @@ namespace avmplus
 
 	class MethodSignature;
 
+	class MethodInfoProcHolder : public MMgc::GCObject
+	{
+		friend class ImtThunkEnv;
+	protected:
+		union 
+		{
+			GprMethodProc _implGPR;
+			FprMethodProc _implFPR;
+		};
+
+		/** pointer to invoker used when callee must coerce args */
+		AtomMethodProc _invoker;
+
+		MethodInfoProcHolder();
+	public:
+		GprMethodProc implGPR() const;
+		FprMethodProc implFPR() const;
+		bool isInterpreted() const;
+		Atom invoke(MethodEnv*, int32_t, Atom*);
+	};
+
 	/**
 	 * MethodInfo is the base class for all functions that
 	 * can be executed by the VM: Actionscript functions,
 	 * native functions, etc.
 	 */
-#ifdef AVMPLUS_TRAITS_MEMTRACK
-	class MethodInfo : public MMgc::GCFinalizedObject
-#else
-	class MethodInfo : public MMgc::GCObject
-#endif
+	class MethodInfo : public MethodInfoProcHolder
 	{
 		friend class CodegenLIR;
-		friend class CodegenIMT;
 	public:
 		/** @name flags from .abc - limited to a BYTE */
 		/*@{*/
 		/** need arguments[0..argc] */
-		static const int NEED_ARGUMENTS			= 0x00000001;
+		static const int32_t NEED_ARGUMENTS			= 0x00000001;
 
 		/** need activation object */
-		static const int NEED_ACTIVATION		= 0x00000002;
+		static const int32_t NEED_ACTIVATION		= 0x00000002;
 
 		/** need arguments[param_count+1..argc] */		
-		static const int NEED_REST				= 0x00000004;
+		static const int32_t NEED_REST				= 0x00000004;
 
 		/** has optional parameters */
-		static const int HAS_OPTIONAL			= 0x00000008;
+		static const int32_t HAS_OPTIONAL			= 0x00000008;
 
 		/** allow extra args, but dont capture them */
-		static const int IGNORE_REST			= 0x00000010;
+		static const int32_t IGNORE_REST			= 0x00000010;
 
 		/** method is native */
-		static const int NATIVE					= 0x00000020;
+		static const int32_t NATIVE					= 0x00000020;
 
 		/** method sets default namespace */
-		static const int SETS_DXNS				= 0x00000040;
+		static const int32_t SETS_DXNS				= 0x00000040;
 
 		/** method has table for parameter names */
-		static const int HAS_PARAM_NAMES		= 0x00000080;
+		static const int32_t HAS_PARAM_NAMES		= 0x00000080;
 
 		/*@}*/
 	private:
 		/** @name internal flags - upper 3 BYTES available */
 		/*@{*/
 		// set iff this is a getter
-		static const int IS_GETTER				= 0x00000100;
+		static const int32_t IS_GETTER				= 0x00000100;
 
 		// set iff this is a setter
-		static const int IS_SETTER				= 0x00000200;
+		static const int32_t IS_SETTER				= 0x00000200;
 
-		static const int OVERRIDE				= 0x00000400;
+		static const int32_t OVERRIDE				= 0x00000400;
 
-		static const int NON_INTERRUPTIBLE		= 0x00000800;
+		static const int32_t NON_INTERRUPTIBLE		= 0x00000800;
 
-		static const int UNBOX_THIS				= 0x00001000;
+		static const int32_t UNBOX_THIS				= 0x00001000;
 
-		static const int NEEDS_CODECONTEXT		= 0x00002000;
+		static const int32_t NEEDS_CODECONTEXT		= 0x00002000;
 
-		static const int HAS_EXCEPTIONS			= 0x00004000;
+		static const int32_t HAS_EXCEPTIONS			= 0x00004000;
 
-		static const int NEEDS_DXNS				= 0x00008000;
+		static const int32_t NEEDS_DXNS				= 0x00008000;
 
-		static const int VERIFIED				= 0x00010000;
+		static const int32_t VERIFIED				= 0x00010000;
 
 #ifdef AVMPLUS_VERIFYALL
-		static const int VERIFY_PENDING			= 0x00020000;
+		static const int32_t VERIFY_PENDING			= 0x00020000;
 #endif
 
 		/** indicates method is final, no overrides allowed */
-		static const int FINAL					= 0x00040000;
+		static const int32_t FINAL					= 0x00040000;
 
 		/** indicates the function is a method, that pushes the
 		    receiver object onto the scope chain at method entry */
-		static const int NEED_CLOSURE			= 0x00080000;
+		static const int32_t NEED_CLOSURE			= 0x00080000;
 
 		/** set to indicate that a function has no bytecode body. */
-		static const int ABSTRACT_METHOD		= 0x00100000;
+		static const int32_t ABSTRACT_METHOD		= 0x00100000;
 
 		/**
 		 * set once the signature types have been resolved and
 		 * override signatures have been checked.
 		 */
-		static const int RESOLVED				= 0x00200000;
+		static const int32_t RESOLVED				= 0x00200000;
 
 		/**
 		 * set to indictate that a function has been 
 		 * recommended to be interpreted. 
 		 */
-		static const int SUGGEST_INTERP			= 0x00400000;
+		static const int32_t SUGGEST_INTERP			= 0x00400000;
 
 		/**
 		 * set to indicate that a function has been compiled
 		 * to native code by the jit compiler.
 		 */
-		static const int JIT_IMPL				= 0x00800000;
+		static const int32_t JIT_IMPL				= 0x00800000;
 		
 // begin AVMPLUS_UNCHECKED_HACK
-		static const int UNCHECKED				= 0x01000000;
+		static const int32_t UNCHECKED				= 0x01000000;
 		
 		// Note, this means "makeIntoPrototypeFunction has been called on me",
 		// *not* "I am a function on a prototype object".
-		static const int PROTOFUNC				= 0x02000000;
+		static const int32_t PROTOFUNC				= 0x02000000;
 // end AVMPLUS_UNCHECKED_HACK
 
-		// unused:								= 0x04000000;
+#ifdef VMCFG_AOT
+		static const int32_t AOT_COMPILED			= 0x04000000;
+#endif
 		// unused:								= 0x08000000;
 		// unused:								= 0x10000000;
 		// unused:								= 0x20000000;
@@ -193,7 +210,7 @@ namespace avmplus
 
     public:
 		// ctor for all normal methods.
-		MethodInfo(int _method_id, 
+		MethodInfo(int32_t _method_id, 
 					PoolObject* pool, 
 					const uint8_t* abc_info_pos, 
 					uint8_t abcFlags,
@@ -203,13 +220,15 @@ namespace avmplus
 		enum InitMethodStub { kInitMethodStub };
 		MethodInfo(InitMethodStub, Traits* declTraits);
 
-#if defined FEATURE_NANOJIT
-		MethodInfo(GprMethodProc interfaceTramp, Traits* declTraits);
+#ifdef VMCFG_AOT
+        MethodInfo(InitMethodStub, Traits* declTraits, const NativeMethodInfo* native_info);
 #endif
 
-		static uintptr_t verifyEnter(MethodEnv* env, int argc, uint32* ap);
+		static uintptr_t verifyEnterGPR(MethodEnv* env, int32_t argc, uint32_t* ap);
+		static double verifyEnterFPR(MethodEnv* env, int32_t argc, uint32_t* ap);
+		static Atom verifyCoerceEnter(MethodEnv* env, int32_t argc, Atom* args);
 
-		inline uintptr_t iid() const { return ((uintptr_t)this)>>3; }
+		uintptr_t iid() const;
 
 		bool usesCallerContext() const;
 
@@ -219,19 +238,24 @@ namespace avmplus
 
 		void resolveSignature(const Toplevel* toplevel);
 
+		Traits* resolveActivation(const Toplevel* toplevel);
+
 #ifdef DEBUGGER
 	public:
 		static AvmBox debugEnterExitWrapper32(AvmMethodEnv env, uint32_t argc, AvmBox* argv);
 		static double debugEnterExitWrapperN(AvmMethodEnv env, uint32_t argc, AvmBox* argv);
 
-		void boxLocals(void* src, int srcPos, Traits** traitArr, Atom* dest, int destPos, int length);
-		void unboxLocals(Atom* src, int srcPos, Traits** traitArr, void* dest, int destPos, int length);
+        Atom boxOneLocal(FramePtr src, int32_t srcPos, Traits** traitArr);
+        void unboxOneLocal(Atom src, FramePtr dst, int32_t dstPos, Traits** traitArr);
+
+		void boxLocals(FramePtr src, int32_t srcPos, Traits** traitArr, Atom* dest, int32_t destPos, int32_t length);
+		void unboxLocals(const Atom* src, int32_t srcPos, Traits** traitArr, FramePtr dest, int32_t destPos, int32_t length);
 
 		void setFile(AbcFile* file);
-		void setRegName(int index, Stringp name);
+		void setRegName(int32_t index, Stringp name);
 
-		Stringp getArgName(int index);
-		Stringp getLocalName(int index);
+		Stringp getArgName(int32_t index);
+		Stringp getLocalName(int32_t index);
 
 		AbcFile* file() const;
 		int32_t firstSourceLine() const;
@@ -244,149 +268,140 @@ namespace avmplus
 		void updateSourceLines(int32_t linenum, int32_t offset);
 
 	private:
-		Stringp getRegName(int index) const;
+		Stringp getRegName(int32_t index) const;
 		DebuggerMethodInfo* dmi() const;
 #endif
 
 	public:
 
-		void verify(Toplevel* toplevel);
+		void verify(Toplevel* toplevel, AbcEnv* abc_env);
         void setInterpImpl();
+		void setNativeImpl(GprMethodProc p);
 
 	public:
 		
-		void makeIntoPrototypeFunction(const Toplevel* toplevel);
+		Traits* makeIntoPrototypeFunction(const Toplevel* toplevel, const ScopeTypeChain* fscope);
 		bool makeMethodOf(Traits* type);
 
+		int32_t allowExtraArgs() const;
+		int32_t hasExceptions() const;
+		int32_t hasMethodBody() const;
+		int32_t hasOptional() const;
+		int32_t isNative() const;
+		int32_t isNonInterruptible();
+		int32_t isResolved() const;
+		int32_t needActivation() const;
+		int32_t needArguments() const;
+		int32_t needClosure() const;
+		int32_t needRest() const;
+		int32_t needRestOrArguments() const;
+		int32_t setsDxns() const;
+		int32_t suggestInterp() const;
+		int32_t unboxThis() const;
 
-		inline int allowExtraArgs() const { return _flags & (NEED_REST|NEED_ARGUMENTS|IGNORE_REST); }
-		inline int hasExceptions() const { return _flags & HAS_EXCEPTIONS; }
-		inline int hasMethodBody() const { return !(_flags & ABSTRACT_METHOD); }
-		inline int hasOptional() const { return _flags & HAS_OPTIONAL; }
-		inline int isNative() const { return _flags & NATIVE; }
-		inline int isNonInterruptible() { return _flags & NON_INTERRUPTIBLE; }
-		inline int isResolved() { return _flags & RESOLVED; }
-		inline int needActivation() const { return _flags & NEED_ACTIVATION; }
-		inline int needArguments() const { return _flags & NEED_ARGUMENTS; }
-		inline int needClosure() const { return _flags & NEED_CLOSURE; }
-		inline int needRest() const { return _flags & NEED_REST; }
-		inline int needRestOrArguments() const { return _flags & (NEED_REST|NEED_ARGUMENTS); }
-		inline int setsDxns() const { return _flags & SETS_DXNS; }
-		inline int suggestInterp() const { return _flags & SUGGEST_INTERP; }
-		inline int unboxThis() const { return _flags & UNBOX_THIS; }
-		inline int isJitImpl() const { return _flags & JIT_IMPL; } // @ todo, Flash needs this for now, remove soon
+		void setUnboxThis();
+		void setSuggestInterp();
+		void setHasExceptions();
+		void setNeedsDxns();
+		void setFinal();
+		void setOverride();
+		void makeNonInterruptible();
+		void setKind(TraitKind kind);
 
-		inline void setUnboxThis() { _flags |= UNBOX_THIS; }
-		inline void setSuggestInterp() { _flags |= SUGGEST_INTERP; }
-		inline void setHasExceptions() { _flags |= HAS_EXCEPTIONS; }
-		inline void setNeedsDxns() { _flags |= NEEDS_DXNS; }
-		inline void setFinal() { _flags |= FINAL; }
-		inline void setOverride() { _flags |= OVERRIDE; }
-		inline void makeNonInterruptible() { _flags |= NON_INTERRUPTIBLE; }
-
-		inline void setKind(TraitKind kind) 
-		{ 
-			if (kind == TRAIT_Getter)
-				_flags |= MethodInfo::IS_GETTER;
-			else if (kind == TRAIT_Setter)
-				_flags |= MethodInfo::IS_SETTER;
-		}
-		
 #ifdef AVMPLUS_VERIFYALL
-		inline int isVerified() const { return _flags & VERIFIED; }
-		inline int isVerifyPending() { return _flags & VERIFY_PENDING; }
-		inline void setVerified() { _flags = (_flags | VERIFIED) & ~VERIFY_PENDING; }
-		inline void setVerifyPending() { _flags |= VERIFY_PENDING; }
+		int32_t isVerified() const;
+		int32_t isVerifyPending() const;
+		void setVerified();
+		void setVerifyPending();
 #endif
 
-
-#ifdef AVMPLUS_TRAITS_MEMTRACK
-	protected:
-		virtual ~MethodInfo();
+#ifdef VMCFG_AOT
+		static int32_t compiledMethodFlags();
+		int32_t isCompiledMethod() const;
+		void setCompiledMethod();
 #endif
 
 	public:
 
 #if VMCFG_METHOD_NAMES
-		Stringp FASTCALL getMethodName() const;
+		Stringp FASTCALL getMethodNameWithTraits(Traits* declaringTraits, bool includeAllNamespaces = false) const;
+		Stringp FASTCALL getMethodName(bool includeAllNamespaces = false) const;
 #endif		
 
 #ifdef AVMPLUS_VERBOSE
 		Stringp format(AvmCore* core) const;
 #endif
 #ifdef DEBUGGER
-		uint32 size();
+		uint32_t size();
 #endif
 
 	public:
 
-		inline PoolObject* pool() const { return _pool; }
+		PoolObject* pool() const;
+		AvmThunkNativeThunker thunker() const;
+#ifdef AVMPLUS_INDIRECT_NATIVE_THUNKS
+		AvmThunkNativeMethodHandler handler_method() const;
+		AvmThunkNativeFunctionHandler handler_function() const;
+#endif
 
-		inline AvmThunkNativeThunker thunker() const { AvmAssert(isNative()); return _native.thunker; }
-		inline AvmThunkNativeMethodHandler handler_method() const { AvmAssert(isNative()); return _native.handler.method; }
-		inline AvmThunkNativeFunctionHandler handler_function() const { AvmAssert(isNative()); return _native.handler.function; }
+		const uint8_t* abc_body_pos() const;
+		void set_abc_body_pos(const uint8_t* p);
+		void set_abc_body_pos_wb(MMgc::GC* gc, const uint8_t* p);
 
-		inline const uint8_t* abc_body_pos() const { AvmAssert(!isNative()); return _abc.body_pos; }
-		inline void set_abc_body_pos(const uint8_t* p) { AvmAssert(!isNative()); _abc.body_pos = p; }
-		inline void set_abc_body_pos_wb(MMgc::GC* gc, const uint8_t* p) { AvmAssert(!isNative()); WB(gc, this, &_abc.body_pos, p); }
-
-		inline ExceptionHandlerTable* abc_exceptions() const { AvmAssert(!isNative()); return _abc.exceptions; }
-		inline void set_abc_exceptions(MMgc::GC* gc, ExceptionHandlerTable* e) { AvmAssert(!isNative()); WB(gc, this, &_abc.exceptions, e); }
+		ExceptionHandlerTable* abc_exceptions() const;
+		void set_abc_exceptions(MMgc::GC* gc, ExceptionHandlerTable* e);
 
 	#ifdef AVMPLUS_WORD_CODE
-
-		inline ExceptionHandlerTable* word_code_exceptions() const { AvmAssert(!isNative()); return _abc.word_code.exceptions; }
-		inline void set_word_code_exceptions(MMgc::GC* gc, ExceptionHandlerTable* e) { AvmAssert(!isNative()); WB(gc, this, &_abc.word_code.exceptions, e); }
-
-		inline const uintptr_t* word_code_start() const { AvmAssert(!isNative()); return _abc.word_code.translated_code->data; }
-		inline void set_word_code(MMgc::GC* gc, TranslatedCode* translated_code) 
-		{ 
-			AvmAssert(!isNative()); 
-			WB(gc, this, &_abc.word_code.translated_code, translated_code);
-		}
-
-		inline int word_code_cache_size() const { AvmAssert(!isNative()); return _abc.word_code.cache_size; }
-		inline void set_word_code_cache_size(int s) { AvmAssert(!isNative()); _abc.word_code.cache_size = s; }
-	
+		ExceptionHandlerTable* word_code_exceptions() const;
+		void set_word_code_exceptions(MMgc::GC* gc, ExceptionHandlerTable* e);
+		const uintptr_t* word_code_start() const;
+		void set_word_code(MMgc::GC* gc, TranslatedCode* translated_code);
 	#endif
 
-		inline int method_id() const { return _method_id; }
+	#ifdef VMCFG_LOOKUP_CACHE
+		int32_t lookup_cache_size() const;
+		void set_lookup_cache_size(int32_t s);
+	#endif
 
-		inline GprMethodProc implGPR() const { return _implGPR; }
-		inline FprMethodProc implFPR() const { return _implFPR; }
-		inline Traits* declaringTraits() const { return _declaringTraits; }
-		inline const ScopeTypeChain* declaringScope() const { return _declaringTraits->scope(); }
-		inline Traits* activationTraits() const { return _activationTraits; }
+		int32_t method_id() const;
 
-		inline void set_activationTraits(Traits* t) { _activationTraits = t; }
+		Traits* declaringTraits() const;
+		const ScopeTypeChain* declaringScope() const;
+		Traits* activationTraits() const;
+		const ScopeTypeChain* activationScope() const;
 
-		inline MethodSignaturep getMethodSignature()
-		{
-			AvmAssert(isResolved());
-			AvmAssert(_msref != NULL);
-			MethodSignaturep ms;
-			if ((ms = (MethodSignaturep)_msref->get()) == NULL)
-				ms = _getMethodSignature();
-			return ms;
-		}
-
-		void update_max_stack(int max_stack);
+        bool hasNoScopeAndNotClassInitializer() const;
+    
+		// note, these are called "init" (rather than "set") because they 
+		// should be called exactly once per MethodInfo.
+		void init_activationTraits(Traits* t);
+		void init_declaringScope(const ScopeTypeChain* s);
+		
+		MethodSignaturep getMethodSignature();
+		void update_max_stack(int32_t max_stack);
 
 	private:
 		MethodSignature* FASTCALL _getMethodSignature();
 		MethodSignature* FASTCALL _buildMethodSignature(const Toplevel* toplevel);
 
+		void init_activationScope(const ScopeTypeChain* s);
+
 	private:
 		struct NativeInfo
 		{
 			AvmThunkNativeThunker thunker;
+#ifdef AVMPLUS_INDIRECT_NATIVE_THUNKS
 			AvmThunkNativeHandler handler;
+#endif
 		};
 
 		struct AbcInfo
 		{
 			const uint8_t*			body_pos;
 			ExceptionHandlerTable*	exceptions;		// we write this once, in Verifier, with an explicit WB.  so no DWB.
+	#ifdef VMCFG_LOOKUP_CACHE
+			int						lookup_cache_size;     // Number of items in lookup cache
+	#endif
 	#ifdef AVMPLUS_WORD_CODE
 			struct 
 			{
@@ -394,22 +409,18 @@ namespace avmplus
 				// We write this once, in WordcodeTranslator, with an explicit WB.  so no DWB.
 				// The contents are the same as the 'exceptions' structure above, except the 'from', 'to', and 'target' fields.
 				ExceptionHandlerTable*	exceptions;
-				int						cache_size;     // Number of items in lookup cache
 			} word_code;
 	#endif
 		};
 
+	private:
+		static const uintptr_t IS_TRAITS = 0x01;
+	
 	// ------------------------ DATA SECTION BEGIN
 	private:
-		// these are (probably) most-frequently accessed so put at offset zero (allow LIR to generate trivially smaller code)
-		union 
-		{
-			GprMethodProc	_implGPR;
-			FprMethodProc	_implFPR;
-		};
-		DWB(MMgc::GCWeakRef*)	_msref;				// our MethodSignature 
-		DWB(Traits*)			_declaringTraits;
-		DWB(Traits*)			_activationTraits;
+		DWB(MMgc::GCWeakRef*)	_msref;						// our MethodSignature 
+		uintptr_t				_declaringScopeOrTraits;	// if LSB set, Traits*   if LSB clr, ScopeTypeChain*
+		uintptr_t				_activationScopeOrTraits;	// if LSB set, Traits*   if LSB clr, ScopeTypeChain*
 		PoolObject* const		_pool;
 		const uint8_t* const	_abc_info_pos;		// pointer to abc MethodInfo record 
 		int						_flags;				// see bitmask defs above 
@@ -426,10 +437,6 @@ namespace avmplus
 	{
 		friend class MethodInfo;
 	public:
-#ifdef AVMPLUS_TRAITS_MEMTRACK 
-		MethodSignature();
-		virtual ~MethodSignature();
-#endif
 	private:
 		union AtomOrType
 		{
@@ -438,37 +445,31 @@ namespace avmplus
 		};
 		
 	public:
-		inline Traits* returnTraits() const { return _returnTraits; }
-		inline BuiltinType returnTraitsBT() const { return Traits::getBuiltinType(_returnTraits); }
+		Traits* returnTraits() const;
+		BuiltinType returnTraitsBT() const;
 
-		inline int param_count() const { return _param_count; }
-		inline int optional_count() const { return _optional_count; }
-		inline int rest_offset() const { return _rest_offset; }
+		int32_t param_count() const;
+		int32_t optional_count() const;
+		int32_t rest_offset() const;
 
-		inline int max_stack() const { AvmAssert(!(_flags & MethodInfo::NATIVE)); return _max_stack; }
-		inline int local_count() const { AvmAssert(!(_flags & MethodInfo::NATIVE)); return _local_count; }
-		inline int max_scope() const { AvmAssert(!(_flags & MethodInfo::NATIVE)); return _max_scope; }
-		inline int frame_size() const { AvmAssert(!(_flags & MethodInfo::NATIVE)); return _frame_size; }
+		int32_t max_stack() const;
+		int32_t local_count() const;
+		int32_t max_scope() const;
+		int32_t frame_size() const;
 
 	#ifdef AVMPLUS_WORD_CODE
 	#else
-		inline const uint8_t* abc_code_start() const { return _abc_code_start; }
+		const uint8_t* abc_code_start() const;
 	#endif
 	
-		inline int requiredParamCount() const { return _param_count - _optional_count; }
+		int32_t requiredParamCount() const;
 
-		inline Traits* paramTraits(int i) const { AvmAssert(i >= 0 && i <= _param_count); return _args[i].paramType; }
-		inline BuiltinType paramTraitsBT(int i) const { AvmAssert(i >= 0 && i <= _param_count); return Traits::getBuiltinType(_args[i].paramType); }
-		inline Atom getDefaultValue(int i) const { AvmAssert(i >= 0 && i < _optional_count); return _args[i+_param_count+1].defaultValue; }
+		Traits* paramTraits(int32_t i) const;
+		BuiltinType paramTraitsBT(int32_t i) const;
+		Atom getDefaultValue(int32_t i) const;
 
-		inline bool argcOk(int argc) const
-		{
-			const int ALLOW_EXTRA_ARGS = MethodInfo::NEED_REST | MethodInfo::NEED_ARGUMENTS | MethodInfo::IGNORE_REST;
-			return argc >= (_param_count - _optional_count) && 
-					(argc <= _param_count || (_flags & ALLOW_EXTRA_ARGS));
-		}
-
-		void boxArgs(AvmCore* core, int argc, const uint32_t* ap, Atom* out) const;
+		bool argcOk(int32_t argc) const;
+		void boxArgs(AvmCore* core, int32_t argc, const uint32_t* ap, Atom* out) const;
 		
 	// ------------------------ DATA SECTION BEGIN
 	private:

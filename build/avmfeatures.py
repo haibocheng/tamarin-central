@@ -45,40 +45,110 @@
 
 def featureSettings(o):
     args = ""
-    if o.getBoolArg("debugger"):
+    arg = o.getBoolArg("debugger")
+    if (arg == True):
         args += "-DAVMFEATURE_DEBUGGER=1 "
-    if o.getBoolArg("allocation-sampler"):
+    if (arg == False):
+        args += "-DAVMFEATURE_DEBUGGER=0 "
+    arg = o.getBoolArg("allocation-sampler")
+    if (arg == True):
         args += "-DAVMFEATURE_ALLOCATION_SAMPLER=1 "
-    if o.getBoolArg("vtune"):
+    if (arg == False):
+        args += "-DAVMFEATURE_ALLOCATION_SAMPLER=0 "
+    arg = o.getBoolArg("vtune")
+    if (arg == True):
         args += "-DAVMFEATURE_VTUNE=1 "
+    if (arg == False):
+        args += "-DAVMFEATURE_VTUNE=0 "
     if o.getBoolArg("jit"):
-        args += "-DAVMFEATURE_JIT=1 "
+        args += "-DAVMFEATURE_JIT=1 -DAVMFEATURE_WORDCODE_INTERP=0 "
+    arg = o.getBoolArg("aot")
+    if (arg == True):
+        args += "-DAVMFEATURE_AOT=1 "
+    if (arg == False):
+        args += "-DAVMFEATURE_AOT=0 "
     if o.getBoolArg("abc-interp"):
         args += "-DAVMFEATURE_ABC_INTERP=1 -DAVMFEATURE_WORDCODE_INTERP=0 "
     if o.getBoolArg("wordcode-interp"):
-        args += "-DAVMFEATURE_WORDCODE_INTERP=1 -DAVMFEATURE_ABC_INTERP=0 "
-    if o.getBoolArg("threaded-interp"):
+        args += "-DAVMFEATURE_WORDCODE_INTERP=1 -DAVMFEATURE_ABC_INTERP=0 -DAVMFEATURE_JIT=0 "
+    arg = o.getBoolArg("threaded-interp")
+    if (arg == True):
         args += "-DAVMFEATURE_THREADED_INTERP=1 "
-    if o.getBoolArg("selftest"):
+    if (arg == False):
+        args += "-DAVMFEATURE_THREADED_INTERP=0 "
+    arg = o.getBoolArg("selftest")
+    if (arg == True):
         args += "-DAVMFEATURE_SELFTEST=1 "
-    if o.getBoolArg("utf32"):
-        args += "-DAVMFEATURE_UTF32=1 "
-    if o.getBoolArg("eval"):
+    if (arg == False):
+        args += "-DAVMFEATURE_SELFTEST=0 "
+    arg = o.getBoolArg("eval")
+    if (arg == True):
         args += "-DAVMFEATURE_EVAL=1 "
-    if o.getBoolArg("protect-jitmem"):
+    if (arg == False):
+        args += "-DAVMFEATURE_EVAL=0 "
+    arg = o.getBoolArg("protect-jitmem")
+    if (arg == True):
         args += "-DAVMFEATURE_PROTECT_JITMEM=1 "
-    if o.getBoolArg("shared-gcheap"):
+    if (arg == False):
+        args += "-DAVMFEATURE_PROTECT_JITMEM=0 "
+    arg = o.getBoolArg("shared-gcheap")
+    if (arg == True):
         args += "-DAVMFEATURE_SHARED_GCHEAP=1 "
-    if o.getBoolArg("use-system_malloc"):
+    if (arg == False):
+        args += "-DAVMFEATURE_SHARED_GCHEAP=0 "
+    arg = o.getBoolArg("use-system-malloc")
+    if (arg == True):
         args += "-DAVMFEATURE_USE_SYSTEM_MALLOC=1 "
-    if o.getBoolArg("cpp-exceptions"):
+    if (arg == False):
+        args += "-DAVMFEATURE_USE_SYSTEM_MALLOC=0 "
+    arg = o.getBoolArg("cpp-exceptions")
+    if (arg == True):
         args += "-DAVMFEATURE_CPP_EXCEPTIONS=1 "
-    if o.getBoolArg("interior-pointers"):
+    if (arg == False):
+        args += "-DAVMFEATURE_CPP_EXCEPTIONS=0 "
+    arg = o.getBoolArg("interior-pointers")
+    if (arg == True):
         args += "-DAVMFEATURE_INTERIOR_POINTERS=1 "
-    if o.getBoolArg("jni"):
+    if (arg == False):
+        args += "-DAVMFEATURE_INTERIOR_POINTERS=0 "
+    arg = o.getBoolArg("jni")
+    if (arg == True):
         args += "-DAVMFEATURE_JNI=1 "
-    if o.getBoolArg("heap-alloca"):
+    if (arg == False):
+        args += "-DAVMFEATURE_JNI=0 "
+    arg = o.getBoolArg("heap-alloca")
+    if (arg == True):
         args += "-DAVMFEATURE_HEAP_ALLOCA=1 "
-    if o.getBoolArg("static-function_ptrs"):
+    if (arg == False):
+        args += "-DAVMFEATURE_HEAP_ALLOCA=0 "
+    arg = o.getBoolArg("static-function-ptrs")
+    if (arg == True):
         args += "-DAVMFEATURE_STATIC_FUNCTION_PTRS=1 "
+    if (arg == False):
+        args += "-DAVMFEATURE_STATIC_FUNCTION_PTRS=0 "
+    arg = o.getBoolArg("indirect-native-thunks")
+    if (arg == True):
+        args += "-DAVMFEATURE_INDIRECT_NATIVE_THUNKS=1 "
+    if (arg == False):
+        args += "-DAVMFEATURE_INDIRECT_NATIVE_THUNKS=0 "
+    arg = o.getBoolArg("override-global-new")
+    if (arg == True):
+        args += "-DAVMFEATURE_OVERRIDE_GLOBAL_NEW=1 "
+    if (arg == False):
+        args += "-DAVMFEATURE_OVERRIDE_GLOBAL_NEW=0 "
+    arg = o.getBoolArg("memory-profiler")
+    if (arg == True):
+        args += "-DAVMFEATURE_MEMORY_PROFILER=1 "
+    if (arg == False):
+        args += "-DAVMFEATURE_MEMORY_PROFILER=0 "
+    arg = o.getBoolArg("cache-gqcn")
+    if (arg == True):
+        args += "-DAVMFEATURE_CACHE_GQCN=1 "
+    if (arg == False):
+        args += "-DAVMFEATURE_CACHE_GQCN=0 "
+    arg = o.getBoolArg("api-versioning")
+    if (arg == True):
+        args += "-DAVMFEATURE_API_VERSIONING=1 "
+    if (arg == False):
+        args += "-DAVMFEATURE_API_VERSIONING=0 "
     return args

@@ -80,10 +80,10 @@
 namespace avmplus
 {
 	XMLObject::XMLObject(XMLClass *type, E4XNode *node)
-		: ScriptObject(type->ivtable(), type->prototype)
+		: ScriptObject(type->ivtable(), type->prototype), m_node(node)
 	{
 		SAMPLE_FRAME("XML", this->core());
-		setNode( node );
+		this->publicNS = core()->findPublicNamespace();
 	}
 
 	// This is considered the "toXML function"
@@ -92,6 +92,12 @@ namespace avmplus
 	{
 		SAMPLE_FRAME("XML", this->core());
 		#if 0//def _DEBUG
+		// *** NOTE ON THREAD SAFETY ***
+		//
+		// Enabling this code means that there may be a race to initialize 'once' on different
+		// threads, or, alternatively, that only one core gets to run this code, not each core
+		// individually.  This may or may not be OK, but needs to be considered before enabling
+		// the code.
 		static bool once = false;
 		if (!once)
 		{
@@ -102,13 +108,13 @@ namespace avmplus
 			AvmDebugMsg(false, "sizeof(E4XNodeAux): %d\r\n", sizeof(E4XNodeAux));
 		}
 		#endif
-		m_node = 0;
 		if (!str)
 			return;
 
 		AvmCore *core = this->core();
 		Toplevel* toplevel = this->toplevel();
 		MMgc::GC *gc = core->GetGC();
+		this->publicNS = core->findPublicNamespace();
 
 		AvmAssert(traits()->getSizeOfInstance() == sizeof(XMLObject));
 		AvmAssert(traits()->getExtraSize() == 0);
@@ -131,7 +137,7 @@ namespace avmplus
 			// create a namespace for the parent using defaultNamespace->URI()
 			Namespace *ns = core->internNamespace (core->newNamespace (core->kEmptyString->atom(), defaultNamespace->getURI()->atom()));
 
-			m_node->_addInScopeNamespace (core, ns);
+			m_node->_addInScopeNamespace (core, ns, publicNS);
 
 			Stringp name = core->internConstantStringLatin1("parent");
 
@@ -144,6 +150,7 @@ namespace avmplus
 
 		while ((m_status = parser.getNext(tag)) == XMLParser::kNoError)
 		{
+
 			E4XNode* pNewElement = NULL;
 
 			switch (tag.nodeType)
@@ -162,20 +169,20 @@ namespace avmplus
 					// A closing tag
 					if (tag.text->charAt(0) == '/')
 					{
-						Stringp thisNodeNameNoSlash = tag.text->substring(1);
-						
-						Multiname m;
-						p->getQName(core, &m);
-						Namespace *ns = m.getNamespace();
+						const int32_t nodeNameStart = 1; // skip the slash
 
-						// Get our parents qualified name string here
+						Multiname m;
+						p->getQName(&m, publicNS);
+						Namespace* ns = m.getNamespace();
+
+						// Get our parent's qualified name string here
 						Stringp parentName = m.getName();
 
-						Namespace *ns2 = toplevel->getDefaultNamespace();
-						if ((!NodeNameEquals(thisNodeNameNoSlash, parentName, ns)) &&
+						if (!NodeNameEquals(tag.text, nodeNameStart, parentName, ns) &&
 							// We're trying to support paired nodes where the first node gets a namespace
 							// from the default namespace.
-							(*m.getName() != *thisNodeNameNoSlash) && (ns->getURI() == ns2->getURI()))
+							parentName->Compare(*tag.text, nodeNameStart, tag.text->length()-nodeNameStart) != 0 && 
+							ns->getURI() == toplevel->getDefaultNamespace()->getURI())
 						{
 							// If p == m_node, we are at the top of our tree and we're parsing the fake "parent"
 							// wrapper tags around our actual XML text.  Instead of warning about a missing "</parent>"
@@ -218,7 +225,7 @@ namespace avmplus
 						}
 
 						// Needs to happen after setting m_name->name so throw error can use name in routine
-						e->CopyAttributesAndNamespaces(core, toplevel, tag);
+						e->CopyAttributesAndNamespaces(core, toplevel, tag, publicNS);
 
 						// Find a namespace that matches this tag in our parent chain.  If this name
 						// is a qualified name (ns:name), we search for a namespace with a matching
@@ -227,8 +234,11 @@ namespace avmplus
 
 						// pg 35, map [[name]].uri to "namespace name" of node
 
-						if (!ns) 
-							ns = core->publicNamespace;
+						if (!ns) {
+							// NOTE use caller's public
+							ns = core->findPublicNamespace();
+						}
+
 						pNewElement->setQName(core, tag.text, ns);
 					}
 				}
@@ -284,11 +294,12 @@ namespace avmplus
 					else
 					{
 						name = tag.text->substring(0, space);
-						while (String::isSpace((wchar) tag.text->charAt (++space))) {}
+						while (String::isSpace((wchar) tag.text->charAt(++space))) {}
 						val  = tag.text->substring(space, tag.text->length());
 					}
 					pNewElement = new (gc) PIE4XNode(0, val); 
-					pNewElement->setQName (core, name, core->publicNamespace);
+					// NOTE use caller's public
+					pNewElement->setQName (core, name, core->findPublicNamespace());
 					if (!m_node)
 						setNode( pNewElement );
 				}
@@ -354,22 +365,19 @@ namespace avmplus
 		if ( p != m_node && ! m_status )
 		{
 			Multiname m;
-			p->getQName(core, &m);
+			p->getQName(&m, publicNS);
 
 			// Get our parents qualified name string here
 			Stringp parentName = m.getName();
 
 			toplevel->throwTypeError(kXMLUnterminatedElementTag, parentName, parentName);
 		}
+
 	}
 
-	XMLObject::~XMLObject()
+	bool XMLObject::NodeNameEquals(Stringp nodeName, int32_t nodeNameStart, Stringp parentName, Namespace * parentNs)
 	{
-		setNode(NULL);
-	}
-
-	bool XMLObject::NodeNameEquals(Stringp nodeName, Stringp parentName, Namespace * parentNs)
-	{
+		int32_t const nodeNameLength = nodeName->length() - nodeNameStart;
 		if (parentNs && parentNs->hasPrefix())
 		{
 			AvmCore *core = this->core();
@@ -378,22 +386,22 @@ namespace avmplus
 
 			// Does nodeName == parentNS:parentName
 			int totalLen = prefixLen + 1 + parentName->length(); // + 1 for ':' separator
-			if (totalLen != nodeName->length())
+			if (totalLen != nodeNameLength)
 				return false;
 
-			if (parentNSName->Compare(*nodeName, 0, prefixLen) != 0)
+			if (parentNSName->Compare(*nodeName, nodeNameStart, prefixLen) != 0)
 				return false;
 
-			if (nodeName->charAt(prefixLen) != ':')
+			if (nodeName->charAt(nodeNameStart + prefixLen) != ':')
 				return false;
 
 			// -1 for ':'
 			prefixLen++;
-			return (parentName->Compare(*nodeName, prefixLen, nodeName->length() - prefixLen) == 0); 
+			return (parentName->Compare(*nodeName, nodeNameStart + prefixLen, nodeNameLength - prefixLen) == 0); 
 		}
 		else
 		{
-			return *parentName == *nodeName;
+			return parentName->Compare(*nodeName, nodeNameStart, nodeNameLength) == 0; 
 		}
 	}
 
@@ -472,8 +480,11 @@ namespace avmplus
 
 		XMLListObject *xl = new (core->GetGC()) XMLListObject(toplevel->xmlListClass(), this->atom(), &name);
 
+
 		if (name.isAttr())
 		{
+			// does not hurt, but makes things faster
+			xl->checkCapacity(m_node->numAttributes());
 			// for each a in x.[[attributes]]
 			for (uint32 i = 0; i < m_node->numAttributes(); i++)
 			{
@@ -482,16 +493,16 @@ namespace avmplus
 				AvmAssert(xml && xml->getClass() == E4XNode::kAttribute);
 
 				Multiname m;
-				AvmAssert(xml->getQName(core, &m) != 0);
+				AvmAssert(xml->getQName(&m, publicNS) != 0);
 
 				//if (((n.[[Name]].localName == "*") || (n.[[Name]].localName == a.[[Name]].localName)) &&
 				//	((n.[[Name]].uri == nulll) || (n.[[Name]].uri == a.[[Name]].uri)))
 				//	l.append (a);
 
-				xml->getQName (core, &m);
+				xml->getQName(&m, publicNS);
 				if (name.matches(&m))
 				{
-					xl->_append (xml);
+					xl->_appendNode (xml);
 				}
 			}
 
@@ -504,6 +515,9 @@ namespace avmplus
 //			and (!n.uri) or (this[k].class == "element) and (n.uri == this[k].name.uri)))
 //			xl->_append (x[k]);
 
+		if (name.isAnyName())
+			xl->checkCapacity(m_node->numChildren());
+
 		for (uint32 i = 0; i < m_node->numChildren(); i++)
 		{
 			E4XNode *child = m_node->_getAt(i);
@@ -511,7 +525,7 @@ namespace avmplus
 			Multiname *m2 = 0;
 			if (child->getClass() == E4XNode::kElement)
 			{
-				child->getQName(core, &m);
+				child->getQName(&m, publicNS);
 				m2 = &m;
 			}
 
@@ -520,7 +534,7 @@ namespace avmplus
 			//		xl->_append (x[k]);
 			if (name.matches(m2))
 			{
-				xl->_append (child);
+				xl->_appendNode (child);
 			}
 		}
 
@@ -556,9 +570,9 @@ namespace avmplus
 		{
 			XMLListObject *src = AvmCore::atomToXMLList(V);
 			if ((src->_length() == 1) && src->_getAt(0)->getClass() & (E4XNode::kText | E4XNode::kAttribute))
-		{
-			c = core->string(V)->atom();
-		}
+            {
+                c = core->string(V)->atom();
+            }
 			else
 			{
 				c = src->_deepCopy()->atom();									
@@ -584,6 +598,7 @@ namespace avmplus
 #endif // STRING_DEBUG
 			c = core->string(V)->atom();
 		}
+
 
 		// step 5
 		//Atom n = core->ToXMLName (P);
@@ -626,7 +641,7 @@ namespace avmplus
 			{
 				E4XNode *x = m_node->getAttribute(j);
 				Multiname m2;
-				x->getQName(core, &m2);
+				x->getQName(&m2, publicNS);
 				if (m.matches(&m2))
 				{
 					if (a == -1)
@@ -640,19 +655,22 @@ namespace avmplus
 					}
 				}
 			}
+
+            Stringp name = !m.isAnyName() ? m.getName() : NULL;
+            Atom nameAtom = name ? name->atom() : nullStringAtom;
 			if (a == -1) // step 7f
 			{
 				E4XNode *e = new (core->GetGC()) AttributeE4XNode(this->m_node, sc);
 				Namespace *ns = 0;
 				if (m.namespaceCount() == 1)
 					ns = m.getNamespace();
-				e->setQName (core, m.getName(), ns);
+				e->setQName(core, name, ns);
 
 				this->m_node->addAttribute (e);
 				
-				e->_addInScopeNamespace (core, ns);
+				e->_addInScopeNamespace(core, ns, publicNS);
 
-				nonChildChanges(xmlClass()->kAttrAdded, m.getName()->atom(), sc->atom());
+				nonChildChanges(xmlClass()->kAttrAdded, nameAtom, sc->atom());
 			}
 			else // step 7g
 			{
@@ -660,7 +678,7 @@ namespace avmplus
 				Stringp prior = x->getValue();
 				x->setValue (sc);
 
-				nonChildChanges(xmlClass()->kAttrChanged, m.getName()->atom(), (prior) ? prior->atom() : undefinedAtom);
+				nonChildChanges(xmlClass()->kAttrChanged, nameAtom, (prior) ? prior->atom() : undefinedAtom);
 			}
 
 			// step 7h
@@ -679,8 +697,7 @@ namespace avmplus
 
 		// step 10
 		int32 i = -1; // -1 is undefined in spec
-		bool primitiveAssign = ((!AvmCore::isXML(c) && !AvmCore::isXMLList(c)) && 
-			(!m.isAnyName()));
+		bool primitiveAssign = ((!AvmCore::isXML(c) && !AvmCore::isXMLList(c)) && (!m.isAnyName()));
 
 		// step 12
 		bool notify = notifyNeeded(getNode());
@@ -692,7 +709,7 @@ namespace avmplus
 				
 			if (x->getClass() == E4XNode::kElement)
 			{
-				x->getQName (core, &mx);
+				x->getQName(&mx, publicNS);
 				m2 = &mx;
 			}
 
@@ -738,7 +755,7 @@ namespace avmplus
 				XMLObject *y = new (core->GetGC())  XMLObject (toplevel->xmlClass(), e);
 
 				m_node->_replace (core, toplevel, i, y->atom());
-				e->_addInScopeNamespace (core, ns);
+				e->_addInScopeNamespace (core, ns, publicNS);
 			}
 		}
 
@@ -824,7 +841,7 @@ namespace avmplus
 			{
 				E4XNode *x = m_node->getAttribute(j);
 				Multiname m2;
-				x->getQName(core, &m2);
+				x->getQName(&m2, publicNS);
 				if (m.matches(&m2))
 				{
 					x->setParent(NULL);
@@ -833,7 +850,7 @@ namespace avmplus
 					m_node->getAttributes()->removeAt (j);
 
 					Multiname previous;
-					x->getQName(core, &previous);
+					x->getQName(&previous, publicNS);
 					Stringp name = previous.getName();
 					Stringp val = x->getValue();
 					nonChildChanges(xmlClass()->kAttrRemoved, (name) ? name->atom() : undefinedAtom, (val) ? val->atom() : undefinedAtom);
@@ -857,7 +874,7 @@ namespace avmplus
 			bool isElem = x->getClass() == (E4XNode::kElement) ? true : false;
 			if (isElem)
 			{
-				x->getQName (core, &mx);
+				x->getQName(&mx, publicNS);
 				m2 = &mx;
 			}
 
@@ -891,6 +908,8 @@ namespace avmplus
 		AvmCore *core = this->core();
 		Toplevel* toplevel = this->toplevel();
 
+		core->stackCheck(toplevel);
+
 		Multiname m;
 		toplevel->CoerceE4XMultiname(name_in, m);
 
@@ -902,13 +921,13 @@ namespace avmplus
 			{
 				E4XNode *ax = m_node->getAttribute(i);
 				Multiname m2;
-				AvmAssert(ax->getQName(core, &m2));
-				ax->getQName(core, &m2);
+				AvmAssert(ax->getQName(&m2, publicNS));
+				ax->getQName(&m2, publicNS);
 
 				if (m.matches(&m2))
 				{
 					// for each atribute, if it's name equals m,
-					l->_append (ax);
+					l->_appendNode (ax);
 				}
 			}
 		}
@@ -923,12 +942,12 @@ namespace avmplus
 				Multiname *m2 = 0;
 				if (child->getClass() == E4XNode::kElement)
 				{
-					child->getQName (core, &mx);
+					child->getQName(&mx, publicNS);
 					m2 = &mx;
 				}
 				if (m.matches(m2))
 				{
-					l->_append (child);
+					l->_appendNode (child);
 				}
 			}
 
@@ -995,8 +1014,6 @@ namespace avmplus
 
 	bool XMLObject::hasMultinameProperty(const Multiname* name_in) const
 	{
-		AvmCore *core = this->core();
-
 		Multiname m;
 		toplevel()->CoerceE4XMultiname(name_in, m);
 
@@ -1016,7 +1033,7 @@ namespace avmplus
 			{
 				E4XNode *ax = m_node->getAttribute(i);
 				Multiname m2;
-				if (ax->getQName(core, &m2) && (m.matches(&m2)))
+				if (ax->getQName(&m2, publicNS) && (m.matches(&m2)))
 				{
 					return true;
 				}
@@ -1033,7 +1050,7 @@ namespace avmplus
 			Multiname *m2 = 0;
 			if (child->getClass() == E4XNode::kElement)
 			{
-				child->getQName (core, &mx);
+				child->getQName(&mx, publicNS);
 				m2 = &mx;
 			}
 
@@ -1059,7 +1076,7 @@ namespace avmplus
 	{
 		AvmCore *core = this->core();
 
-		E4XNode *e = m_node->_deepCopy (core, toplevel());
+		E4XNode *e = m_node->_deepCopy (core, toplevel(), publicNS);
 
 		XMLObject *y = new (core->GetGC()) XMLObject(xmlClass(), e);
 
@@ -1145,6 +1162,8 @@ namespace avmplus
 	{
 		AvmCore *core = this->core();
 
+		core->stackCheck(toplevel());
+
 		if (toplevel()->xmlClass()->okToPrettyPrint()) 
 		{
 			for (int i = 0; i < indentLevel; i++)
@@ -1185,12 +1204,13 @@ namespace avmplus
 			s << "-->";
 			return;
 		}
+
 		if (this->getClass() == E4XNode::kProcessingInstruction) // step 7
 		{
 			s << "<?";
 			Multiname m;
-			AvmAssert (m_node->getQName(core, &m) != 0);
-			if (m_node->getQName(core, &m))
+			AvmAssert (m_node->getQName(&m, publicNS) != 0);
+			if (m_node->getQName(&m, publicNS))
 			{
 				s << m.getName() << " ";
 			}
@@ -1236,8 +1256,8 @@ namespace avmplus
 		// step 11 - new ISNS changes
 		// If this node's namespace has an undefined prefix, generate a new one
 		Multiname m;
-		AvmAssert (getNode()->getQName (core, &m));
-		getNode()->getQName (core, &m);
+		AvmAssert (getNode()->getQName(&m, publicNS));
+		getNode()->getQName(&m, publicNS);
 		Namespace *thisNodesNamespace = GetNamespace (m, AncestorNamespaces);
 		AvmAssert(thisNodesNamespace != 0);
 		if (thisNodesNamespace->getPrefix() == undefinedAtom)
@@ -1256,17 +1276,18 @@ namespace avmplus
 			AvmAssert(an != 0);
 			AvmAssert(an->getClass() == E4XNode::kAttribute);
 			Multiname nam;
-			AvmAssert(an->getQName(core, &nam));
-			an->getQName(core, &nam);
-			Namespace *ns = GetNamespace (nam, AncestorNamespaces);
-			AvmAssert(ns != 0);
-			if (ns->getPrefix() == undefinedAtom)
-			{
-				// find a prefix and add this namespace to our list
-				ns = GenerateUniquePrefix (ns, AncestorNamespaces);
+			if (an->getQName(&nam, publicNS))
+            {
+                Namespace* ns = GetNamespace(nam, AncestorNamespaces);
+                AvmAssert(ns != 0);
+                if (ns->getPrefix() == undefinedAtom)
+                {
+                    // find a prefix and add this namespace to our list
+                    ns = GenerateUniquePrefix (ns, AncestorNamespaces);
 
-				AncestorNamespaces->push (ns->atom());
-			}
+                    AncestorNamespaces->push (ns->atom());
+                }
+            }
 		}
 		// step 12
 		s << "<";
@@ -1287,38 +1308,39 @@ namespace avmplus
 		for (uint32 i = 0; i < m_node->numAttributes(); i++)
 		{
 			// step 17a
-			s << " ";
 			E4XNode *an = m_node->getAttribute(i);
 			AvmAssert(an != 0);
 			AvmAssert(an->getClass() == E4XNode::kAttribute);
 			Multiname nam;
-			AvmAssert(an->getQName(core, &nam));
-			an->getQName(core, &nam);
+			if (an->getQName(&nam, publicNS))
+            {
+                s << " ";
 
-			// step16b-i - ans = an->getName->getNamespace(AncestorNamespace);
-			AvmAssert(nam.isAttr());
-			Namespace *attr_ns = GetNamespace (nam, AncestorNamespaces);
+                // step16b-i - ans = an->getName->getNamespace(AncestorNamespace);
+                AvmAssert(nam.isAttr());
+                Namespace *attr_ns = GetNamespace (nam, AncestorNamespaces);
 
-			//!!@step16b-ii - should never get hit now with revised 10.2.1 step 11.
-			AvmAssert(attr_ns->getPrefix() != undefinedAtom);
+                //!!@step16b-ii - should never get hit now with revised 10.2.1 step 11.
+                AvmAssert(attr_ns->getPrefix() != undefinedAtom);
 
-			// step16b-iii
-			if (attr_ns && attr_ns->hasPrefix ())
-			{
-				s << core->string(attr_ns->getPrefix()) << ":";
-			}
-			//step16b-iv
-			s << nam.getName();
+                // step16b-iii
+                if (attr_ns && attr_ns->hasPrefix ())
+                {
+                    s << core->string(attr_ns->getPrefix()) << ":";
+                }
+                //step16b-iv
+                s << nam.getName();
 
-			//step16c - namespace case - see below
+                //step16c - namespace case - see below
 
-			//step 16d
-			s << "=\"";
-			//step 16e
-			s << core->EscapeAttributeValue(an->getValue()->atom());
-			//step 16f - namespace case
-			//step 16g
-			s << "\"";
+                //step 16d
+                s << "=\"";
+                //step 16e
+                s << core->EscapeAttributeValue(an->getValue()->atom());
+                //step 16f - namespace case
+                //step 16g
+                s << "\"";
+            }
 		}
 
 		// This adds any NS that were added to our ancestor namespace list (from origLength on up)
@@ -1505,14 +1527,15 @@ namespace avmplus
 	XMLObject *XMLObject::AS3_addNamespace (Atom _namespace)
 	{
 		AvmCore *core = this->core();
+
 		if (core->isNamespace (_namespace))
 		{
-			m_node->_addInScopeNamespace (core, AvmCore::atomToNamespace(_namespace));
+			m_node->_addInScopeNamespace (core, AvmCore::atomToNamespace(_namespace), publicNS);
 		}
 		else
 		{
 			Namespace *ns = core->newNamespace (_namespace);
-			m_node->_addInScopeNamespace (core, ns);
+			m_node->_addInScopeNamespace (core, ns, publicNS);
 
 			_namespace = ns->atom();
 		}
@@ -1577,7 +1600,7 @@ namespace avmplus
 			XMLListObject *xl = new (core->GetGC()) XMLListObject(toplevel()->xmlListClass());
 			if (index < m_node->numChildren())
 			{
-				xl->_append (m_node->_getAt(index));
+				xl->_appendNode (m_node->_getAt(index));
 			}
 			return xl;
 		}
@@ -1587,27 +1610,7 @@ namespace avmplus
 
 	int XMLObject::AS3_childIndex()
 	{
-		if ((m_node->getParent() == NULL) || (getClass() == E4XNode::kAttribute))
-			return -1;
-
-		// find this child in parent's children list - return ordinal
-
-		E4XNode *parent = m_node->getParent();
-		AvmAssert(parent != 0);
-		AvmAssert(parent->_length()); // this child's parent does not contain itself???
-
-		for (uint32 i = 0; i < parent->_length(); i++)
-		{
-			E4XNode *x = parent->_getAt(i);
-			if (x == m_node)
-			{
-				return i;
-			}
-		}
-
-		// this child's parent does not contain itself???
-		AvmAssert(0);
-		return -1;
+		return m_node->childIndex();
 	}
 
 	XMLListObject *XMLObject::AS3_children ()
@@ -1628,7 +1631,7 @@ namespace avmplus
 
 			if (child->getClass() == E4XNode::kComment)
 			{
-				l->_append (child);
+				l->_appendNode (child);
 			}
 		}
 
@@ -1654,7 +1657,7 @@ namespace avmplus
 
 		E4XNode *v = AvmCore::atomToXML(value);
 
-		return getNode()->_equals (core, v) == trueAtom; // rhino
+		return getNode()->_equals(toplevel(), core, v); // rhino
 		//SPEC - return (core()->equals (this->atom(), value) == trueAtom);
 	}
 
@@ -1668,6 +1671,7 @@ namespace avmplus
 	XMLListObject *XMLObject::AS3_elements (Atom name) // name defaults to '*'
 	{
 		AvmCore *core = this->core();
+
 		Multiname m;
 		toplevel()->ToXMLName(name, m);
 
@@ -1680,7 +1684,7 @@ namespace avmplus
 			if (child->getClass() == E4XNode::kElement)
 			{
 				Multiname m2;
-				child->getQName(core, &m2);
+				child->getQName(&m2, publicNS);
 
 				// if name.localName = "*" or name.localName =child->name.localName)
 				// and (name.uri == null) or (name.uri == child.name.uri))
@@ -1688,7 +1692,7 @@ namespace avmplus
 				{
 					// if name.localName = "*" or name.localName =child->name.localName)
 					// and (name.uri == null) or (name.uri == child.name.uri))
-					l->_append (child);
+					l->_appendNode (child);
 				}
 			}
 		}
@@ -1711,40 +1715,13 @@ namespace avmplus
 	// E4X 13.4.4.15, page 77
 	bool XMLObject::AS3_hasComplexContent ()
 	{
-		if (m_node->getClass() & (E4XNode::kText | E4XNode::kComment | E4XNode::kProcessingInstruction | E4XNode::kAttribute | E4XNode::kCDATA))
-			return false;
-
-		for (uint32 i = 0; i < m_node->_length(); i++)
-		{
-			E4XNode *child = m_node->_getAt(i);
-
-			if (child->getClass() == E4XNode::kElement)
-			{
-				return true;
-			}
-		}
-
-		return false;
+		return m_node->hasComplexContent();
 	}
 
 	// E4X 13.4.4.16, page 77
 	bool XMLObject::AS3_hasSimpleContent ()
 	{
-		if (m_node->getClass() & (E4XNode::kComment | E4XNode::kProcessingInstruction))
-			return false;
-
-		// for each prop in x, if x.class == element, return false
-		for (uint32 i = 0; i < m_node->_length(); i++)
-		{
-			E4XNode *child = m_node->_getAt(i);
-
-			if (child->getClass() == E4XNode::kElement)
-			{
-				return false;
-			}
-		}
-
-		return true;
+		return m_node->hasSimpleContent();
 	}
 
 	// E4X 13.4.4.17, page 78
@@ -1768,7 +1745,8 @@ namespace avmplus
 		// !!@ Rhino behavior always seems to return at least one NS
 		if (!inScopeNS->getLength())
 		{
-			a->setUintProperty (i, core->newNamespace(core->kEmptyString)->atom()); 
+			// NOTE use caller's public
+			a->setUintProperty (i, core->findPublicNamespace()->atom());
 		}
 
 		return a;
@@ -1898,7 +1876,7 @@ namespace avmplus
 	Atom XMLObject::AS3_localName ()
 	{
 		Multiname m;
-		if (m_node->getQName(core(), &m) == 0)
+		if (m_node->getQName(&m, publicNS) == 0)
 		{
 			return nullStringAtom;
 		}
@@ -1913,7 +1891,7 @@ namespace avmplus
 	{
 		AvmCore *core = this->core();
 		Multiname m;
-		if (!m_node->getQName(core, &m))
+		if (!m_node->getQName(&m, publicNS))
 			return nullObjectAtom;
 
 		return (new (core->GetGC(), toplevel()->qnameClass()->ivtable()->getExtraSize()) QNameObject(toplevel()->qnameClass(), m))->atom();
@@ -1989,7 +1967,7 @@ namespace avmplus
 			if (!ns->hasPrefix ())
 			{
 				// Emulating Rhino behavior
-				if (ns->getURI() != core->kEmptyString)
+			    if (ns->getURI() != core->kEmptyString)
 				{
 					bool bMatch = false;
 					for (uint32 j = 0; j < ancestorNS->getLength(); j++)
@@ -2033,24 +2011,7 @@ namespace avmplus
 
 	String *XMLObject::AS3_nodeKind () const
 	{
-		switch (m_node->getClass())
-		{
-			case E4XNode::kAttribute:
-				return toplevel()->xmlClass()->kAttribute;
-			case E4XNode::kText:
-			case E4XNode::kCDATA: 
-				return toplevel()->xmlClass()->kText;
-			case E4XNode::kComment:
-				return toplevel()->xmlClass()->kComment;
-			case E4XNode::kProcessingInstruction:
-				return toplevel()->xmlClass()->kProcessingInstruction;
-			case E4XNode::kElement:
-				return toplevel()->xmlClass()->kElement;
-			case E4XNode::kUnknown:
-			default:
-				AvmAssert(0);
-				return 0; 
-		}
+		return m_node->nodeKind(toplevel());
 	}
 
 	XMLObject *XMLObject::AS3_normalize ()
@@ -2146,13 +2107,13 @@ namespace avmplus
 			if (child->getClass() == E4XNode::kProcessingInstruction)
 			{
 				Multiname m2;
-				bool bFound = child->getQName(core, &m2);
+				bool bFound = child->getQName(&m2, publicNS);
 
 				// if name.localName = "*" or name.localName =child->name.localName)
 				// and (name.uri == null) or (name.uri == child.name.uri))
 				if (m.matches(bFound ? &m2 : 0))
 				{
-					xl->_append (child);
+					xl->_appendNode (child);
 				}
 			}
 		}
@@ -2219,8 +2180,8 @@ namespace avmplus
 		{
 			E4XNode *a = m_node->getAttribute(j);
 			Multiname m;
-			AvmAssert(a->getQName(core, &m));
-			a->getQName(core, &m);
+			AvmAssert(a->getQName(&m, publicNS));
+			a->getQName(&m, publicNS);
 			Namespace *anNS = GetNamespace (m, m_node->getNamespaces());
 			if (anNS == ns)
 				return this;
@@ -2300,7 +2261,7 @@ namespace avmplus
 			Multiname m3;
 			if (x->getClass() == E4XNode::kElement)
 			{
-				if (x->getQName (core, &m3))
+				if (x->getQName(&m3, publicNS))
 					m2 = &m3;
 			}
 
@@ -2345,7 +2306,6 @@ namespace avmplus
 			return;
 
 		AvmCore *core = this->core();
-
 		QNameObject *qn = AvmCore::atomToQName(name);
 		Stringp newname;
 		if (qn)
@@ -2361,10 +2321,11 @@ namespace avmplus
 			toplevel()->throwTypeError(kXMLInvalidName, newname);
 
 		Multiname m;
-		if (this->getNode()->getQName(core, &m))
+
+		if (this->getNode()->getQName(&m, publicNS))
 		{
 			Multiname previous;
-			getNode()->getQName(core, &previous);
+			getNode()->getQName(&previous, publicNS);
 			Stringp prior = previous.getName();
 
 			m.setName (newname);
@@ -2385,7 +2346,7 @@ namespace avmplus
 		if (AvmCore::isQName(name))
 		{
 			QNameObject *q  = AvmCore::atomToQName(name);
-			if (AvmCore::isNull(q->get_uri()))
+			if (AvmCore::isNull(q->getURI()))
 			{
 				name = q->get_localName()->atom();
 			}
@@ -2398,11 +2359,11 @@ namespace avmplus
 			toplevel()->throwTypeError(kXMLInvalidName, s);
 
 		Multiname m;
-		if (m_node->getQName(core, &m))
+		if (m_node->getQName(&m, publicNS))
 		{
 			if (m_node->getClass() == E4XNode::kProcessingInstruction)
 			{
-				m_node->setQName (core, n->get_localName(), core->publicNamespace);
+				m_node->setQName (core, n->get_localName(), core->findPublicNamespace());
 			}
 			else // only for attribute and element nodes
 			{
@@ -2411,17 +2372,17 @@ namespace avmplus
 				m_node->setQName (core, &m2);
 
 				// ISNS changes
-				if (n->get_uri() != core->kEmptyString->atom())
+				if (n->getURI() != core->kEmptyString->atom())
 				{
-					m_node->getQName(core, &m); // get our new multiname
+					m_node->getQName(&m, publicNS); // get our new multiname
 
 					if (this->getClass() == E4XNode::kAttribute && getNode()->getParent())
 					{
-						getNode()->getParent()->_addInScopeNamespace (core, m.getNamespace());
+						getNode()->getParent()->_addInScopeNamespace (core, m.getNamespace(), publicNS);
 					}
 					else if (this->getClass() == E4XNode::kElement)
 					{
-						getNode()->_addInScopeNamespace (core, m.getNamespace());
+						getNode()->_addInScopeNamespace (core, m.getNamespace(), publicNS);
 					}
 				}
 			}
@@ -2441,7 +2402,7 @@ namespace avmplus
 		Namespace* newns = core->newNamespace (ns);
 
 		Multiname m;
-		if (m_node->getQName(core, &m))
+		if (m_node->getQName(&m, publicNS))
 		{
 			m_node->setQName (core, m.getName(), newns);
 		}
@@ -2449,11 +2410,11 @@ namespace avmplus
 		// ISNS changes
 		if (this->getClass() == E4XNode::kAttribute && getNode()->getParent())
 		{
-			getNode()->getParent()->_addInScopeNamespace (core, newns);
+			getNode()->getParent()->_addInScopeNamespace (core, newns, publicNS);
 		}
 		else if (this->getClass() == E4XNode::kElement)
 		{
-			getNode()->_addInScopeNamespace (core, newns);
+			getNode()->_addInScopeNamespace (core, newns, publicNS);
 		}
 
 		nonChildChanges(xmlClass()->kNamespaceSet, newns->atom());
@@ -2469,7 +2430,7 @@ namespace avmplus
 			E4XNode *child = m_node->_getAt(i);
 			if (child->getClass() & (E4XNode::kText | E4XNode::kCDATA))
 			{
-				l->_append (child);
+				l->_appendNode (child);
 			}
 		}
 
@@ -2579,10 +2540,10 @@ namespace avmplus
 
 	bool XMLObject::getQName(Multiname *m) 
 	{ 
-		return m_node->getQName(core(), m); 
+		return m_node->getQName(m, publicNS); 
 	}
 
-	void XMLObject::AS3_setNotification(ScriptObject* f)
+	Atom XMLObject::AS3_setNotification(FunctionObject* f)
 	{
 		AvmCore* core  = this->core();
 
@@ -2590,10 +2551,12 @@ namespace avmplus
 		if (f && !AvmCore::istype(f->atom(), core->traits.function_itraits)) 
 			toplevel()->throwArgumentError( kInvalidArgumentError, "f");
 		else
-			m_node->setNotification(core, f);
+			m_node->setNotification(core, f, publicNS);
+		// since AS3 sez this returns an Atom, our implementation must do so.
+		return undefinedAtom;
 	}
 
-	ScriptObject* XMLObject::AS3_notification()
+	FunctionObject* XMLObject::AS3_notification()
 	{
 		return m_node->getNotification();
 	}
@@ -2618,7 +2581,7 @@ namespace avmplus
 	/**
 	 * Notification on generic node addition from XML or XMLList 
 	 */
-	void XMLObject::childChanges(Atom type, Atom value, E4XNode* prior)
+	void XMLObject::childChanges(Stringp type, Atom value, E4XNode* prior)
 	{
 		AvmCore* core = this->core();
 		Toplevel* top = this->toplevel();
@@ -2658,7 +2621,7 @@ namespace avmplus
 		}
 	}
 
-	void XMLObject::nonChildChanges(Atom type, Atom value, Atom detail)
+	void XMLObject::nonChildChanges(Stringp type, Atom value, Atom detail)
 	{
 		AvmCore* core = this->core();
 		Toplevel* top = this->toplevel();
@@ -2673,7 +2636,7 @@ namespace avmplus
 	/**
 	 * Perform the callback for each node in which the notification property is set.
 	 */
-	void XMLObject::issueNotifications(AvmCore* core, Toplevel* top, E4XNode* initialTarget, Atom target, Atom type, Atom value, Atom detail)
+	void XMLObject::issueNotifications(AvmCore* core, Toplevel* top, E4XNode* initialTarget, Atom target, Stringp type, Atom value, Atom detail)
 	{
 		// start notification at initialtarget
 		E4XNode* volatile node = initialTarget;
@@ -2685,7 +2648,7 @@ namespace avmplus
 			if (methodObj) 
 			{
 				XMLObject* currentTarget = new (core->GetGC())  XMLObject(top->xmlClass(), node);
-				Atom argv[6] = { top->atom(), currentTarget->atom(), type, target, value, detail };
+				Atom argv[6] = { top->atom(), currentTarget->atom(), type->atom(), target, value, detail };
 				int argc = 5;
 
 				//EnterScriptTimeout enterScriptTimeout(core);				
@@ -2754,9 +2717,9 @@ namespace avmplus
 				AvmAssert(xml && xml->getClass() == E4XNode::kAttribute);
 
 				Multiname m;
-				AvmAssert(xml->getQName(core, &m) != 0);
+				AvmAssert(xml->getQName(&m, publicNS) != 0);
 
-				xml->getQName (core, &m);
+				xml->getQName(&m, publicNS);
 				if (name.matches(&m))
 				{
 					if (core->equals(xml->getValue()->atom(), value) == trueAtom)
@@ -2774,7 +2737,7 @@ namespace avmplus
 			Multiname *m2 = 0;
 			if (child->getClass() == E4XNode::kElement)
 			{
-				child->getQName(core, &m);
+				child->getQName(&m, publicNS);
 				m2 = &m;
 			}
 
@@ -2803,6 +2766,11 @@ namespace avmplus
 	}
 #endif // XML_FILTER_EXPERIMENT
 
+	void XMLObject::dispose()
+	{
+		m_node->dispose();
+	}
+
 	/////////////////////////////////////////////////////////////////
 	/////////////////////////////////////////////////////////////////
 	/////////////////////////////////////////////////////////////////
@@ -2822,13 +2790,8 @@ namespace avmplus
 	 * inside the QName to differentiate betweent the two types.
 	 */
 	QNameObject::QNameObject(QNameClass *factory, Namespace *ns, Atom nameatom, bool bA)
-		: ScriptObject(factory->ivtable(), factory->prototype),
-		  m_mn()
+		: ScriptObject(factory->ivtable(), factory->prototype)
 	{
-		// Set attribute bit in multiname
-		if (bA)
-			m_mn.setAttr();
-
 		AvmCore *core = this->core();
 
 		Stringp name;
@@ -2846,70 +2809,79 @@ namespace avmplus
 			name = core->intern(nameatom);
 		}
 
+		Multiname mn;
+
+		// Set attribute bit in multiname
+		if (bA)
+			mn.setAttr();
+
 		if (name == core->kAsterisk)
 		{
-			this->m_mn.setAnyName();
-			AvmAssert(this->m_mn.isAnyName());
+			mn.setAnyName();
+			AvmAssert(mn.isAnyName());
 		}
 		else
 		{
-			this->m_mn.setName(name);
+			mn.setName(name);
 		}
 
 		if (ns == NULL)
 		{
-			this->m_mn.setAnyNamespace();
+			mn.setAnyNamespace();
 		}
 		else
 		{
-			this->m_mn.setNamespace(core->internNamespace(ns));
-			this->m_mn.setQName();
+			mn.setNamespace(core->internNamespace(ns));
+			mn.setQName();
 		}
+		this->m_mn = mn;
 	}
 
 	/**
 	 * called when no namespace specified.
 	 */
 	QNameObject::QNameObject(QNameClass *factory, Atom nameatom, bool bA)
-	: ScriptObject(factory->ivtable(), factory->prototype),
-		m_mn()
+	: ScriptObject(factory->ivtable(), factory->prototype)
 	{
-		// Set attribute bit in multiname
-		if (bA)
-			m_mn.setAttr();
-
 		AvmCore *core = this->core();
 		Toplevel* toplevel = this->toplevel();
+
+		Multiname mn;
 
 		if (AvmCore::isQName(nameatom))
 		{
 			QNameObject *q = AvmCore::atomToQName(nameatom);
-			m_mn = q->m_mn;
-			if (bA)
-				m_mn.setAttr();
-			return;
-		}
-
-		Stringp name = core->intern(nameatom);
-		if (name == core->kAsterisk)
-		{
-			this->m_mn.setAnyNamespace();
-			this->m_mn.setAnyName();
-			AvmAssert(this->m_mn.isAnyName());
+			mn = q->m_mn;
 		}
 		else
 		{
-			if (nameatom == undefinedAtom)
+			Stringp name = core->intern(nameatom);
+			if (name == core->kAsterisk)
 			{
-				this->m_mn.setName (core->kEmptyString);
-			}			
+				mn.setAnyNamespace();
+				mn.setAnyName();
+				AvmAssert(mn.isAnyName());
+			}
 			else
 			{
-				this->m_mn.setName(name);
+				if (nameatom == undefinedAtom)
+				{
+					mn.setName(core->kEmptyString);
+				}			
+				else
+				{
+					mn.setName(name);
+				}
+				Namespacep ns = ApiUtils::getVersionedNamespace(core, toplevel->getDefaultNamespace(), core->getAPI(NULL));
+				mn.setNamespace(ns);
 			}
-
-			this->m_mn.setNamespace(toplevel->getDefaultNamespace());
 		}
+
+		// Set attribute bit in multiname
+		if (bA)
+			mn.setAttr();
+		
+		this->m_mn = mn;
 	}
 
 	Stringp QNameObject::get_localName() const
@@ -2920,7 +2892,7 @@ namespace avmplus
 		return m_mn.getName();
 	}
 
-	Atom QNameObject::get_uri() const
+	Atom QNameObject::getURI() const
 	{
 		if (m_mn.isAnyNamespace())
 		{
@@ -2934,6 +2906,11 @@ namespace avmplus
 		{
 			return m_mn.getNamespace()->getURI()->atom();
 		}
+	}
+
+	Atom QNameObject::get_uri() const
+	{
+	    return getURI();
 	}
 
 	// E4X 13.3.5.4, pg 69
@@ -2984,7 +2961,7 @@ namespace avmplus
 		if (index == 1)
 			return this->get_localName()->atom();
 		else if (index == 2)
-			return this->get_uri();
+			return this->getURI();
 		else
 			return nullStringAtom;
 	}

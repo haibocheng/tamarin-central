@@ -68,20 +68,19 @@ namespace avmplus
 
 		kColon = core->internConstantStringLatin1(":");
 		kXml = core->internConstantStringLatin1("xml");
-		nsXML = core->newNamespace(core->kEmptyString->atom(), core->internConstantStringLatin1("http://www.w3.org/XML/1998/namespace")->atom()); 
 
 		// for notifications
-		kAttrAdded = core->internConstantStringLatin1("attributeAdded")->atom();
-		kAttrRemoved = core->internConstantStringLatin1("attributeRemoved")->atom();
-		kAttrChanged = core->internConstantStringLatin1("attributeChanged")->atom();
-		kNodeAdded = core->internConstantStringLatin1("nodeAdded")->atom();
-		kNodeRemoved = core->internConstantStringLatin1("nodeRemoved")->atom();
-		kNodeChanged = core->internConstantStringLatin1("nodeChanged")->atom();
-		kNamespaceAdded = core->internConstantStringLatin1("namespaceAdded")->atom();
-		kNamespaceRemoved = core->internConstantStringLatin1("namespaceRemoved")->atom();
-		kNamespaceSet = core->internConstantStringLatin1("namespaceSet")->atom();
-		kNameSet = core->internConstantStringLatin1("nameSet")->atom();
-		kTextSet = core->internConstantStringLatin1("textSet")->atom();
+		kAttrAdded = core->internConstantStringLatin1("attributeAdded");
+		kAttrRemoved = core->internConstantStringLatin1("attributeRemoved");
+		kAttrChanged = core->internConstantStringLatin1("attributeChanged");
+		kNodeAdded = core->internConstantStringLatin1("nodeAdded");
+		kNodeRemoved = core->internConstantStringLatin1("nodeRemoved");
+		kNodeChanged = core->internConstantStringLatin1("nodeChanged");
+		kNamespaceAdded = core->internConstantStringLatin1("namespaceAdded");
+		kNamespaceRemoved = core->internConstantStringLatin1("namespaceRemoved");
+		kNamespaceSet = core->internConstantStringLatin1("namespaceSet");
+		kNameSet = core->internConstantStringLatin1("nameSet");
+		kTextSet = core->internConstantStringLatin1("textSet");
 
 		// XML.settings
 		// XML.setSettings ([settings])

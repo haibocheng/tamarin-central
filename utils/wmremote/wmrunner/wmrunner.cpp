@@ -51,6 +51,8 @@ HWND				g_hWndMenuBar;		// menu bar handle
 INT                 i_timer;
 TCHAR               szMessage[550];
 TCHAR               szError[550];
+TCHAR               szExitCode[550];
+TCHAR               szExitCodeFile[550];
 TCHAR               nextvm[500];
 TCHAR               shell[100];
 TCHAR               last[200];
@@ -58,6 +60,7 @@ INT                 i_buildcount;
 LONG				l_buildsum;
 INT                 i_maxtime;
 INT                 i_currenttime;
+DWORD               i_exitcode;
 
 // Forward declarations of functions included in this code module:
 ATOM			MyRegisterClass(HINSTANCE, LPTSTR);
@@ -260,6 +263,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			i_buildcount=0;
 			l_buildsum=0;
 			i_maxtime=0;
+			i_exitcode=0;
 			_tcscpy(szFile,L"\\Storage Card\\running.txt");
 			handle=CreateFile(szFile,GENERIC_WRITE,0,NULL,CREATE_NEW,0,NULL);
       		if (handle==INVALID_HANDLE_VALUE) {
@@ -309,6 +313,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			wsprintf(szMax,TEXT("max time: %d ms"),i_maxtime);
 			SetRect(&r,10,150,220,170);
 			DrawText(hdc,szMax,-1,&r,DT_WORDBREAK);
+			wsprintf(szExitCode,TEXT("exit code: %d"),i_exitcode);
+			SetRect(&r,10,170,220,190);
+			DrawText(hdc,szExitCode,-1,&r,DT_WORDBREAK);
+
 /*
 			SetRect(&r,10,170,220,230);
 			DrawText(hdc,szError,-1,&r,DT_WORDBREAK);
@@ -413,6 +421,23 @@ BOOL checkForCommand(HWND hWnd) {
 			BOOL convert;
             convert=MultiByteToWideChar(CP_ACP,MB_PRECOMPOSED,msg,-1,last,500);
 			convert=MultiByteToWideChar(CP_ACP,MB_PRECOMPOSED,data,-1,params,500);
+            char *pch;
+			char filename[500];
+			pch=strtok(data," ");
+			while (pch!=NULL) {
+				if (pch[0]!='\"') {
+					strcat(filename," ");
+					strcat(filename,pch);
+				} else {
+					strcpy(filename,pch+1);
+				}
+				if (filename[strlen(filename)-1]=='\"') {
+					filename[strlen(filename)-1]=0;
+				}
+				pch=strtok(NULL," ");
+			}
+			strcat(filename,".exitcode");
+			MultiByteToWideChar(CP_ACP,0,filename,-1,szExitCodeFile,500);
 			if (convert==0) {
 				_tcscpy(szMessage,L"error converting string");
 				_tcscpy(szError,L"error converting string");
@@ -424,6 +449,7 @@ BOOL checkForCommand(HWND hWnd) {
 				}
 				PROCESS_INFORMATION pi;
 				ZeroMemory(&pi,sizeof(pi));
+				i_exitcode=-1;
                 CreateProcess(shell,params,NULL,NULL,FALSE,CREATE_NEW_CONSOLE,NULL,NULL,NULL,&pi);
 				DWORD start_time=GetTickCount();
                 DWORD last_time=0;
@@ -435,17 +461,26 @@ BOOL checkForCommand(HWND hWnd) {
   						wsprintf(szMessage,TEXT("running %s"),last);
 						if (last_time/1000!=(end_time-start_time)/1000) {
                             last_time=i_currenttime=end_time-start_time;
-							SetRect(&r,10,10,220,109);
+							SetRect(&r,10,10,220,190);
   							InvalidateRect(hWnd,&r,TRUE);
 							UpdateWindow(hWnd); 
 						}
 					} else if (res==WAIT_OBJECT_0) {
+						GetExitCodeProcess(pi.hProcess,&i_exitcode);
+						char szExit[100];
+						sprintf(szExit,"%d\n",i_exitcode);
+						DWORD dwBytes;
+						HANDLE ceExitFile = CreateFile(szExitCodeFile, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,NULL);
+                        WriteFile(ceExitFile, (void*)szExit, strlen(szExit), &dwBytes, NULL);
+                        CloseHandle(ceExitFile);
 						i_buildcount++;
 						l_buildsum+=(end_time-start_time);
 						if ((LONG)(end_time-start_time)>i_maxtime) {
 							i_maxtime=end_time-start_time;
 						}
 						wsprintf(szMessage,TEXT("finished %s"),last);
+						
+
 						i_currenttime=end_time-start_time;
 						SetRect(&r,10,10,220,230);
   						InvalidateRect(hWnd,&r,TRUE);

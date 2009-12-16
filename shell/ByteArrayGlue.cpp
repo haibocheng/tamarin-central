@@ -54,10 +54,13 @@ namespace avmshell
 		m_array    = NULL;
 	}
 
-	ByteArray::ByteArray(const ByteArray &lhs)
+	ByteArray::ByteArray(const ByteArray &lhs) 
+        // GCC will warn if we don't explicitly init GlobalMemoryProvider, 
+        // even though it has no fields or ctor... sigh
+        : GlobalMemoryProvider()
 	{
 		m_subscriberRoot = NULL;
-		m_array    = new U8[lhs.m_length];
+		m_array    = mmfx_new_array(uint8_t, lhs.m_length);
 		if (!m_array)
 		{
 			ThrowMemoryError();
@@ -75,7 +78,7 @@ namespace avmshell
 		m_subscriberRoot = NULL;
 		if (m_array)
 		{
-			delete [] m_array;
+			mmfx_delete_array(m_array);
 			m_array = NULL;
 		}
 		m_capacity = 0;
@@ -101,7 +104,7 @@ namespace avmshell
 			{
 				newCapacity = kGrowthIncr;
 			}
-			U8 *newArray = new U8[newCapacity];
+			U8 *newArray = mmfx_new_array(uint8_t, newCapacity);
 			if (!newArray)
 			{
 				return false;
@@ -109,7 +112,7 @@ namespace avmshell
 			if (m_array)
 			{
 				VMPI_memcpy(newArray, m_array, m_length);
-				delete [] m_array;
+				mmfx_delete_array(m_array);
 			}
 			VMPI_memset(newArray+m_length, 0, newCapacity-m_capacity);
 			m_array = newArray;
@@ -182,45 +185,46 @@ namespace avmshell
  		{
  			AvmAssert(m_length >= Domain::GLOBAL_MEMORY_MIN_SIZE);
  
- 			Domain *dom = (Domain *)curLink->weakDomain->get();
+ 			GlobalMemorySubscriber* subscriber = (GlobalMemorySubscriber*)curLink->weakSubscriber->get();
  
- 			if(dom)
+ 			if (subscriber)
  			{
- 				(dom->*(curLink->notify))(m_array, m_length);
+ 				subscriber->notifyGlobalMemoryChanged(m_array, m_length);
  				prevNext = &curLink->next;
  			}
  			else
+            {
  				// Domain went away? remove link
  				MMgc::GC::WriteBarrier(prevNext, curLink->next);
+            }
  			curLink = curLink->next;
  		}
  	}
  
- 	bool ByteArray::GlobalMemorySubscribe(const Domain *subscriber, GlobalMemoryNotifyFunc notify)
+ 	bool ByteArray::addSubscriber(GlobalMemorySubscriber* subscriber)
  	{
  		if(m_length >= Domain::GLOBAL_MEMORY_MIN_SIZE)
  		{
- 			GlobalMemoryUnsubscribe(subscriber);
+ 			removeSubscriber(subscriber);
 			SubscriberLink *newLink = new (MMgc::GC::GetGC(subscriber)) SubscriberLink;
- 			newLink->weakDomain = subscriber->GetWeakRef();
- 			newLink->notify = notify;
+ 			newLink->weakSubscriber = subscriber->GetWeakRef();
  			MMgc::GC::WriteBarrier(&newLink->next, m_subscriberRoot);
  			MMgc::GC::WriteBarrier(&m_subscriberRoot, newLink);
  			// notify the new "subscriber" of the current state of the world
- 			(subscriber->*notify)(m_array, m_length);
+ 			subscriber->notifyGlobalMemoryChanged(m_array, m_length);
  			return true;
  		}
  		return false;
  	}
  
- 	bool ByteArray::GlobalMemoryUnsubscribe(const Domain *subscriber)
+ 	bool ByteArray::removeSubscriber(GlobalMemorySubscriber* subscriber)
  	{
  		SubscriberLink **prevNext = &m_subscriberRoot;
  		SubscriberLink *curLink = m_subscriberRoot;
  
  		while(curLink)
  		{
- 			if(curLink->weakDomain->get() == (MMgc::GCObject *)subscriber)
+ 			if ((GlobalMemorySubscriber*)curLink->weakSubscriber->get() == subscriber)
  			{
  				MMgc::GC::WriteBarrier(prevNext, curLink->next);
  				return true;
@@ -370,7 +374,11 @@ namespace avmshell
 
 	String* ByteArrayObject::_toString()
 	{
-		uint8_t *c = (uint8_t*)m_byteArray.GetBuffer();
+		union {
+			uint8_t* c;
+			wchar* c_w;
+		};
+		c = (uint8_t*)m_byteArray.GetBuffer();
 		uint32_t len = m_byteArray.GetLength();
 
 		if (len >= 3)
@@ -385,12 +393,12 @@ namespace avmshell
 				//UTF-16 big endian
 				c += 2;
 				len = (len - 2) >> 1;
-				return core()->newStringEndianUTF16(/*littleEndian*/false, (const wchar*)c, len);
+				return core()->newStringEndianUTF16(/*littleEndian*/false, c_w, len);
 			}
 			else if ((c[0] == 0xff) && (c[1] == 0xfe))
 			{
 				//UTF-16 little endian
-				return core()->newStringEndianUTF16(/*littleEndian*/true, (const wchar*)c, len);
+				return core()->newStringEndianUTF16(/*littleEndian*/true, c_w, len);
 			}
 		}
 
@@ -485,10 +493,10 @@ namespace avmshell
 		if (!len) // empty buffer should give us a empty result
 			return; 
 		unsigned long gzlen = len * 3/2 + 32; // enough for growth plus zlib headers
-		U8 *gzdata = new U8[gzlen];
+		U8 *gzdata = mmfx_new_array( uint8_t, gzlen );
 
 		// Use zlib to compress the data
-		compress2((U8*)gzdata, (unsigned long*)&gzlen,
+		compress2((uint8_t*)gzdata, (unsigned long*)&gzlen,
 				m_byteArray.GetBuffer(), len, 9);
 
 		// Replace the byte array with the compressed data
@@ -496,7 +504,7 @@ namespace avmshell
 		//m_byteArray.WriteU32((U32)len);
 		m_byteArray.Write(gzdata, gzlen);
 
-		delete [] gzdata;
+		mmfx_delete_array( gzdata );
 	}
 
     void ByteArrayObject::zlib_uncompress()
@@ -506,7 +514,7 @@ namespace avmshell
 		if (!gzlen) // empty buffer should give us a empty result
 			return; 
 
-		U8 *gzdata = new U8[gzlen];
+		uint8_t *gzdata = mmfx_new_array( uint8_t, gzlen );
         VMPI_memcpy(gzdata, m_byteArray.GetBuffer(), gzlen);
 
         // Clear the buffer
@@ -523,7 +531,7 @@ namespace avmshell
             zstream.SetAvailIn(gzlen);
 
             const int kBufferSize = 8192;
-            U8 *buffer = new U8 [kBufferSize];
+            uint8_t *buffer = mmfx_new_array( uint8_t, kBufferSize );
 
             do {
                 zstream.SetNextOut(buffer);
@@ -532,8 +540,8 @@ namespace avmshell
                 m_byteArray.Write(buffer, kBufferSize-zstream.AvailOut());
             } while (error == Z_OK);
 
-            delete [] buffer;
-            delete [] gzdata;
+            mmfx_delete_array( buffer );
+	    mmfx_delete_array( gzdata );
         }
 
 		// position byte array at the beginning
@@ -607,16 +615,6 @@ namespace avmshell
 		m_byteArray.Write(b, len);
 	}
 	
- 	bool ByteArrayObject::globalMemorySubscribe(const Domain *subscriber, ByteArray::GlobalMemoryNotifyFunc notify)
- 	{
- 		return m_byteArray.GlobalMemorySubscribe(subscriber, notify);
- 	}
- 
- 	bool ByteArrayObject::globalMemoryUnsubscribe(const Domain *subscriber)
- 	{
- 		return m_byteArray.GlobalMemoryUnsubscribe(subscriber);
- 	}
-
 	//
 	// ByteArrayClass
 	//
@@ -660,7 +658,7 @@ namespace avmshell
 
 		uint32_t readCount = (uint32_t)len;
 
-		unsigned char *c = new unsigned char[readCount+1];
+		unsigned char *c = mmfx_new_array( unsigned char, readCount+1);
 
 		Atom args[1] = {nullObjectAtom};
 		ByteArrayObject *b = (ByteArrayObject*)AvmCore::atomToScriptObject(construct(0,args));
@@ -681,7 +679,7 @@ namespace avmshell
 		}
 		b->seek(0);
 
-		delete [] c;
+		mmfx_delete_array( c );
 
 		fp->close();
 		Platform::GetInstance()->destroyFile(fp);
@@ -745,45 +743,3 @@ namespace avmshell
 
 }	
 
-namespace avmplus {
- 	// memory object glue
- 	bool Domain::isMemoryObject(Traits *t) const
- 	{
-		Traits *cur = t;
-
-		// walk the traits to find a builtin pool
-		while(cur && !cur->pool->isBuiltin)
-			cur = cur->base;
-
-		// have a traits with a builtin pool
-		if(cur)
-		{
-			Stringp uri = core->internConstantStringLatin1("flash.utils");
-			Namespace* ns = core->internNamespace(core->newNamespace(uri));
-			// try to get traits from flash.utils.ByteArray
-			Traits *baTraits = cur->pool->getTraits(core->internConstantStringLatin1("ByteArray"), ns);
-			// and see if the original traits contains it!
-			return t->containsInterface(baTraits) != 0;
-		}
-		return false;
- 	}
- 
- 	bool Domain::globalMemorySubscribe(ScriptObject *mem) const
- 	{
-		if(isMemoryObject(mem->traits()))
-		{
-			avmshell::ByteArray::GlobalMemoryNotifyFunc notify = &Domain::notifyGlobalMemoryChanged;
- 			return ((avmshell::ByteArrayObject *)mem)->globalMemorySubscribe(this, notify);
-		}
-		return false;
- 	}
- 
- 	bool Domain::globalMemoryUnsubscribe(ScriptObject *mem) const
- 	{
-		if(isMemoryObject(mem->traits()))
-		{
-	 		return ((avmshell::ByteArrayObject *)mem)->globalMemoryUnsubscribe(this);
-		}
-		return false;
- 	}
-}	

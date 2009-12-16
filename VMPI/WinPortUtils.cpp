@@ -51,18 +51,20 @@ namespace avmplus
 /*
 * Windows implementation of platform-dependent date and time code
 */
-static TIME_ZONE_INFORMATION gTimeZoneInfo;
-static SYSTEMTIME gGmtCache;
+static const double kMsecPerDay       = 86400000;
+static const double kMsecPerHour      = 3600000;
+static const double kMsecPerSecond    = 1000;
+static const double kMsecPerMinute    = 60000;
 
-static double kMsecPerDay       = 86400000;
-static double kMsecPerHour      = 3600000;
-static double kMsecPerSecond    = 1000;
-static double kMsecPerMinute    = 60000;
-
-static void UpdateTimeZoneInfo()
+static TIME_ZONE_INFORMATION UpdateTimeZoneInfo()
 {
+	static vmpi_spin_lock_t gTimeZoneInfoLock;		// protects gTimeZoneInfo and gGmtCache
+	static TIME_ZONE_INFORMATION gTimeZoneInfo;
+	static SYSTEMTIME gGmtCache;
+	
 	SYSTEMTIME gmt;
 	GetSystemTime(&gmt);
+	MMGC_LOCK(gTimeZoneInfoLock);
 	if ((gmt.wMinute != gGmtCache.wMinute) ||
 		(gmt.wHour != gGmtCache.wHour) ||
 		(gmt.wDay != gGmtCache.wDay) ||
@@ -74,12 +76,14 @@ static void UpdateTimeZoneInfo()
 		GetTimeZoneInformation(&gTimeZoneInfo);
 		gGmtCache = gmt;
 	}
+	TIME_ZONE_INFORMATION tz = gTimeZoneInfo;
+	return tz;
 }
 
 double VMPI_getLocalTimeOffset()
 {
-	UpdateTimeZoneInfo();
-	return -gTimeZoneInfo.Bias * 60.0 * 1000.0;
+	TIME_ZONE_INFORMATION tz = UpdateTimeZoneInfo();
+	return -tz.Bias * 60.0 * 1000.0;
 }
 
 static double ConvertWin32DST(int year, SYSTEMTIME *st)
@@ -138,8 +142,8 @@ double VMPI_getDaylightSavingsTA(double time)
 {
 	// On Windows, ask the OS what the daylight saving time bias
 	// is.  If it's zero, perform no adjustment.
-	UpdateTimeZoneInfo();
-	if (gTimeZoneInfo.DaylightBias != -60 || gTimeZoneInfo.DaylightDate.wMonth == 0) {
+	TIME_ZONE_INFORMATION tz = UpdateTimeZoneInfo();
+	if (tz.DaylightBias != -60 || tz.DaylightDate.wMonth == 0) {
 		return 0;
 	}
 
@@ -151,10 +155,10 @@ double VMPI_getDaylightSavingsTA(double time)
 	int year = avmplus::YearFromTime(time);
 
 	// 2. Compute time that daylight saving time begins
-	double timeD = ConvertWin32DST(year, &gTimeZoneInfo.DaylightDate);
+	double timeD = ConvertWin32DST(year, &tz.DaylightDate);
 
 	// 3. Compute time that standard time begins
-	double timeS = ConvertWin32DST(year, &gTimeZoneInfo.StandardDate);
+	double timeS = ConvertWin32DST(year, &tz.StandardDate);
 
 	// Subtract the daylight bias from the standard transition time
 	timeS -= kMsecPerHour;
@@ -226,12 +230,43 @@ void VMPI_free(void* ptr)
 	HeapFree(GetProcessHeap(), 0, ptr);
 }
 
+size_t VMPI_size(void* ptr)
+{
+	return HeapSize(GetProcessHeap(), 0, ptr);
+}
+
+typedef void (*LoggingFunction)(const char*);
+
+LoggingFunction logFunc = NULL;
+
+void RedirectLogOutput(LoggingFunction func)
+{
+	logFunc = func;
+}
+
 void VMPI_log(const char* message)
 {
 #ifndef UNDER_CE
 	::OutputDebugStringA(message);
 #endif
-	printf("%s\n",message);
+
+	if(logFunc)
+		logFunc(message);
+	else {
+		printf("%s",message);
+		fflush(stdout);
+	}
+}
+
+bool VMPI_isMemoryProfilingEnabled()
+{
+#if defined (UNDER_CE) && defined(MMGC_MEMORY_PROFILER)
+	return true;
+#else
+	//read the mmgc profiling option switch
+	const char *env = VMPI_getenv("MMGC_PROFILE");
+	return (env && (VMPI_strncmp(env, "1", 1) == 0));
+#endif
 }
 
 void VMPI_setPageProtection(void *address,
@@ -250,14 +285,30 @@ void VMPI_setPageProtection(void *address,
 	} else {
 		newProtectFlags = PAGE_READONLY;
 	}
-	BOOL retval = VirtualProtect(address,
-								 size,
-								 newProtectFlags,
-								 &oldProtectFlags);
 	
-	(void)retval;
-	GCAssert(retval);
+	BOOL retval;
+	MEMORY_BASIC_INFORMATION mbi;	
+	do {
+		VirtualQuery(address, &mbi, sizeof(MEMORY_BASIC_INFORMATION));
+		size_t markSize = size > mbi.RegionSize ? mbi.RegionSize : size;
+		
+		retval = VirtualProtect(address, markSize, newProtectFlags, &oldProtectFlags);
+		GCAssert(retval);
+		
+		address = (char*) address + markSize;
+		size -= markSize;
+	} while(size > 0 && retval);
 	
 	// We should not be clobbering PAGE_GUARD protections
 	GCAssert((oldProtectFlags & PAGE_GUARD) == 0);
+}
+
+const char *VMPI_getenv(const char *env) 
+{ 
+	const char *val = NULL;
+	(void)env;
+#ifndef UNDER_CE
+	val = getenv(env);
+#endif
+	return val;
 }

@@ -45,41 +45,57 @@ namespace avmplus
 		class AtomWB
 		{
 		public:
-			AtomWB() {}
-			AtomWB(Atom t)
+			explicit AtomWB() : m_atom(nullObjectAtom) 
+			{
+				// nothing
+			}
+
+			explicit AtomWB(Atom t)  // : m_atom(t) -- not necessary, atomWriteBarrier_ctor handles it
 			{ 
-				set(t);
+				MMgc::GC* const gc = MMgc::GC::GetGC(this);
+				void* const container = gc->FindBeginningFast(this);
+				AvmCore::atomWriteBarrier_ctor(gc, container, &m_atom, t);
 			}
-			AtomWB(const AtomWB& toCopy)
+
+			~AtomWB() 
+			{ 
+				AvmCore::atomWriteBarrier_dtor(&m_atom);
+			}
+
+			Atom operator=(Atom tNew)
 			{
-				set(toCopy.atom);
+				MMgc::GC* const gc = MMgc::GC::GetGC(this);
+				void* const container = gc->FindBeginningFast(this);
+				set(gc, container, tNew);
+				return tNew;
 			}
-
-			~AtomWB() { set(0); }
-
-			const Atom& operator=(const AtomWB& wb)
+			
+			// if you know the container, this saves a call to FindBeginningFast...
+			// which adds up in (e.g.) heavy E4X usage
+			inline void set(MMgc::GC* gc, const void* container, Atom atomNew)
 			{
-				return set(wb.atom);	
+				if (m_atom != atomNew)
+				{
+					AvmCore::atomWriteBarrier(gc, container, &m_atom, atomNew);
+				}
 			}
 
-			const Atom& operator=(const Atom& tNew)
-			{
-				return set(tNew);
-			}
-
-			operator const Atom&() const { return atom; }
+			inline operator const Atom&() const { return m_atom; }
 
 		private:
+			explicit AtomWB(const AtomWB& toCopy); // unimplemented
+			void operator=(const AtomWB& wb); // unimplemented
 			
-			Atom& set(const Atom& atomNew)
+			Atom set(Atom atomNew)
 			{
-				if(atom == atomNew)
-					return atom;			
-				MMgc::GC *gc = MMgc::GC::GetGC(this);
-				AvmCore::atomWriteBarrier(gc, gc->FindBeginning(this), (Atom*)this, atomNew);
-				return atom;
+				if (m_atom != atomNew)
+				{
+					MMgc::GC* gc = MMgc::GC::GetGC(this);
+					AvmCore::atomWriteBarrier(gc, gc->FindBeginningFast(this), &m_atom, atomNew);
+				}
+				return atomNew;
 			}
-			Atom atom;
+			Atom m_atom;
 		};
 #define ATOM_WB AtomWB
 #define WBATOM(gc, c, a, v) AvmCore::atomWriteBarrier(gc, c, a, v)

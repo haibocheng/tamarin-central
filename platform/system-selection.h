@@ -59,6 +59,17 @@
 #else
   #define AVMSYSTEM_WIN32 0
 #endif
+#ifdef __SYMBIAN32__ // defined by Symbian S60 tool chain
+  #define AVMSYSTEM_SYMBIAN 1
+#else
+  #define AVMSYSTEM_SYMBIAN 0
+#endif
+
+#ifdef WEBOS
+  #define AVMSYSTEM_WEBOS 1
+#else
+  #define AVMSYSTEM_WEBOS 0
+#endif
 
 // cpu, word size
 
@@ -100,6 +111,12 @@
     #define AVMSYSTEM_SPARC  0
   #endif
 
+  #if defined(__mips__) || defined(__MIPS__)
+    #define AVMSYSTEM_MIPS   1
+  #else
+    #define AVMSYSTEM_MIPS   0
+  #endif
+
 #endif  // mac || unix
 
 #if AVMSYSTEM_WIN32
@@ -125,8 +142,29 @@
 
   #define AVMSYSTEM_PPC    0
   #define AVMSYSTEM_SPARC  0
+  #define AVMSYSTEM_MIPS   0
 
 #endif  // win32
+
+#if AVMSYSTEM_SYMBIAN
+
+  #define AVMSYSTEM_PPC		0
+  #define AVMSYSTEM_AMD64	0
+  #define AVMSYSTEM_SPARC	0
+
+  #if defined(__ARMCC__)
+    #define AVMSYSTEM_ARM    1
+  #else
+    #define AVMSYSTEM_ARM    0
+  #endif
+
+  #if !AVMSYSTEM_ARM
+    #define AVMSYSTEM_IA32 1
+  #else
+    #define AVMSYSTEM_IA32 0
+  #endif
+
+#endif // symbian
 
 #ifdef SIXTYFOURBIT
   #define AVMSYSTEM_32BIT 0
@@ -148,7 +186,12 @@
     #define AVMSYSTEM_LITTLE_ENDIAN     1
     #define AVMSYSTEM_BIG_ENDIAN        0
   #elif defined __GNUC__
-    #include <endian.h>
+    #if AVMSYSTEM_MAC && AVMSYSTEM_ARM
+        #include <machine/endian.h>
+        #define __BYTE_ORDER BYTE_ORDER
+    #else 
+		#include <endian.h>
+    #endif
     #if __BYTE_ORDER == LITTLE_ENDIAN
       #define AVMSYSTEM_LITTLE_ENDIAN   1
       #define AVMSYSTEM_BIG_ENDIAN      0
@@ -159,16 +202,34 @@
       #define AVMSYSTEM_LITTLE_ENDIAN   0
       #define AVMSYSTEM_BIG_ENDIAN      1
     #endif
+  #elif defined __ARMCC__
+    #define AVMSYSTEM_LITTLE_ENDIAN   1
+    #define AVMSYSTEM_BIG_ENDIAN      0
   #endif
 #elif AVMSYSTEM_PPC || AVMSYSTEM_SPARC
   #define AVMSYSTEM_LITTLE_ENDIAN       0
   #define AVMSYSTEM_BIG_ENDIAN          1
+#elif AVMSYSTEM_MIPS
+  #if defined __GNUC__
+    #include <endian.h>
+    #if __BYTE_ORDER == LITTLE_ENDIAN
+      #define AVMSYSTEM_LITTLE_ENDIAN   1
+      #define AVMSYSTEM_BIG_ENDIAN      0
+    #else
+      #define AVMSYSTEM_LITTLE_ENDIAN   0
+      #define AVMSYSTEM_BIG_ENDIAN      1
+    #endif
+  #endif
 #else
   #error "Error in test to determine endianness"
 #endif
 
 #ifndef AVMSYSTEM_DOUBLE_MSW_FIRST
   #define AVMSYSTEM_DOUBLE_MSW_FIRST 0
+#endif
+
+#ifndef AVMSYSTEM_ARM_FPU
+  #define AVMSYSTEM_ARM_FPU 0
 #endif
 
 #endif

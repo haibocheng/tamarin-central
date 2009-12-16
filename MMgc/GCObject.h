@@ -40,27 +40,26 @@
 #ifndef __GCObject__
 #define __GCObject__
 
+#ifdef __GNUC__
+	#define GNUC_ONLY(x) x
+#else
+	#define GNUC_ONLY(x)
+#endif
+
 // VC++ wants these declared
 //void *operator new(size_t size);
 //void *operator new[] (size_t size);
 
-// Sun Studio doesn't support default parameters for operator new
-#ifdef __SUNPRO_CC
-inline void *operator new(size_t size, MMgc::GC *gc)
+// Sun Studio doesn't support default parameters for operator new, so break up as two functions
+REALLY_INLINE void *operator new(size_t size, MMgc::GC *gc)
 {
-	return gc->Alloc(size, MMgc::GC::kContainsPointers|MMgc::GC::kZero);
+	return gc->AllocPtrZero(size);
 }
 
-inline void *operator new(size_t size, MMgc::GC *gc, int flags)
+REALLY_INLINE void *operator new(size_t size, MMgc::GC *gc, int flags)
 {
 	return gc->Alloc(size, flags);
 }
-#else
-inline void *operator new(size_t size, MMgc::GC *gc, int flags=MMgc::GC::kContainsPointers|MMgc::GC::kZero)
-{
-	return gc->Alloc(size, flags);
-}
-#endif
 
 namespace MMgc
 {
@@ -70,98 +69,147 @@ namespace MMgc
 	class GCObject
 	{
 	public:
-		static void *operator new(size_t size, GC *gc, size_t extra = 0)
-#ifdef __GNUC__
-			// add this to avoid GCC warning: 'operator new' must not return NULL unless it is declared 'throw()' (or -fcheck-new is in effect)
-			throw()
-#endif
-		{
-			// TODO throw exception and shutdown player?
-			if (size + extra < size)
-			{
-				GCAssert(0);
-				return 0;
-			}
-			return gc->Alloc(size + extra, GC::kContainsPointers|GC::kZero);
-		}
+		// 'throw()' annotation to avoid GCC warning: 'operator new' must not return NULL unless it is declared 'throw()' (or -fcheck-new is in effect)
+		static void *operator new(size_t size, GC *gc, size_t extra) GNUC_ONLY(throw());
 
-		static void operator delete (void *gcObject)
-		{
-			GC::GetGC(gcObject)->Free(gcObject);
-		}
+		static void *operator new(size_t size, GC *gc) GNUC_ONLY(throw());
+		
+		static void operator delete(void *gcObject);
 		
 		GCWeakRef *GetWeakRef() const;
 	};
 
 	/**
-	 * Base class for GC-managed objects that are finalized.
-	 * @note This class does not provide operator new/delete: derive from GCFinalizedObject
-	 *       or GCFinalizedObjectOptIn to provide correct handling of "new Class"
-	 */
-	class GCFinalizable
-	{
-	public:
-		virtual ~GCFinalizable() { }
-	};
-
-	/**
 	 *	Baseclass for GC managed objects that are finalized 
 	 */
-	class GCFinalizedObject : public GCFinalizable
+	class GCFinalizedObject 
 	//: public GCObject can't do this, get weird compile errors in AVM plus, I think it has to do with
 	// the most base class (GCObject) not having any virtual methods)
 	{
 	public:
 		GCWeakRef *GetWeakRef() const;
 		
-		static void *operator new(size_t size, GC *gc, size_t extra = 0);
+		virtual ~GCFinalizedObject();
+		static void* operator new(size_t size, GC *gc, size_t extra);
+		static void* operator new(size_t size, GC *gc);
 		static void operator delete (void *gcObject);
 	};
 
-	/**
-	 *	Baseclass for GC managed objects that are finalized 
-	 */
-	class GCFinalizedObjectOptIn : public GCFinalizedObject
-	//: public GCObject can't do this, get weird compile errors in AVM plus, I think it has to do with
-	// the most base class (GCObject) not having any virtual methods)
+	REALLY_INLINE void *GCObject::operator new(size_t size, GC *gc, size_t extra) GNUC_ONLY(throw())
 	{
-	public:
-		static void *operator new(size_t size, GC *gc, size_t extra = 0);
-		static void operator delete (void *gcObject);
-	};
+		return gc->AllocExtraPtrZero(size, extra);
+	}
+	
+	REALLY_INLINE void *GCObject::operator new(size_t size, GC *gc) GNUC_ONLY(throw())
+	{
+		return gc->AllocPtrZero(size);
+	}
+	
+	REALLY_INLINE void GCObject::operator delete(void *gcObject)
+	{
+		GC::GetGC(gcObject)->FreeNotNull(gcObject);
+	}
+	
+	REALLY_INLINE GCWeakRef* GCObject::GetWeakRef() const
+	{
+		return GC::GetWeakRef(this);
+	}
+
+	REALLY_INLINE GCFinalizedObject::~GCFinalizedObject()
+	{
+		// Nothing
+	}
+
+	REALLY_INLINE GCWeakRef* GCFinalizedObject::GetWeakRef() const
+	{
+		return GC::GetWeakRef(this);
+	}
+	
+	REALLY_INLINE void* GCFinalizedObject::operator new(size_t size, GC *gc, size_t extra)
+	{
+		return gc->AllocExtraPtrZeroFinalized(size, extra);
+	}
+	
+	REALLY_INLINE void* GCFinalizedObject::operator new(size_t size, GC *gc)
+	{
+		return gc->AllocPtrZeroFinalized(size);
+	}
+	
+	REALLY_INLINE void GCFinalizedObject::operator delete (void *gcObject)
+	{
+		GC::GetGC(gcObject)->FreeNotNull(gcObject);
+	}		
+	
+	/**
+	 * Base class for reference counted objects.
+	 *
+	 * This object always has a finalizer (the C++ destructor).  The C++ destructor /must/
+	 * leave the object with all-fields-zero.
+	 *
+	 * Reference counting is deferred: when an object's reference count drops to zero it
+	 * is inserted into the zero-count table (the ZCT), see ZCT.h etc.  If the reference 
+	 * count grows above zero the object is removed from the ZCT again.  Every new object
+	 * is added to the ZCT initially - reference counts start at zero.
+	 *
+	 * Occasionally the ZCT is reaped: objects in the ZCT that are not referenced from stack
+	 * memory or special ZCT roots, and that are not explicitly pinned by client code, are
+	 * deleted by calling their finalizers and reclaiming their memory.   A finalizer may
+	 * make the reference counts of more referenced objects drop to zero, whereupon they
+	 * too are entered into the ZCT (and may be deleted by the ongoing reap, or a later
+	 * reap).
+	 *
+	 * (Under complicated scenarios it is possible for an object allocated during reaping
+	 * to be erroneously deleted, see https://bugzilla.mozilla.org/show_bug.cgi?id=506644,
+	 * so client code may want to take note of that.)
+	 */
 
 	class RCObject : public GCFinalizedObject
 	{
 		friend class GC;
+		friend class ZCT;
 	public:
-		RCObject()
-#if 0
-			: history(0)
-#endif
+		REALLY_INLINE static void *operator new(size_t size, GC *gc, size_t extra)
+		{
+			return gc->AllocExtraRCObject(size, extra);
+		}
+		
+		REALLY_INLINE static void *operator new(size_t size, GC *gc)
+		{
+			return gc->AllocRCObject(size);
+		}
+		
+		REALLY_INLINE RCObject()
 		{
 			// composite == 0 is special, it means a deleted object in Release builds
-			// b/c RCObjects have a vtable we know composite isn't the first 4 byte and thus
+			// b/c RCObjects have a vtable we "know" composite isn't the first word and thus
 			// won't be trampled by the freelist
 			composite = 1;
-			GC::GetGC(this)->AddToZCT(this);
+			GC::GetGC(this)->AddToZCT(this REFCOUNT_PROFILING_ARG(true));
 		}
 
-		~RCObject()
+		REALLY_INLINE ~RCObject()
 		{
 			// for explicit deletion
 			if (InZCT())
-				GC::GetGC(this)->RemoveFromZCT(this);
+				GC::GetGC(this)->RemoveFromZCT(this REFCOUNT_PROFILING_ARG(true));
 			composite = 0;
-#if 0
-			padto32bytes = 0;
-#endif
 		}
 
-		bool IsPinned()
+		/**
+		 * @return true if the object is currently pinned (explicitly or by
+		 *         the ZCT's stack pinner).
+		 */
+		REALLY_INLINE bool IsPinned()
 		{
 			return (composite & STACK_PIN) != 0;
 		}
 
+		/**
+		 * Explicitly pin the object, protecting it from ZCT reaping.  The pin
+		 * flag /will/ be cleared if the object is subsequently added to the
+		 * ZCT and reaping is not ongoing.  It is not advised to call Pin()
+		 * except from prereap() callback handlers.
+		 */
 		void Pin()
 		{
 #ifdef _DEBUG
@@ -182,31 +230,66 @@ namespace MMgc
 			composite |= STACK_PIN;
 		}
 
+		/**
+		 * Explicitly unpin the object, allowing it to be reaped by the ZCT.
+		 * It is not advised to unpin objects that weren't pinned explicitly
+		 * by a call to Pin(), and calls to Unpin() should come from postreap()
+		 * callback handlers.
+		 */
 		void Unpin()
 		{
 			composite &= ~STACK_PIN;
 		}
 
-		int InZCT() const { return composite & ZCTFLAG; }
-		int RefCount() const { return (composite & RCBITS) - 1; }
-		int Sticky() const { return composite & STICKYFLAG; }		
-		void Stick() { composite = STICKYFLAG; }
+		/**
+		 * @return the object's current reference count.  The value is not
+		 * valid unless Sticky() returns 0.
+		 */
+		REALLY_INLINE uint32_t RefCount() const
+		{
+			return (composite & RCBITS) - 1;
+		}
 		
-		// called by EnqueZCT
-		void ClearZCTFlag() 
+		/**
+		 * @return non-zero if the object is sticky (RC operations have no effect because
+		 *         the RC field is invalid, either as a consequence of an RC overflow or
+		 *         because the sticky bit was set explicitly).
+		 */
+		REALLY_INLINE uint32_t Sticky() const
+		{
+			return composite & STICKYFLAG;
+		}
+		
+		/**
+		 * Make RC operations on the object be no-ops.
+		 */
+		REALLY_INLINE void Stick()
 		{ 
-			composite &= ~(ZCTFLAG|ZCT_INDEX);
+			if (InZCT())
+				GC::GetGC(this)->RemoveFromZCT(this REFCOUNT_PROFILING_ARG(true));
+			composite |= STICKYFLAG;
 		}
 
-		void IncrementRef() 
+		/**
+		 * Increment the object's reference count.
+		 *
+		 * OPTIMIZEME: this is too expensive and too large.  It should be
+		 * possible to do better if we play around with the positive/negative
+		 * boundary (eg, operations that don't cross that boundary are
+		 * cheap, and those that do aren't), but the special-casing of
+		 * composite==0 and invariants throughtout the system relying on
+		 * composite==0 make it hard.  We need profiling data on the breakdown
+		 * of the frequency of various paths through this function.
+		 */
+		REALLY_INLINE void IncrementRef() 
 		{
+			REFCOUNT_PROFILING_ONLY( GC::GetGC(this)->policy.signalIncrementRef(); )
 			if(Sticky() || composite == 0)
 				return;
-
 #ifdef _DEBUG
 			GC* gc = GC::GetGC(this);
 			GCAssert(gc->IsRCObject(this));
-			GCAssert(this == gc->FindBeginning(this));
+			GCAssert(this == gc->FindBeginningGuarded(this));
 			// don't touch swept objects
 			if(composite == 0xcacacaca || composite == 0xbabababa)
 				return;
@@ -220,21 +303,33 @@ namespace MMgc
 				GC::GetGC(this)->RemoveFromZCT(this);
 			}
 			
-#if 0
-			if(gc->keepDRCHistory)
-				history.Push(GetStackTraceIndex(2));
+#ifdef MMGC_RC_HISTORY
+			if(GC::GetGC(this)->keepDRCHistory)
+				history.Add(GCHeap::GetGCHeap()->GetProfiler()->GetStackTrace());
 #endif
 		}
 
+		/**
+		 * Decrement the object's reference count.
+		 *
+		 * OPTIMIZEME: this is too expensive and too large.  It should be
+		 * possible to do better if we play around with the positive/negative
+		 * boundary (eg, operations that don't cross that boundary are
+		 * cheap, and those that do aren't), but the special-casing of
+		 * composite==0 and invariants throughtout the system relying on
+		 * composite==0 make it hard.  We need profiling data on the breakdown
+		 * of the frequency of various paths through this function.
+		 */
 		REALLY_INLINE void DecrementRef() 
 		{ 
+			REFCOUNT_PROFILING_ONLY( GC::GetGC(this)->policy.signalDecrementRef(); )
 			if(Sticky() || composite == 0)
 				return;
 
 #ifdef _DEBUG
 			GC* gc = GC::GetGC(this);
 			GCAssert(gc->IsRCObject(this));
-			GCAssert(this == gc->FindBeginning(this));
+			GCAssert(this == gc->FindBeginningGuarded(this));
 			// don't touch swept objects
 			if(composite == 0xcacacaca || composite == 0xbabababa)
 				return;
@@ -243,7 +338,7 @@ namespace MMgc
 				return;
 
 			if(RefCount() == 0) {
-#ifdef MMGC_MEMORY_INFO
+#ifdef MMGC_RC_HISTORY
 				DumpHistory();
 #endif
 				GCAssert(false);
@@ -266,7 +361,12 @@ namespace MMgc
 			
 			composite--; 
 
-#if 0
+#ifdef MMGC_RC_HISTORY
+			if(GC::GetGC(this)->keepDRCHistory)
+				history.Add(GCHeap::GetGCHeap()->GetProfiler()->GetStackTrace());
+#endif
+			// ??? unclear what the following comment pertains to -- lars, 2009-06-09
+			
 			// the delete flag works around the fact that DecrementRef
 			// may be called after ~RCObject since all dtors are called
 			// in one pass.  For example a FunctionScriptObject may be
@@ -274,55 +374,67 @@ namespace MMgc
 			// ~FunctionScriptObject during a sweep, but since ScopeChain's
 			// are smaller the ScopeChain was already finalized, thus the
 			// push crashes b/c the history object has been destructed.
-			if(gc->keepDRCHistory)
-				history.Push(GetStackTraceIndex(1));
-#endif
-
+			
 			// composite == 1 is the same as (rc == 1 && !notSticky && !notInZCT)
 			if(RefCount() == 0) {
 				GC::GetGC(this)->AddToZCT(this);
 			}
 		}
 		
-#ifdef MMGC_MEMORY_INFO
+#ifdef MMGC_RC_HISTORY
 		void DumpHistory();
 #endif
 
-		void setZCTIndex(uint32_t index) 
+	private:
+
+		// @return non-zero if the object is in the ZCT
+		uint32_t InZCT() const
 		{
-			GCAssert(index < (ZCT_INDEX>>8));
-			GCAssert(index < ZCT_INDEX>>8);
-			composite = (composite&~ZCT_INDEX) | ((index<<8)|ZCTFLAG);
+			return composite & ZCTFLAG;
+		}
+		
+		// Clear the ZCT flag and the ZCT index
+		void ClearZCTFlag() 
+		{
+			composite &= ~(ZCTFLAG|ZCT_INDEX);
 		}
 
+		// @return the ZCT index.  This is only valid if InZCT returns non-zero.
 		uint32_t getZCTIndex() const
 		{
 			return (composite & ZCT_INDEX) >> 8;
 		}
 		
-		static void *operator new(size_t size, GC *gc, size_t extra = 0)
+		// Set the ZCT index and the ZCT flag and clear the pinned flag.
+		void setZCTIndexAndUnpin(uint32_t index) 
 		{
-			return gc->Alloc(size + extra, GC::kContainsPointers|GC::kZero|GC::kRCObject|GC::kFinalize);
+			GCAssert(index <= (ZCT_INDEX>>8));
+			composite = (composite&~(ZCT_INDEX|STACK_PIN)) | ((index<<8)|ZCTFLAG);
 		}
 
-	private:
-		friend class ZCT;
+		// Set the ZCT index and the ZCT flag.  If reaping==0 then clear the pinned flag, 
+		// otherwise preserve the pinned flag.
+		void setZCTIndexAndMaybeUnpin(uint32_t index, uint32_t reaping)
+		{
+			GCAssert(reaping == 0 || reaping == 1);
+			GCAssert(index <= (ZCT_INDEX>>8));
+			composite = (composite&~(ZCT_INDEX|((~reaping&1)<<STACK_PIN_SHIFT))) | ((index<<8)|ZCTFLAG);
+		}
+
+		// Fields in 'composite'
+		static const uint32_t ZCTFLAG	         = 0x80000000;			// The object is in the ZCT
+		static const uint32_t STICKYFLAG         = 0x40000000;			// The object is sticky (RC overflow)
+		static const uint32_t STACK_PIN          = 0x20000000;			// The object has been pinned
+		static const uint32_t STACK_PIN_SHIFT    = 29;
+		static const uint32_t RCBITS	         = 0x000000FF;			// 8 bits for the reference count
+		static const uint32_t ZCT_INDEX          = 0x0FFFFF00;			// 20 bits for the ZCT index
+		static const uint32_t ZCT_CAPACITY       = (ZCT_INDEX>>8) + 1;
 		
-		// 1 bit for inZCT flag (0x80000000)
-		// 1 bit for sticky flag (0x40000000)
-		// 20 bits for ZCT index
-		// 8 bits for RC count (0x000000FF)
-		static const uint32_t ZCTFLAG	         = 0x80000000;
-		static const uint32_t STICKYFLAG         = 0x40000000;
-		static const uint32_t STACK_PIN          = 0x20000000;
-		static const uint32_t RCBITS	         = 0x000000FF;
-		static const uint32_t ZCT_INDEX          = 0x0FFFFF00;
 		uint32_t composite;
-#if 0
+#ifdef MMGC_RC_HISTORY
 		// addref/decref stack traces
-		GCStack<StackTrace*,4> history;
-		int32_t padto32bytes;
-#endif
+		BasicList<StackTrace*> history;
+#endif // MMGC_MEMORY_INFO
 	};
 
 	template<class T> 
@@ -381,6 +493,16 @@ namespace MMgc
 			return (T) t;
 		}
 
+		RCPtr<T>& operator=(const RCPtr<T>& other)
+		{
+			if(valid())
+				t->DecrementRef();
+			t = other.t;
+			if(valid())
+				t->IncrementRef();
+			return *this;
+		}
+		
 		operator T() const
 		{
 			return (T) t;
@@ -398,6 +520,8 @@ namespace MMgc
 		void Clear() { t = NULL; }
 
 	private:
+		// Hidden and meant not to be used at all.
+		RCPtr(const RCPtr<T>& other);
 
 		inline bool valid() { return (uintptr_t)t > 1; }
 		T t;
@@ -406,6 +530,8 @@ namespace MMgc
 
 // put spaces around the template arg to avoid possible digraph warnings
 #define DRC(_type) MMgc::RCPtr< _type >
+
+#undef GNUC_ONLY
 
 }
 

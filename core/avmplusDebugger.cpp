@@ -44,13 +44,12 @@ namespace avmplus
 {
 	using namespace MMgc;
 
-	Debugger::TraceLevel	Debugger::astrace_console = Debugger::TRACE_OFF;
-	Debugger::TraceLevel	Debugger::astrace_callback = Debugger::TRACE_OFF;
-	bool					Debugger::in_trace = false;
-	uint64					Debugger::astraceStartTime = VMPI_getTime();
-
-	Debugger::Debugger(AvmCore *core)
-		: core(core)
+	Debugger::Debugger(AvmCore *core, TraceLevel tracelevel)
+		: astrace_console(tracelevel)
+		, astrace_callback(TRACE_OFF)
+		, in_trace(false)
+		, astraceStartTime(VMPI_getTime())
+		, core(core)
 		, abcList(core->GetGC())
 		, pool2abcIndex()
 	{
@@ -234,7 +233,11 @@ namespace avmplus
 		traceMethod(env->method);
 
 		// can't debug native methods
-		if (!env->method->isNative())
+		if (!env->method->isNative()
+#ifdef VMCFG_AOT
+			|| env->method->isCompiledMethod()
+#endif
+            )
 			debugMethod(env);
 	}
 
@@ -324,7 +327,10 @@ namespace avmplus
 		MethodEnv* env = core->callStack->env();
 		if (env->method)
 		{
-			name = env->method->getMethodName();
+			// normally, getMethodName omits nonpublic namespaces, but for this purpose,
+			// we want to include all namespaces.
+			const bool includeAllNamespaces = true;
+			name = env->method->getMethodName(includeAllNamespaces);
 			if (!name)
 				name = core->kEmptyString;
 			if ((line == 0) && (astrace_callback == TRACE_METHODS_WITH_ARGS || astrace_callback == TRACE_METHODS_AND_LINES_WITH_ARGS))
@@ -373,6 +379,11 @@ namespace avmplus
 	 */
 	void Debugger::processAbc(PoolObject* pool, ScriptBuffer code)
 	{
+#ifdef VMCFG_AOT
+		if(pool2abcIndex.get(pool) != NULL)
+			return;
+#endif
+
 		// first off we build an AbcInfo object 
 		AbcFile* abc = new (core->GetGC()) AbcFile(core, (int)code.getSize());
 		
@@ -490,7 +501,7 @@ namespace avmplus
 					if (active == NULL)
 						AvmAssert(0 == 1); // means OP_debugline appeared before OP_debugfile which is WRONG!  Fix compiler
 					else
-						active->addLine(core, line, m, (int)(pc - abc_start));
+						active->addLine(line, m, (int)(pc - abc_start));
  					break;
 				}
 
@@ -639,7 +650,7 @@ namespace avmplus
 	/**
 	 * A line - offset pair should be recorded 
 	 */
-	void SourceFile::addLine(AvmCore* core, int linenum, MethodInfo* func, int offset)
+	void SourceFile::addLine(int linenum, MethodInfo* func, int offset)
 	{
 		// Add the function to our list if it doesn't exist.  Use lastIndexOf() instead of
 		// indexOf(), because this will be faster in the very common case where the function
@@ -652,11 +663,7 @@ namespace avmplus
 		// order -- for example, I've seen them come out of order if a function
 		// contains an inner anonymous function -- so, update every time we get called
 		func->updateSourceLines(linenum, offset);
-
-        MMgc::GC *gc = core->GetGC();
-		if (sourceLines == NULL)
-			sourceLines = new (gc) BitSet();
-		sourceLines->set(gc,linenum);
+		sourceLines.set(linenum);
 	}
 
 	int SourceFile::functionCount() const 
@@ -671,27 +678,23 @@ namespace avmplus
 
 	bool SourceFile::setBreakpoint(int linenum)
 	{
-		if (sourceLines == NULL || !sourceLines->get(linenum))
+		if (!sourceLines.get(linenum))
 			return false;
-
-        MMgc::GC *gc = GC::GetGC(this);
-		if (breakpoints == NULL)
-			breakpoints = new (gc) BitSet();
-		breakpoints->set(gc, linenum);
+		breakpoints.set(linenum);
 		return true;
 	}
 
 	bool SourceFile::clearBreakpoint(int linenum)
 	{
-		if (breakpoints == NULL || !breakpoints->get(linenum))
+		if (!breakpoints.get(linenum))
 			return false;
-		breakpoints->clear(linenum);
+		breakpoints.clear(linenum);
 		return true;
 	}
 
 	bool SourceFile::hasBreakpoint(int linenum)
 	{
-		return (breakpoints != NULL && breakpoints->get(linenum));
+		return breakpoints.get(linenum);
 	}
 
 	DebugStackFrame::DebugStackFrame(int nbr, CallStackNode* tr, Debugger* debug)
@@ -814,7 +817,7 @@ namespace avmplus
 				// it is stored as an atom.)
 				if (info->needRestOrArguments())
 				{
-					int atomType = ar[0] & 7;
+					int atomType = atomKind(ar[0]);
 					if (atomType == 0) // 0 is not a legal atom type, so ar[0] is not an atom
 					{
 						ScriptObject* obj = (ScriptObject*)ar[0];

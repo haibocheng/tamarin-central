@@ -47,6 +47,8 @@ namespace MMgc
 
 #ifdef MMGC_MEMORY_PROFILER
 
+	const int kMaxStackTrace = 16; // RtlCaptureStackBackTrace stops working when this is 32
+
 #define MMGC_MEM_TAG(_x) if(MMgc::GCHeap::GetGCHeap()->HooksEnabled()) MMgc::SetMemTag(_x)
 #define MMGC_MEM_TYPE(_x) if(MMgc::GCHeap::GetGCHeap()->HooksEnabled()) MMgc::SetMemType(_x)
 	
@@ -56,14 +58,27 @@ namespace MMgc
 	void SetMemType(const void *memtype);
 	void PrintStackTrace(StackTrace *trace);
 
-	class GCStackTraceHashtable : public GCHashtable
+	class GCStackTraceHashtableKeyHandler
 	{
 	public:
-		GCStackTraceHashtable(unsigned int capacity=kDefaultSize, int options=0) : GCHashtable(capacity, options) {}
-	protected:
-		virtual unsigned equals(const void *k, const void *k2);
-		virtual unsigned hash(const void *k);
+		inline static uint32_t hash(const void* k)
+		{
+			const int* array = (const int*)k;
+			int hash = 0;
+			for(int i=0;i<kMaxStackTrace; i++)
+				hash += array[i];
+			return uint32_t(hash);
+		}
+
+		inline static bool equal(const void* k1, const void* k2)
+		{
+			if (k1 == NULL || k2 == NULL)
+				return false;
+			return VMPI_memcmp(k1, k2, kMaxStackTrace * sizeof(void*)) == 0;
+		}
 	};
+
+	typedef GCHashtableBase<GCStackTraceHashtableKeyHandler,GCHashtableAllocHandler_VMPI> GCStackTraceHashtable_VMPI;
 
 	class MemoryProfiler : public GCAllocObject
 	{
@@ -73,23 +88,32 @@ namespace MMgc
 		void RecordAllocation(const void *item, size_t askSize, size_t gotSize);
 		void RecordDeallocation(const void *item, size_t size);
 		void DumpFatties();
+		void DumpSimple();
 		const char *GetAllocationName(const void *obj);
 		StackTrace *GetAllocationTrace(const void *obj);
+		StackTrace *GetDeletionTrace(const void *obj);
 		StackTrace *GetStackTrace();
+		size_t GetAskSize(const void* item);
+
 	private:
 		const char *Intern(const char *name, size_t len);
 		const char *GetPackage(StackTrace *trace);
 		const char *GetAllocationNameFromTrace(StackTrace *trace);
 		const char *GetAllocationCategory(StackTrace *trace);
 
-		// map memory addresses of allocated objects to StackTrace*
-		GCHashtable traceTable;
+		// Note: it's important to use the VMPI variant of GCHashtable for all of these.
 
 		// intern table of StackTrace*
-		GCStackTraceHashtable stackTraceMap;
+		GCStackTraceHashtable_VMPI stackTraceMap;
 
-		// intern table of names
-		GCHashtable nameTable;
+		// intern table of strings used by Profiler
+		GCStringHashtable_VMPI stringsTable;
+
+		// hash table for address -> name lookup
+		GCHashtable_VMPI nameTable;
+
+		//table to store allocation specific information
+		GCHashtable_VMPI allocInfoTable;
 	};
 
 #else // MMGC_MEMORY_PROFILER
@@ -106,11 +130,6 @@ namespace MMgc
 #define DebugSize() 0
 
 #else 
-
-	/**
-	* Manually set me, for special memory not new/deleted, like the code memory region
-	*/
-	void ChangeSizeForObject(const void *object, int size);
 
 	/**
 	* How much extra size does DebugDecorate need?

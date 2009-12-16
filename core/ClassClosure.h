@@ -77,12 +77,15 @@ namespace avmplus
 		virtual uint64 size() const;
 #endif
 
+		virtual Stringp implToString() const;
+
 #ifdef AVMPLUS_VERBOSE
 	public:
 		Stringp format(AvmCore* core) const;
 #endif
 	// ------------------------ DATA SECTION BEGIN
 	public: DRCWB(ScriptObject*) prototype;
+	DECLARE_SLOTS_ClassClosure;
 	// ------------------------ DATA SECTION END
 	};
 }

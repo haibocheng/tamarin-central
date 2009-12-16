@@ -40,10 +40,6 @@
 #ifdef AVMPLUS_WORD_CODE
 
 // FIXME the following is required because FrameState has dependencies on the jitters
-#if defined FEATURE_NANOJIT
-    #include "CodegenLIR.h"
-#endif
-
 #include "FrameState.h"
 
 
@@ -51,10 +47,11 @@ namespace avmplus
 {
 	using namespace MMgc;
 	
-	WordcodeEmitter::WordcodeEmitter(MethodInfo* info)
+	WordcodeEmitter::WordcodeEmitter(MethodInfo* info, Toplevel* avm_toplevel)
 		: WordcodeTranslator()
 		, info(info)
 		, core(info->pool()->core)
+		, avm_toplevel(avm_toplevel)
 		, backpatches(NULL)
 		, labels(NULL)
 		, exception_fixes(NULL)
@@ -105,22 +102,15 @@ namespace avmplus
 #endif // AVMPLUS_SELFTEST
 	
 	void WordcodeEmitter::boot() {
-		if (pool != NULL)
-			pool->initPrecomputedMultinames();
 		computeExceptionFixups();
 		refill();
 #ifdef AVMPLUS_PEEPHOLE_OPTIMIZER
 		peepInit();
 #endif
-		this->next_cache = 0;
-		this->caches = new uint32_t[5];
-		this->num_caches = 5;
 	}
 	
 	WordcodeEmitter::~WordcodeEmitter()
 	{
-		delete [] caches;
-		caches = NULL;
 		cleanup();
 	}
 
@@ -137,6 +127,7 @@ namespace avmplus
 	
 	void WordcodeEmitter::cleanup() 
 	{
+		cache_builder.cleanup();
 		DELETE_LIST(backpatch_info, backpatches);
 		DELETE_LIST(label_info, labels);
 		DELETE_LIST(catch_info, exception_fixes);
@@ -174,7 +165,14 @@ namespace avmplus
 			label_info* l = labels;
 			while (l != NULL && l->old_offset != old_offset)
 				l = l->next;
-			AvmAssert(l != NULL);
+			// See https://bugzilla.mozilla.org/show_bug.cgi?id=481171.  Arguably this is a verification
+			// error, but work around the lack of a verification error here.
+			if (l == NULL) {
+				if (avm_toplevel != NULL)
+					core->throwErrorV(avm_toplevel->verifyErrorClass(), kInvalidBranchTargetError);
+				else
+					core->throwAtom(core->newStringLatin1("word code translator: missing LABEL for backward branch")->atom());
+			}
 			*dest++ = l->new_offset - base_offset;
 		}
 		else
@@ -232,18 +230,15 @@ namespace avmplus
 			
 			p[0] = new catch_info;
 			p[0]->pc = code_start + old_table->exceptions[i].from;
-			p[0]->is_target = false;
-			p[0]->fixup_loc = (void*)&(new_table->exceptions[i].from);
+			p[0]->fixup_loc = &(new_table->exceptions[i].from);
 			
 			p[1] = new catch_info;
 			p[1]->pc = code_start + old_table->exceptions[i].to;
-			p[1]->is_target = false;
-			p[1]->fixup_loc = (void*)&(new_table->exceptions[i].to);
+			p[1]->fixup_loc = &(new_table->exceptions[i].to);
 			
 			p[2] = new catch_info;
 			p[2]->pc = code_start + old_table->exceptions[i].target;
-			p[2]->is_target = true;
-			p[2]->fixup_loc = (void*)&(new_table->exceptions[i].target);
+			p[2]->fixup_loc = &(new_table->exceptions[i].target);
 			
 			if (p[0]->pc > p[1]->pc) {
 				catch_info* tmp = p[0];
@@ -314,10 +309,7 @@ namespace avmplus
 		while (exception_fixes != NULL && exception_fixes->pc <= pc) {
 			AvmAssert(exception_fixes->pc == pc);
 			exceptions_consumed = true;
-			if (exception_fixes->is_target)
-				*(intptr_t*)(exception_fixes->fixup_loc) = (intptr_t)(buffer_offset + (dest - buffers->data));
-			else
-				*(int*)(exception_fixes->fixup_loc) = (int)(buffer_offset + (dest - buffers->data));
+			*exception_fixes->fixup_loc = (int)(buffer_offset + (dest - buffers->data));
 			catch_info* tmp = exception_fixes;
 			exception_fixes = exception_fixes->next;
 			delete tmp;
@@ -444,7 +436,7 @@ namespace avmplus
 			break;
 		case OP_findpropglobal: 
 		case OP_findpropglobalstrict:
-			emitOp2(wordCode(opcode), opd1, allocateCacheSlot(opd1));
+			emitOp2(wordCode(opcode), opd1, cache_builder.allocateCacheSlot(opd1));
 		    break;
         case OP_pushscope:
         case OP_pushwith:
@@ -645,13 +637,9 @@ namespace avmplus
 		case OP_convert_s:
 		case OP_esc_xelem: 
 		case OP_esc_xattr:
+		case OP_lix8:
+		case OP_lix16:
   		    emitOp0(pc, wordCode(opcode));
-			break;
-		case OP_concat:
-  		    emitOp0(pc, wordCode(OP_add));
-			break;
-		case OP_add_d:
-  		    emitOp0(pc, wordCode(OP_add));
 			break;
 		case OP_throw:
 		case OP_returnvalue:		  
@@ -761,8 +749,8 @@ namespace avmplus
 		    emitOp0(pc, WOP_dxnslate);
 			break;
 		case OP_kill:
-			// No sense in emitting this for the interpreter, as all
-			// stacked values are atoms and fully type checked
+			// We used to remove this but it has side effects, so we can't
+			emitOp1(pc, WOP_kill);
 			break;
 		default:
 			// FIXME need error handler here
@@ -770,12 +758,6 @@ namespace avmplus
 		}
 
 	}
-
-    void WordcodeEmitter::writeSetContext(FrameState* state, MethodInfo *f)
-    {
-	    (void)state;
-		(void)f;
-    }
 
 	void WordcodeEmitter::writeCoerce(FrameState* state, uint32_t index, Traits *type)
     {
@@ -903,7 +885,7 @@ namespace avmplus
 		CHECK(2);
 		pc++;
 		*dest++ = NEW_OPCODE(WOP_pushbits);
-		*dest++ = (intptr_t)(((int8_t)*pc++) << 3) | kIntegerType;
+		*dest++ = (intptr_t)(((int8_t)*pc++) << 3) | kIntptrType;
 #ifdef AVMPLUS_PEEPHOLE_OPTIMIZER
 		peep(WOP_pushbits, dest-2);
 #endif
@@ -914,7 +896,7 @@ namespace avmplus
 		CHECK(2);
 		pc++;
 		*dest++ = NEW_OPCODE(WOP_pushbits);
-		*dest++ = (intptr_t)((int16_t)AvmCore::readU30(pc) << 3) | kIntegerType;
+		*dest++ = (intptr_t)((int16_t)AvmCore::readU30(pc) << 3) | kIntptrType;
 #ifdef AVMPLUS_PEEPHOLE_OPTIMIZER
 		peep(WOP_pushbits, dest-2);
 #endif
@@ -936,10 +918,10 @@ namespace avmplus
 		// FIXME: wrong for 64-bit, we want 32 bits of payload
 		pc++;
 		int32_t value = pool->cpool_int[AvmCore::readU30(pc)];
-		if ((value & 0xF0000000U) == 0xF0000000U || (value & 0xF0000000U) == 0) {
+		if (atomIsValidIntptrValue(value)) {
 			CHECK(2);
 			*dest++ = NEW_OPCODE(WOP_pushbits);
-			*dest++ = (value << 3) | kIntegerType;
+			*dest++ = (intptr_t(value) << 3) | kIntptrType;
 #ifdef AVMPLUS_PEEPHOLE_OPTIMIZER
 			peep(WOP_pushbits, dest-2);
 #endif
@@ -965,10 +947,10 @@ namespace avmplus
 		// FIXME: wrong for 64-bit, we want 32 bits of payload
 		pc++;
 		uint32_t value = pool->cpool_uint[AvmCore::readU30(pc)];
-		if ((value & 0xF0000000U) == 0) {
+		if (atomIsValidIntptrValue_u(value)) {
 			CHECK(2);
 			*dest++ = NEW_OPCODE(WOP_pushbits);
-			*dest++ = (value << 3) | kIntegerType;
+			*dest++ = (intptr_t(value) << 3) | kIntptrType;
 #ifdef AVMPLUS_PEEPHOLE_OPTIMIZER
 			peep(WOP_pushbits, dest-2);
 #endif
@@ -1050,7 +1032,7 @@ namespace avmplus
 		AvmAssert(exception_fixes == NULL);
 		
 		if (info != NULL)
-			info->set_word_code_cache_size(next_cache);
+			info->set_lookup_cache_size(cache_builder.next_cache);
 
 #ifdef AVMPLUS_PEEPHOLE_OPTIMIZER
 		peepFlush();
@@ -1524,26 +1506,6 @@ namespace avmplus
 		state = 0;			// ignore any partial match
 	}
 #endif  // AVMPLUS_PEEPHOLE_OPTIMIZER
-
-	// The cache structure is expected to be small in the normal case, so use a
-	// linear list.  For some programs, notably classical JS programs, it may however
-	// be larger, and we may need a more sophisticated structure.
-	uint32_t WordcodeEmitter::allocateCacheSlot(uint32_t imm30)
-	{
-		for ( int i=0 ; i < next_cache ; i++ )
-			if (caches[i] == imm30)
-				return i;
-		if (next_cache == num_caches) {
-			uint32_t* new_cache = new uint32_t[num_caches*2];
-			VMPI_memcpy(new_cache, caches, sizeof(uint32_t)*num_caches);
-			delete [] caches;
-			caches = new_cache;
-			num_caches *= 2;
-		}
-		caches[next_cache] = imm30;
-		return next_cache++;
-	}
-
 
 }
 #endif // AVMPLUS_WORD_CODE

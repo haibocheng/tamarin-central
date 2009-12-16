@@ -53,19 +53,66 @@
 
 namespace avmplus
 {	
+	// an auto-ptr for managing MethodFrame calls.
+	class EnterMethodEnv
+	{
+	public:
+		inline explicit EnterMethodEnv(AvmCore* core, MethodEnv* env, MethodFrame& frame) : m_core(core), m_frame(frame)
+		{
+			m_frame.enter(m_core, env);
+		}
+		inline ~EnterMethodEnv()
+		{
+			m_frame.exit(m_core);
+		}
+	private:
+		AvmCore* m_core;
+		MethodFrame& m_frame;
+	};
 
-#define IS_INTEGER(v)        (((v) & 7) == kIntegerType)
+#ifdef _DEBUG
+    REALLY_INLINE Atom CHECK_INT_ATOM(Atom a)
+    {
+        AvmAssert(atomKind(a) == kIntptrType && atomIsValidIntptrValue(atomGetIntptr(a)));
+        return a;
+    }
+    REALLY_INLINE Atom MAKE_INTEGER(intptr_t i)
+    {
+        AvmAssert(atomIsValidIntptrValue(i));
+        return (intptr_t(i) << 3) | kIntptrType;
+    }
+#else
+    #define CHECK_INT_ATOM(a) (a)
+    #define MAKE_INTEGER(v)   ((intptr_t(v) << 3) | kIntptrType)
+#endif
+
+
+#define IS_INTEGER(v)        (((v) & 7) == kIntptrType)
 #define IS_DOUBLE(v)         (((v) & 7) == kDoubleType)
 #define IS_BOOLEAN(v)        (((v) & 7) == kBooleanType)
 #define IS_STRING(v)		 (((v) & 7) == kStringType)
-#define FITS_IN_INTEGER(v)   (((int32_t(v) << 3) >> 3) == int32_t(v))				// FIXME: incorrect on 64-bit systems, where we have a 32-bit payload
-#define MAKE_INTEGER(v)      ((intptr_t(v) << 3) | kIntegerType)
-#define INTEGER_VALUE(v)     (intptr_t(v) >> 3)
-#define INT32_VALUE(v)       int32_t(INTEGER_VALUE(v))
-#define UINT32_VALUE(v)      uint32_t(INTEGER_VALUE(v))
+
+// note that the argument to SIGN_EXTEND is expected to be upshifted 3 bits (not a "raw" intptr),
+// but it doesn't expect or require the tag bits to be set properly.
+#ifdef AVMPLUS_64BIT
+// since 64-bit int atoms expect exactly 53 bits of precision, we want to shift bit 53+3 up into the sign bit and back down
+#  define SIGN_EXTEND(v)       ((intptr_t(v) << 8) >> 8)	
+#else
+#  define SIGN_EXTEND(v)       (intptr_t(v))
+#endif
+
+// CLAMP_32 is equivalent to running an int atom thru AvmCore::integer (ie, truncate to int32 using the right rules),
+// but, like SIGN_EXTEND, it expects the argument to be upshifted 3 bit.
+#ifdef AVMPLUS_64BIT
+#  define CLAMP_32(v)       ((intptr_t(v) << 29) >> 29)	
+#else
+#  define CLAMP_32(v)       (intptr_t(v))
+#endif
+
+#define INT32_VALUE(v)       int32_t(atomGetIntptr(v))
+#define UINT32_VALUE(v)      uint32_t(atomGetIntptr(v))
 #define DOUBLE_VALUE(v)		 (*(double*)((v) ^ kDoubleType))
-#define IS_BOTH_INTEGER(a,b) ((((a ^ kIntegerType) | (b ^ kIntegerType)) & 7) == 0) // less control flow but more registers -- which is better?
-//#define IS_BOTH_INTEGER(a,b) ((IS_INTEGER(a) && IS_INTEGER(b))
+#define IS_BOTH_INTEGER(a,b) ((((a ^ kIntptrType) | (b ^ kIntptrType)) & 7) == 0) // less control flow but more registers -- which is better?
 #define IS_BOTH_DOUBLE(a,b)  ((((a ^ kDoubleType) | (b ^ kDoubleType)) & 7) == 0)
 
 #ifdef AVMPLUS_WORD_CODE
@@ -165,7 +212,7 @@ namespace avmplus
 		Atom* const atomv = (Atom*)ap;
 		MethodSignaturep ms = env->method->getMethodSignature();
 		ms->boxArgs(env->core(), argc, (uint32 *)ap, atomv);
-		Atom a = interpBoxed(env, argc, atomv, ms);
+		Atom a = interpBoxed(env, argc, atomv);
 		const BuiltinType bt = ms->returnTraitsBT();
 		const uint32_t ATOM_MASK = (1U<<BUILTIN_object) | (1U<<BUILTIN_void) | (1U << BUILTIN_any);
 		if ((1U<<bt) & ATOM_MASK)
@@ -184,7 +231,7 @@ namespace avmplus
 		Atom* const atomv = (Atom*)ap;
 		MethodSignaturep ms = env->method->getMethodSignature();
 		ms->boxArgs(env->core(), argc, (uint32 *)ap, atomv);
-		Atom a = interpBoxed(env, argc, atomv, ms);
+		Atom a = interpBoxed(env, argc, atomv);
 		return AvmCore::number_d(a);
 	}
 
@@ -197,12 +244,30 @@ namespace avmplus
 #ifdef AVMPLUS_DIRECT_THREADED
 
 	void** interpGetOpcodeLabels() {
-		return (void**)interpBoxed(NULL, 0, NULL, NULL);
+		// *** NOTE ON THREAD SAFETY ***
+		//
+		// If we ever enable direct threading for a platform where the thread jump targets
+		// cannot be constants in a vector but must be written into a vector the first time
+		// interpGetOpcodeLabels() is called, then the following call must be within a
+		// critical section (or some startup code must make an initial call to make sure
+		// the vector is initialized in a thread safe way).  At this time, Visual C++
+		// requires this, but we're not using direct threading with Visual C++, so there
+		// is no critical section here.
+		//
+		// The startup code to make the initial call can simply call this function and
+		// assign the result to a dummy static global variable; that trick is not portable
+		// but it can be used for many platforms (and is used elsewhere).
+
+    #if defined MSVC_X86_ASM_THREADING || defined MSVC_X86_REWRITE_THREADING
+        #error "interpGetOpcodeLabels needs a critical section or eager initialization for this compiler / platform combination"
+    #endif
+		
+		return (void**)interpBoxed(NULL, 0, NULL);
 	}
 	
 #endif // AVMPLUS_DIRECT_THREADED
 
-    Atom interpBoxed(register MethodEnv* env, register int _argc, register Atom* _atomv, MethodSignaturep ms)
+    Atom interpBoxed(register MethodEnv* env, register int _argc, register Atom* _atomv)
     {
 #ifdef AVMPLUS_DIRECT_THREADED
 		
@@ -248,7 +313,7 @@ namespace avmplus
 			 III(0x05, L_setsuper)
 			 III(0x06, L_dxns)
 			 III(0x07, L_dxnslate)
-			 XXX(0x08) /* OP_kill */
+			 III(0x08, L_kill)
 			 XXX(0x09) /* OP_label */
 			 XXX(0x0A)
 			 XXX(0x0B)
@@ -394,8 +459,8 @@ namespace avmplus
 			 III(0x97, L_bitnot)
 			 XXX(0x98)
 			 XXX(0x99)
-			 XXX(0x9A) /* OP_concat */
-			 XXX(0x9B) /* OP_add_d */
+			 XXX(0x9A)
+			 XXX(0x9B)
 			 XXX(0x9C)
 			 XXX(0x9D)
 			 XXX(0x9E)
@@ -554,6 +619,8 @@ namespace avmplus
 			 XXX(0x133)
 			 XXX(0x134)
 #endif
+			 III(0x135, L_lix8)
+			 III(0x136, L_lix16)
 #  if defined GNUC_THREADING
 			};
 			AvmAssert(opcode_labels[0x18] == &&L_ifge);
@@ -585,11 +652,8 @@ namespace avmplus
  		
  		struct InterpreterAuxiliaryFrame
  		{
+			MethodFrame methodFrame;
  			ExceptionFrame ef;
- 			CodeContextAtom savedCodeContext;
-			Namespace** dxnsAddr;
- 			Namespace* dxns;
- 			Namespace* const * dxnsAddrSave;
  			Multiname multiname2;
  		};
 
@@ -623,7 +687,7 @@ namespace avmplus
 #endif
  		
 #ifdef AVMPLUS_VERBOSE
- 		if (pool->verbose)
+ 		if (pool->isVerbose(VB_interp))
  			core->console << "interp " << info << '\n';
 #endif
  		
@@ -633,31 +697,30 @@ namespace avmplus
   		// Should not have to do this on every entry, but the logic that tries to do
   		// it elsewhere is not currently working - at least the verifier installs a trampoline
   		// bypasses delegateInvoke, so the structure is not created on all paths.
+		// 
+		// this block is not #ifdef VMCFG_LOOKUP_CACHE because we only want
+		// to do this when the lookup cache is being used by wordcode.  we do not
+		// want to run this in the abc interpreter when combined with the JIT.
   		
-  		if (info->word_code_cache_size() > 0 && env->lookup_cache == NULL) {
+  		if (info->lookup_cache_size() > 0 && env->lookup_cache == NULL) {
   			using namespace MMgc;
- 			env->lookup_cache = (MethodEnv::LookupCache*)core->GetGC()->Alloc(sizeof(MethodEnv::LookupCache)*info->word_code_cache_size(), GC::kContainsPointers|GC::kZero);
+ 			env->lookup_cache = (MethodEnv::LookupCache*)core->GetGC()->Alloc(sizeof(MethodEnv::LookupCache)*info->lookup_cache_size(), GC::kContainsPointers|GC::kZero);
   		}
 #endif
  		
- 		if (core->minstack)
- 		{
- 			// Take the address of a local variable to get
- 			// stack pointer
- 			void* dummy;
- 			//fprintf(stderr, "%p\n", &dummy);
- 			if ((uintptr_t)&dummy < core->minstack)
- 			{
- 				core->stackOverflow(env);
- 			}
- 		}
- 		
+		// always do a stack check; this not only checks true stack overflows
+		// but also the stack limit is used to gain control for host interrupts.
+		// so this stack check doubles as an interrupt check.
+		// see also: AvmCore::handleStackOverflow().
+		core->stackCheck(env);
+
  		register List<double*, LIST_GCObjects> const & cpool_double = pool->cpool_double;
  		register const bool interruptable = !info->isNonInterruptible();
  		register const Domain* envDomain = env->domainEnv()->domain();
  		// I do *not* like making pc 'volatile'; a smart compiler may handle it well
  		// and only spill to memory across a call, but a dumb compiler may not ever
  		// keep the value in a register at all.
+		MethodSignaturep volatile ms = env->method->getMethodSignature();
 #if !defined AVMPLUS_WORD_CODE || defined AVMPLUS_VERBOSE
 	#ifdef AVMPLUS_WORD_CODE
  		register const bytecode_t* volatile codeStart = info->word_code_start();
@@ -686,26 +749,30 @@ namespace avmplus
 					   (Atom*)VMPI_alloca(core, _framep,
 										  sizeof(Atom)*(ms->frame_size())
 										+ kAuxFrameSize);
-		register InterpreterAuxiliaryFrame* const aux_memory = (InterpreterAuxiliaryFrame*)(framep + ms->frame_size());
+		union {
+			Atom* fa;
+			InterpreterAuxiliaryFrame* fi;
+		};
+		fa = framep + ms->frame_size();
+		register InterpreterAuxiliaryFrame* const aux_memory = (InterpreterAuxiliaryFrame*)fi;
 #endif
+
+		// It's essential that the MethodFrame is cleaned up upon normal exit, to keep core->currentMethodFrame
+		// in order. (a throw past the frame will not perform cleanup.) A manual call just before returning 
+		// is *not* adequate, as we need to be able to call aux_memory->methodFrame->exit() *after* our TRY/CATCH
+		//  code has completed (otherwise, it may attempt to "restore" currentStack to a bogus value). 
+		// Using a real dtor here ensures we are called after any endTry().
+		EnterMethodEnv methodFrame(core, env, aux_memory->methodFrame);
+
  		register Atom* const scopeBase = framep + ms->local_count();
  		register Atom* volatile withBase = NULL;
  		NONDEBUGGER_ONLY( register ) int volatile scopeDepth = 0;
  		register ScopeChain* const scope = env->scope();
  		register Atom* /* NOT VOLATILE */ sp = scopeBase + ms->max_scope() - 1;
+		// Note: scopes can be anything but null or undefined... but scope0 (the global scope) will always be a ScriptObject*.
+		// Code that uses lots of global variables accesses this frequently, so it's worth caching.
+		ScriptObject* /* NOT VOLATILE */ globalScope = (scope->getSize() > 0) ? AvmCore::atomToScriptObject(scope->getScope(0)) : NULL;
  		
- 		aux_memory->dxns = scope->getDefaultNamespace();
-		aux_memory->dxnsAddrSave = core->dxnsAddr;
- 		if(info->setsDxns()) 
- 			aux_memory->dxnsAddr = &aux_memory->dxns;
- 		else 
- 			aux_memory->dxnsAddr = scope->getDefaultNamespaceAddr();	// just the address of a member of *scope
-		core->dxnsAddr = aux_memory->dxnsAddr;
-		
- 		aux_memory->savedCodeContext = core->codeContextAtom;
- 		if (pool->domain->base != NULL)
- 			core->codeContextAtom = makeCodeContextAtom(env);
-  
  		// OPTIMIZEME - opportunities for streamlining the function entry code.
  		// 
  		// * With unbox/box optimization introduced and alloca removed so that the parameter
@@ -762,6 +829,13 @@ namespace avmplus
  				// Even tho E3 says create an Object, E4 says create an Array so thats what we will do.
  				framep[param_count+1] = env->createArguments(_atomv, arguments_argc)->atom();
  			}
+
+#ifdef DEBUGGER
+            // in debugger builds, ensure that non-active scope entries are nulled out
+            // (really only need to do so if there's a debugger active, but not really worth checking for)
+            for (int i = 0; i < ms->max_scope(); ++i)
+                scopeBase[i] = nullObjectAtom;
+#endif
  		}
 
 #ifdef DEBUGGER
@@ -769,13 +843,11 @@ namespace avmplus
 #ifndef AVMPLUS_WORD_CODE
 		if (core->debugger()) 
 		{
-			callStackNode = new ((char*)aux_memory + offsetof(InterpreterAuxiliaryFrameWithCSN, cs)) CallStackNode(env, framep, /*frameTraits*/0, &expc, true);
+			callStackNode = new ((char*)aux_memory + offsetof(InterpreterAuxiliaryFrameWithCSN, cs)) CallStackNode(env, (FramePtr)framep, /*frameTraits*/0, &expc);
 			env->debugEnterInner();
 		}
 #endif
 #endif
- 
- 		core->branchCheck(env, interruptable, -1);
 
 // NEXT dispatches the next instruction.
 //
@@ -792,7 +864,7 @@ namespace avmplus
 // Used in the case of exceptions.
 
 #ifdef AVMPLUS_VERBOSE
-#  define VERBOSE  if (pool->verbose) showState(info, codeStart, pc-1, framep, sp, scopeDepth, scopeBase, ms->max_scope())
+#  define VERBOSE  if (pool->isVerbose(VB_interp)) showState(info, codeStart, pc-1, framep, sp, scopeDepth, scopeBase, ms->max_scope())
 #else
 #  define VERBOSE
 #endif
@@ -843,7 +915,7 @@ namespace avmplus
 #  define INSTR(op) case OP_##op: VERBOSE;
 
 #  define NEXT              continue
-#  define U30ARG            (readU30(pc))
+#  define U30ARG            (tmp_pc=pc, tmp_u30 = uint32_t(readU30(tmp_pc)), pc = tmp_pc, tmp_u30)
 #  define U8ARG             (*pc++)
 #  define S24ARG            (pc+=3, readS24(pc-3))
 #  define SAVE_EXPC	        expc = pc-1-codeStart
@@ -875,16 +947,18 @@ namespace avmplus
 		register bool b1;
 		register uint8_t ub2;
 		register ScriptObject *o1;
-		WORD_CODE_ONLY(register ScriptObject* o2;)
 		register const Multiname* multiname;
 		register MethodEnv* f;
-		register const TraitsBindings* td;
 		register Traits* t1;
 		uint16_t uh2l;				// not register - its address /can/ be taken
 		int32_t i32l;				// ditto
 		float f2l;					// ditto
 		double d2l;					// ditto
 		Atom a1l;					// ditto
+#ifndef AVMPLUS_WORD_CODE
+		register uint32_t tmp_u30;
+		const bytecode_t* tmp_pc;
+#endif
 		
 	MainLoop:
 #ifdef AVMPLUS_WORD_CODE
@@ -926,11 +1000,9 @@ namespace avmplus
 				}
 #endif
 				SAVE_EXPC;
-				core->codeContextAtom = aux_memory->savedCodeContext;
 				a1 = toplevel->coerce(a1, ms->returnTraits());
-				core->dxnsAddr = aux_memory->dxnsAddrSave;
 #ifdef AVMPLUS_VERBOSE
-				if (pool->verbose)
+				if (pool->isVerbose(VB_interp))
 					core->console << "exit " << info << '\n';
 #endif
 				return a1;
@@ -990,7 +1062,7 @@ namespace avmplus
 			INSTR(debugenter) {
 				AvmAssert(core->debugger() != NULL);
 				AvmAssert(callStackNode == NULL);
-				callStackNode = new ((char*)aux_memory + offsetof(InterpreterAuxiliaryFrameWithCSN, cs)) CallStackNode(env, framep, /*frameTraits*/0, &expc, true);
+				callStackNode = new ((char*)aux_memory + offsetof(InterpreterAuxiliaryFrameWithCSN, cs)) CallStackNode(env, (FramePtr)framep, /*frameTraits*/0, &expc);
 				env->debugEnterInner();
 				NEXT;
 			}
@@ -1027,7 +1099,7 @@ namespace avmplus
 			}
 
             INSTR(pushstring) {
-                *(++sp) = pool->cpool_string[(uint32_t)U30ARG]->atom();
+                *(++sp) = pool->getString((uint32_t)U30ARG)->atom();
                 NEXT;
 			}
 
@@ -1056,7 +1128,8 @@ namespace avmplus
 			}
 
             INSTR(getlocal) {
-				*(++sp) = framep[U30ARG];
+				u1 = U30ARG;
+				*(++sp) = framep[u1];
 				NEXT;
 			}
 
@@ -1154,7 +1227,7 @@ namespace avmplus
 				if (IS_BOOLEAN(a1))
 					;
 				else if (IS_INTEGER(a1))
-					sp[0] = a1 == kIntegerType ? falseAtom : trueAtom;
+					sp[0] = a1 == zeroIntAtom ? falseAtom : trueAtom;
 				else
 					sp[0] = AvmCore::booleanAtom(a1);
 				NEXT;
@@ -1176,12 +1249,12 @@ namespace avmplus
 
             INSTR(negate) {
 				a1 = sp[0];
-				if (IS_INTEGER(a1) && a1 != MAKE_INTEGER(0)) {
-					i1 = -INTEGER_VALUE(a1);
-					if (FITS_IN_INTEGER(i1)) {
-						sp[0] = MAKE_INTEGER(i1);
-						NEXT;
-					}
+				if (IS_INTEGER(a1) && a1 != zeroIntAtom) {
+					i1 = -atomGetIntptr(a1); // *not* INT32_VALUE
+                    if (atomIsValidIntptrValue(i1)) {
+                        sp[0] = MAKE_INTEGER(i1);
+                        NEXT;
+                    }
 				}
 				SAVE_EXPC;
 				sp[0] = core->doubleToAtom(-AvmCore::number(a1));
@@ -1195,12 +1268,11 @@ namespace avmplus
                 NEXT;
 			}
 
-#ifndef AVMPLUS_WORD_CODE
 			INSTR(kill) {
-				framep[U30ARG] = undefinedAtom;
+				u1 = U30ARG;
+				framep[u1] = undefinedAtom;
 				NEXT;
 			}
-#endif
 
             INSTR(typeof) {
 				*sp = core->_typeof(*sp)->atom();
@@ -1212,7 +1284,7 @@ namespace avmplus
 				if (IS_BOOLEAN(a1))
 					;
 				else if (IS_INTEGER(a1))
-					a1 = a1 == kIntegerType ? falseAtom : trueAtom;
+					a1 = a1 == zeroIntAtom ? falseAtom : trueAtom;
 				else
 					a1 = AvmCore::booleanAtom(a1);
                 sp[0] = a1 ^ (trueAtom ^ falseAtom);
@@ -1222,7 +1294,7 @@ namespace avmplus
 			INSTR(bitnot) {
 				a1 = sp[0];
 				if (IS_INTEGER(a1)) {
-					sp[0] = ~a1 ^ 7;
+					sp[0] = MAKE_INTEGER(~int32_t(atomGetIntptr(a1)));
 					NEXT;
 				}
 				SAVE_EXPC;
@@ -1231,7 +1303,8 @@ namespace avmplus
 			}
 
             INSTR(setlocal) {
-                framep[U30ARG] = *(sp--);
+				u1 = U30ARG;
+                framep[u1] = *(sp--);
                 NEXT;
 			}
 
@@ -1255,33 +1328,17 @@ namespace avmplus
                 NEXT;
 			}	
 
-// Add a1 and a2 if they are both fixnums and computation does not overflow,
-// or if they are both flonums.  On success, store the result in dest, and NEXT.
 
-#define FAST_ADD_MAYBE(a1,a2,dest) \
-	if (IS_BOTH_INTEGER(a1, a2)) { \
-		u1t = a1 ^ kIntegerType; \
-		u2t = a2 ^ kIntegerType; \
-		u3t = u1t + u2t; \
-		if ((int32_t)(u1t ^ u2t) < 0 || (int32_t)(u1t ^ u3t) >= 0) { \
-			dest = u3t | kIntegerType; \
-			NEXT; \
-		} \
-	} \
-	else if (IS_BOTH_DOUBLE(a1, a2)) { \
-		dest = core->doubleToAtom(DOUBLE_VALUE(a1) + DOUBLE_VALUE(a2)); \
-		NEXT; \
-	}
 
 // Add 1 to a1 if it is a fixnum and computation does not overflow, or
 // if a1 is a flonum.  On success, store the result in dest, and NEXT.
 					
 #define FAST_INC_MAYBE(a1,dest) \
 	if (IS_INTEGER(a1)) { \
-		u1t = a1 ^ kIntegerType; \
-		u3t = u1t + (1 << 3); \
-		if ((int32_t)u1t < 0 || (int32_t)(u3t ^ u1t) >= 0) { \
-			dest = u3t | kIntegerType; \
+		u1t = a1 ^ kIntptrType; \
+		u3t = SIGN_EXTEND(u1t + (1 << 3)); \
+		if ((intptr_t)u1t < 0 || (intptr_t)(u3t ^ u1t) >= 0) { \
+			dest = CHECK_INT_ATOM(u3t | kIntptrType); \
 			NEXT; \
 		} \
 	} \
@@ -1291,36 +1348,31 @@ namespace avmplus
 	}
 
 #define ADD_TWO_VALUES_AND_NEXT(a1, a2, dest) \
-	FAST_ADD_MAYBE(a1,a2,dest); \
-	SAVE_EXPC; \
-	dest = toplevel->add2(a1, a2); \
-	NEXT
-
-// Subtract a2 from a1 if they are both fixnums and computation does not overflow.
-// On success, store the result in dest, and NEXT.
-#define FAST_SUB_MAYBE(a1,a2,dest) \
 	if (IS_BOTH_INTEGER(a1, a2)) { \
-		u1t = a1 ^ kIntegerType; \
-		u2t = a2 ^ kIntegerType; \
-		u3t = u1t - u2t; \
-		if ((int32_t)(u1t ^ u2t) >= 0 || (int32_t)(u1t ^ u3t) >= 0) { \
-			dest = u3t | kIntegerType; \
+		u1t = a1 ^ kIntptrType; \
+		u2t = a2 ^ kIntptrType; \
+		u3t = SIGN_EXTEND(u1t + u2t); \
+		if ((intptr_t)(u1t ^ u2t) < 0 || (intptr_t)(u1t ^ u3t) >= 0) { \
+			dest = CHECK_INT_ATOM(u3t | kIntptrType); \
 			NEXT; \
 		} \
 	} \
 	else if (IS_BOTH_DOUBLE(a1, a2)) { \
-		dest = core->doubleToAtom(DOUBLE_VALUE(a1) - DOUBLE_VALUE(a2)); \
+		dest = core->doubleToAtom(DOUBLE_VALUE(a1) + DOUBLE_VALUE(a2)); \
 		NEXT; \
-	}
+	} \
+	SAVE_EXPC; \
+	dest = toplevel->add2(a1, a2); \
+	NEXT
 
 // Subtract 1 from a1 if a1 is a fixnum and computation does not overflow.
-// On success, store the result in dest, and NEXT.
+// On success, store the result in dest, and NEXT. 
 #define FAST_DEC_MAYBE(a1,dest) \
 	if (IS_INTEGER(a1)) { \
-		u1t = a1 ^ kIntegerType; \
-		u3t = u1t - (1 << 3); \
-		if ((int32_t)u1t >= 0 || (int32_t)(u1t ^ u3t) >= 0) { \
-			dest = u3t | kIntegerType; \
+		u1t = a1 ^ kIntptrType; \
+		u3t = SIGN_EXTEND(u1t - (1 << 3)); \
+		if ((intptr_t)u1t >= 0 || (intptr_t)(u1t ^ u3t) >= 0) { \
+			dest = CHECK_INT_ATOM(u3t | kIntptrType); \
 			NEXT; \
 		} \
 	} \
@@ -1351,6 +1403,9 @@ namespace avmplus
 				a2p = sp;
 			increment_i_impl:
 				a1 = *a2p;
+ 				if (!IS_INTEGER(a1)) {
+ 					a1 = core->intAtom(a1);
+ 				}
 				FAST_INC_MAYBE(a1,*a2p);	// note, *a2p is lvalue here
 				core->increment_i(a2p, 1);
 				NEXT;
@@ -1407,10 +1462,22 @@ namespace avmplus
 				a1 = sp[-1];
 				a2 = sp[0];
 				sp--;
-				FAST_ADD_MAYBE(a1,a2,sp[0]);
+				if (IS_BOTH_INTEGER(a1, a2)) {
+					u1t = a1 ^ kIntptrType;
+					u2t = a2 ^ kIntptrType;
+					u3t = CLAMP_32(u1t + u2t);
+					sp[0] = CHECK_INT_ATOM(u3t | kIntptrType);
+					NEXT;
+				}
+				if (IS_BOTH_DOUBLE(a1, a2)) { 
+					i1 = (int32_t)AvmCore::integer_d(DOUBLE_VALUE(a1));
+					i2 = (int32_t)AvmCore::integer_d(DOUBLE_VALUE(a2));
+					goto finish_add_i;
+				}
 				SAVE_EXPC;
 				i1 = AvmCore::integer(a1);
 				i2 = AvmCore::integer(a2);
+			finish_add_i:
 				sp[0] = core->intToAtom((int32_t)(i1 + i2));
                 NEXT;
 			}
@@ -1422,7 +1489,19 @@ namespace avmplus
 #ifdef AVMPLUS_PEEPHOLE_OPTIMIZER
 			sub_two_values_and_next:
 #endif
-				FAST_SUB_MAYBE(a1, a2, sp[0]);
+				if (IS_BOTH_INTEGER(a1, a2)) { 
+					u1t = a1 ^ kIntptrType; 
+					u2t = a2 ^ kIntptrType;
+					u3t = SIGN_EXTEND(u1t - u2t); 
+					if ((intptr_t)(u1t ^ u2t) >= 0 || (intptr_t)(u1t ^ u3t) >= 0) { 
+						sp[0] = CHECK_INT_ATOM(u3t | kIntptrType); 
+						NEXT; 
+					} 
+				} 
+				if (IS_BOTH_DOUBLE(a1, a2)) { 
+					sp[0] = core->doubleToAtom(DOUBLE_VALUE(a1) - DOUBLE_VALUE(a2)); 
+					NEXT; 
+				}
 				SAVE_EXPC;
 				d1 = AvmCore::number(a1);
 				d2 = AvmCore::number(a2);
@@ -1434,10 +1513,22 @@ namespace avmplus
 				a1 = sp[-1];
 				a2 = sp[0];
 				sp--;
-				FAST_SUB_MAYBE(a1,a2,sp[0]);
+				if (IS_BOTH_INTEGER(a1, a2)) {
+					u1t = a1 ^ kIntptrType;
+					u2t = a2 ^ kIntptrType;
+					u3t = CLAMP_32(u1t - u2t);
+					sp[0] = CHECK_INT_ATOM(u3t | kIntptrType);
+					NEXT;
+				}
+				if (IS_BOTH_DOUBLE(a1, a2)) { 
+					i1 = (int32_t)AvmCore::integer_d(DOUBLE_VALUE(a1));
+					i2 = (int32_t)AvmCore::integer_d(DOUBLE_VALUE(a2));
+					goto finish_subtract_i;
+				}
 				SAVE_EXPC;
 				i1 = AvmCore::integer(a1);
 				i2 = AvmCore::integer(a2);
+			finish_subtract_i:
 				sp[0] = core->intToAtom((int32_t)(i1 - i2));
                 NEXT;
 			}
@@ -1501,9 +1592,9 @@ namespace avmplus
 #ifdef AVMPLUS_PEEPHOLE_OPTIMIZER
 			mod_two_values_and_next:
 #endif
-				if (IS_BOTH_INTEGER(a1, a2) && a2 != kIntegerType) {
-					i1 = INTEGER_VALUE(a1) % INTEGER_VALUE(a2);
-					if (FITS_IN_INTEGER(i1)) {
+				if (IS_BOTH_INTEGER(a1, a2) && a2 != zeroIntAtom) {
+					i1 = INT32_VALUE(a1) % INT32_VALUE(a2);
+					if (atomIsValidIntptrValue(i1)) {
 						sp[0] = MAKE_INTEGER(i1);
 						NEXT;
 					}
@@ -1526,8 +1617,8 @@ namespace avmplus
 			//lshift_two_values_and_next:
 				if (IS_BOTH_INTEGER(a1,a2)) {
 					i1 = INT32_VALUE(a1) << (INT32_VALUE(a2) & 0x1F);
-					if (FITS_IN_INTEGER(i1)) {
-						sp[0] = MAKE_INTEGER(i1);
+					if (atomIsValidIntptrValue(i1)) {
+						sp[0] = SIGN_EXTEND(MAKE_INTEGER(i1));
 						NEXT;
 					}
 				}
@@ -1560,8 +1651,8 @@ namespace avmplus
 				sp--;
 			//urshift_two_values_and_next:
 				if (IS_BOTH_INTEGER(a1,a2)) {
-					u1 = (UINT32_VALUE(a1) >> (INT32_VALUE(a2) & 0x1F));
-					if ((u1 & 0xF0000000U) == 0) {
+                    u1 = (UINT32_VALUE(a1) >> (INT32_VALUE(a2) & 0x1F));
+					if (atomIsValidIntptrValue_u(u1)) {
 						sp[0] = MAKE_INTEGER(u1);
 						NEXT;
 					}
@@ -1573,12 +1664,12 @@ namespace avmplus
 				NEXT;
 			}
 
-// The OR with tag is only necessary for xor, which passes kIntegerType.  The
+// The OR with tag is only necessary for xor, which passes kIntptrType.  The
 // others pass 0, and we assume the compiler optimizes the OR away.
 
 #define BITOP_TWO_VALUES_AND_NEXT(op, a1, a2, dest, tag) \
 	if (IS_BOTH_INTEGER(a1,a2)) { \
-		dest = (a1 op a2) | tag; \
+		dest = (CLAMP_32((a1) op (a2)) | tag); \
 		NEXT; \
 	} \
 	SAVE_EXPC; \
@@ -1614,7 +1705,7 @@ namespace avmplus
 #ifdef AVMPLUS_PEEPHOLE_OPTIMIZER
 			bitxor_two_values_and_next:
 #endif
-				BITOP_TWO_VALUES_AND_NEXT(^, a1, a2, sp[0], kIntegerType);
+				BITOP_TWO_VALUES_AND_NEXT(^, a1, a2, sp[0], kIntptrType);
 			}
 
             INSTR(equals) {
@@ -1635,7 +1726,7 @@ namespace avmplus
 			INSTR(lookupswitch) {
 #ifdef AVMPLUS_WORD_CODE
 				const uintptr_t* base = pc-1;
-				uint32_t index = AvmCore::integer_u(*(sp--));
+				uint32_t index = AvmCore::integer_i(*(sp--));
 				intptr_t default_offset = S24ARG;
 				uintptr_t case_count = U30ARG;
 				if (index <= case_count)
@@ -1645,9 +1736,9 @@ namespace avmplus
 #else
 				const uint8_t* base = pc-1;
 				// safe to assume int since verifier checks for int
-				uint32_t index = AvmCore::integer_u(*(sp--));
+				uint32_t index = AvmCore::integer_i(*(sp--));
 				const uint8_t* switch_pc = pc+3;
-				uint32_t case_count = readU30(switch_pc) + 1;
+				uint32_t case_count = uint32_t(readU30(switch_pc)) + 1;
                 pc = base+readS24( index < case_count ? (switch_pc + 3*index) : pc );
 #endif
 				NEXT;
@@ -1660,7 +1751,7 @@ namespace avmplus
 				if (IS_BOOLEAN(a1))
 					;
 				else if (IS_INTEGER(a1))
-					a1 = a1 == kIntegerType ? falseAtom : trueAtom;
+					a1 = a1 == zeroIntAtom ? falseAtom : trueAtom;
 				else
 					a1 = AvmCore::booleanAtom(a1);  // does not throw or change the XML namespace
 				i1 = S24ARG;
@@ -1846,7 +1937,7 @@ namespace avmplus
             INSTR(newarray) {
 				SAVE_EXPC;
                 i1 = (intptr_t)U30ARG;
-                a1 = toplevel->arrayClass->newarray(sp-i1+1, (int)i1)->atom();
+                a1 = avmplus::newarray(toplevel, (int)i1, sp-i1+1)->atom();
                 *(sp -= i1-1) = a1;
                 NEXT;
 			}
@@ -1866,11 +1957,9 @@ namespace avmplus
 // a test and a switch to get to that.  Should we in-line?
 // How will RTTI caching affect that?
 
-#ifdef AVMPLUS_WORD_CODE
-#  define GET_MULTINAME(name, arg)  do { name = pool->word_code.cpool_mn->multinames[arg]; } while(0)
-#  define GET_MULTINAME_PTR(decl, arg)  decl = &pool->word_code.cpool_mn->multinames[arg]
+#ifdef VMCFG_PRECOMP_NAMES
+#  define GET_MULTINAME_PTR(decl, arg)  decl = pool->precomputedMultiname(arg)
 #else
-#  define GET_MULTINAME(name, arg)  do { pool->parseMultiname(name, arg); } while(0)
 #  define GET_MULTINAME_PTR(decl, arg)  Multiname _multiname; pool->parseMultiname(_multiname, arg); decl = &_multiname
 #endif
 
@@ -2064,69 +2153,99 @@ namespace avmplus
 			// rather than using MAKE_INTEGER macro.
 			INSTR(sxi1) {
 				i1 = AvmCore::integer(sp[0]);
-				sp[0] = Atom(((i1 << (8*sizeof(Atom)-1)) >> ((8*sizeof(Atom)-1)-3)) | kIntegerType);
+				sp[0] = CHECK_INT_ATOM(Atom(((i1 << (8*sizeof(Atom)-1)) >> ((8*sizeof(Atom)-1)-3)) | kIntptrType));
 				NEXT;
 			}
 			
 			INSTR(sxi8) {
 				i1 = AvmCore::integer(sp[0]);
-				sp[0] = Atom(((i1 << (8*(sizeof(Atom)-1))) >> ((8*(sizeof(Atom)-1))-3)) | kIntegerType);
+				sp[0] = CHECK_INT_ATOM(Atom(((i1 << (8*(sizeof(Atom)-1))) >> ((8*(sizeof(Atom)-1))-3)) | kIntptrType));
 				NEXT;
 			}
 			
 			INSTR(sxi16) {
 				i1 = AvmCore::integer(sp[0]);
-				sp[0] = Atom(((i1 << (8*(sizeof(Atom)-2))) >> ((8*(sizeof(Atom)-2))-3)) | kIntegerType);
+				sp[0] = CHECK_INT_ATOM(Atom(((i1 << (8*(sizeof(Atom)-2))) >> ((8*(sizeof(Atom)-2))-3)) | kIntptrType));
 				NEXT;
 			}
 					
+        // note that the mops "addr" (offset from globalMemoryBase) is in fact a signed int, so we have to check
+        // for it being < 0 ... but we can get by with a single unsigned compare since all values < 0 will be > size
 #define MOPS_RANGE_CHECK(addr, type) \
-		if (addr < 0 || (uint32_t)((addr) + sizeof(type)) > envDomain->globalMemorySize) { env->mopRangeCheckFailed(); }
+		if (uint32_t(addr) > (envDomain->globalMemorySize() - sizeof(type))) { avmplus::mop_rangeCheckFailed(env); }
 
-#define MOPS_LOAD(addr, type, result) \
-		MOPS_RANGE_CHECK(addr, type) \
-		result = *(const type*)(envDomain->globalMemoryBase + (addr));
+#if defined(AVMPLUS_UNALIGNED_ACCESS) && defined(AVMPLUS_LITTLE_ENDIAN)
+    #define MOPS_LOAD(addr, type, call, result) \
+            MOPS_RANGE_CHECK(addr, type) \
+            union { const uint8_t* p8; const type* p; }; \
+            p8 = envDomain->globalMemoryBase() + (addr); \
+            result = *p;
 
-#define MOPS_STORE(addr, type, value) \
-		MOPS_RANGE_CHECK(addr, type) \
-		*(type*)(envDomain->globalMemoryBase + (addr)) = (type)(value);
+    #define MOPS_STORE(addr, type, call, value) \
+            MOPS_RANGE_CHECK(addr, type) \
+            union { uint8_t* p8; type* p; }; \
+            p8 = envDomain->globalMemoryBase() + (addr); \
+            *p = (type)(value);
+#else
+    #define MOPS_LOAD(addr, type, call, result) \
+            MOPS_RANGE_CHECK(addr, type) \
+            result = (type)avmplus::mop_##call(envDomain->globalMemoryBase() + (addr));
+
+    #define MOPS_STORE(addr, type, call, value) \
+            MOPS_RANGE_CHECK(addr, type) \
+            avmplus::mop_##call(envDomain->globalMemoryBase() + (addr), value);
+#endif
+
+
 			
 			// loads
+#ifdef AVMPLUS_WORD_CODE
+			INSTR(lix8) {
+				i1 = AvmCore::integer(sp[0]);		// i1 = addr
+				MOPS_LOAD(i1, int8_t, lix8, i32l);	// i32l = result
+				sp[0] = MAKE_INTEGER(i32l);		// always fits in atom
+				NEXT;
+			}
+
+			INSTR(lix16) {
+				i1 = AvmCore::integer(sp[0]);		// i1 = addr
+				MOPS_LOAD(i1, int16_t, lix16, i32l);	// i32l = result
+				sp[0] = MAKE_INTEGER(i32l);		// always fits in atom
+				NEXT;
+			}
+#endif
+
 			INSTR(li8) {
 				i1 = AvmCore::integer(sp[0]);		// i1 = addr
-				MOPS_LOAD(i1, uint8_t, ub2);	// ub2 = result
+				MOPS_LOAD(i1, uint8_t, liz8, ub2);	// ub2 = result
 				sp[0] = MAKE_INTEGER(ub2);		// always fits in atom
 				NEXT;
 			}
 
 			INSTR(li16) {
 				i1 = AvmCore::integer(sp[0]);		// i1 = addr
-				MOPS_LOAD(i1, uint16_t, uh2l);	// uh2l = result
-				MOPS_SWAP_BYTES(&uh2l);
+				MOPS_LOAD(i1, uint16_t, liz16, uh2l);	// uh2l = result
 				sp[0] = MAKE_INTEGER(uh2l);		// always fits in atom
 				NEXT;
 			}
 
 			INSTR(li32) {
 				i1 = AvmCore::integer(sp[0]);		// i1 = addr
-				MOPS_LOAD(i1, int32_t, i32l);	// i32l = result
-				MOPS_SWAP_BYTES(&i32l);
+				MOPS_LOAD(i1, int32_t, li32, i32l);	// i32l = result
 				sp[0] = core->intToAtom(i32l);
 				NEXT;
 			}
 
 			INSTR(lf32) {
 				i1 = AvmCore::integer(sp[0]);		// i1 = addr
-				MOPS_LOAD(i1, float, f2l);		// f2l = result
-				MOPS_SWAP_BYTES(&f2l);
+				MOPS_LOAD(i1, float, lf32, f2l);		// f2l = result
 				sp[0] = core->doubleToAtom(f2l);
 				NEXT;
 			}
 
 			INSTR(lf64) {
 				i1 = AvmCore::integer(sp[0]);		// i1 = addr
-				MOPS_LOAD(i1, double, d2l);		// d2l = addr
-				MOPS_SWAP_BYTES(&d2l);
+				MOPS_LOAD(i1, double, lf64, d2l);		// d2l = addr
 				sp[0] = core->doubleToAtom(d2l);
 				NEXT;
 			}
@@ -2135,7 +2254,7 @@ namespace avmplus
 			INSTR(si8) {
 				i1 = AvmCore::integer(sp[0]);		        // i1 = addr
 				ub2 = (uint8_t)AvmCore::integer(sp[-1]);	// u2 = value
-				MOPS_STORE(i1, uint8_t, ub2);
+				MOPS_STORE(i1, uint8_t, si8, ub2);
 				sp -= 2;
 				NEXT;
 			}
@@ -2143,8 +2262,7 @@ namespace avmplus
 			INSTR(si16) {
 				i1 = AvmCore::integer(sp[0]);		// i1 = addr
 				uh2l = (uint16_t)AvmCore::integer(sp[-1]);	// uh2l = value
-				MOPS_SWAP_BYTES(&uh2l);
-				MOPS_STORE(i1, uint16_t, uh2l);
+				MOPS_STORE(i1, uint16_t, si16, uh2l);
 				sp -= 2;
 				NEXT;
 			}
@@ -2152,8 +2270,7 @@ namespace avmplus
 			INSTR(si32) {
 				i1 = AvmCore::integer(sp[0]);		// i1 = addr
 				i32l = AvmCore::integer(sp[-1]);	// i32l = value
-				MOPS_SWAP_BYTES(&i32l);
-				MOPS_STORE(i1, uint32_t, i32l);
+				MOPS_STORE(i1, uint32_t, si32, i32l);
 				sp -= 2;
 				NEXT;
 			}
@@ -2161,8 +2278,7 @@ namespace avmplus
 			INSTR(sf32) {
 				i1 = AvmCore::integer(sp[0]);		// i1 = addr
 				f2l = (float)AvmCore::number(sp[-1]);		// d2l = value
-				MOPS_SWAP_BYTES(&f2l);
-				MOPS_STORE(i1, float, f2l);
+				MOPS_STORE(i1, float, sf32, f2l);
 				sp -= 2;
 				NEXT;
 			}
@@ -2170,8 +2286,7 @@ namespace avmplus
 			INSTR(sf64) {
 				i1 = AvmCore::integer(sp[0]);
 				d2l = AvmCore::number(sp[-1]);
-				MOPS_SWAP_BYTES(&d2l);
-				MOPS_STORE(i1, double, d2l);
+				MOPS_STORE(i1, double, sf64, d2l);
 				sp -= 2;
 				NEXT;
 			}
@@ -2209,10 +2324,8 @@ namespace avmplus
 				a2 = sp[0];
 				sp -= 2;
 				env->nullcheck(a1);
-				u1 = U30ARG-1;  // slot_id
-				o1 = AvmCore::atomToScriptObject(a1);
-				td = o1->traits()->getTraitsBindings();
-				o1->setSlotAtom((uint32_t)u1, toplevel->coerce(a2, td->getSlotTraits((uint32_t)u1)));
+				u1 = U30ARG-1;    // slot_id
+				AvmCore::atomToScriptObject(a1)->coerceAndSetSlotAtom((uint32_t)u1, a2);
 				NEXT;
 			}
 
@@ -2228,29 +2341,26 @@ namespace avmplus
 			INSTR(setglobalslot) {
 				SAVE_EXPC;
 				// find the global activation scope (object at depth 0 on scope chain)
-				// o1 = global
-				o1 = AvmCore::atomToScriptObject(scope->getSize() == 0 ? scopeBase[0] : scope->getScope(0));
+				AvmAssert(globalScope != NULL);
 
 				// OPTIMIZEME - cleanup after ABC interpreter defenestration.
 				// Perform the -1 adjustment in the bytecode translator, not here every time.
 				u1 = U30ARG-1;    // slot_id
 				a1 = sp[0];       // value
 				sp--;
-				td = o1->traits()->getTraitsBindings();
-				o1->setSlotAtom((uint32_t)u1, toplevel->coerce(a1, td->getSlotTraits((uint32_t)u1)));
+				globalScope->coerceAndSetSlotAtom((uint32_t)u1, a1);
 				NEXT;
 			}
 
 			INSTR(getglobalslot) {
 				SAVE_EXPC;
 				// find the global activation scope (object at depth 0 on scope chain)
-				// o1 = global
-				o1 = AvmCore::atomToScriptObject(scope->getSize() == 0 ? scopeBase[0] : scope->getScope(0));
+				AvmAssert(globalScope != NULL);
 
 				// OPTIMIZMEME - cleanup after ABC interpreter defenestration.
 				// Perform the -1 adjustment in the bytecode translator, not here every time.
 				sp++;
-				sp[0] = o1->getSlotAtom((uint32_t)(U30ARG-1));
+				sp[0] = globalScope->getSlotAtom((uint32_t)(U30ARG-1));
 				NEXT;
 			}
 
@@ -2382,7 +2492,7 @@ namespace avmplus
 				i1 = (intptr_t)U30ARG;  // argc
 				// stack in: factory, arg1, ... argN
 				// stack out: result
-				a1 = toplevel->op_applytype(sp[-i1]/*function*/, (int32_t)i1, sp-i1+1);
+				a1 = op_applytype(env, sp[-i1]/*function*/, (int32_t)i1, sp-i1+1);
 				*(sp = sp-i1) = a1;
 				NEXT;
 			}
@@ -2460,7 +2570,7 @@ namespace avmplus
 #ifndef AVMPLUS_WORD_CODE
             INSTR(pushshort) {
                 // this just pushes an integer since we dont have short atoms
-                *(++sp) = ((signed short)U30ARG)<<3|kIntegerType;
+                *(++sp) = MAKE_INTEGER(((int16_t)U30ARG));
 				NEXT;
 			}
 #endif
@@ -2547,7 +2657,8 @@ namespace avmplus
             }
 
             INSTR(getglobalscope) {
-				*(++sp) = (scope->getSize() > 0) ? scope->getScope(0) : scopeBase[0];
+				AvmAssert(globalScope != NULL);
+				*(++sp) = globalScope->atom();
 				NEXT;
 			}
 
@@ -2557,6 +2668,11 @@ namespace avmplus
 				if (AvmCore::isNullOrUndefined(a1)) {
 					SAVE_EXPC;
 					env->nullcheck(a1);
+				}
+				if (scopeDepth == 0 && globalScope == NULL)
+				{
+					AvmAssert(scope->getSize() == 0);
+					globalScope = AvmCore::atomToScriptObject(a1);
 				}
 				scopeBase[scopeDepth++] = a1;
 				NEXT;
@@ -2571,6 +2687,12 @@ namespace avmplus
 				}
 				if (!withBase)
 					withBase = scopeBase+scopeDepth;
+				// is it possible to have pushWith for scope 0? not sure, let's do this just in case
+				if (scopeDepth == 0 && globalScope == NULL)
+				{
+					AvmAssert(scope->getSize() == 0);
+					globalScope = AvmCore::atomToScriptObject(a1);
+				}
 				scopeBase[scopeDepth++] = a1;
 				NEXT;
 			}
@@ -2594,7 +2716,15 @@ namespace avmplus
 			}
 
             INSTR(popscope) {
-				scopeDepth--;
+				if (!--scopeDepth)
+				{
+					if (scope->getSize() == 0)
+						globalScope = NULL;
+				}
+            #ifdef DEBUGGER
+                // in debugger builds, ensure that non-active scope entries are nulled out
+                scopeBase[scopeDepth] = nullObjectAtom;
+            #endif
 				if (withBase >= scopeBase + scopeDepth)
 					withBase = NULL;
 				NEXT;
@@ -2607,6 +2737,9 @@ namespace avmplus
  					SAVE_EXPC;
  					sp[0] = core->intAtom(a1);
  				}
+				else {
+					sp[0] = CLAMP_32(a1);
+                }
 				NEXT;
 			}
 
@@ -2660,14 +2793,14 @@ namespace avmplus
 			INSTR(dxns) {
 				AvmAssert(info->setsDxns());
 				SAVE_EXPC;
-				aux_memory->dxns = core->newPublicNamespace(pool->cpool_string[(uint32_t)U30ARG]);
+				core->setDxns(&aux_memory->methodFrame, pool->getString((uint32_t)U30ARG));
 				NEXT;
 			}
 
 			INSTR(dxnslate) {
 				AvmAssert(info->setsDxns());
 				SAVE_EXPC;
-				aux_memory->dxns = core->newPublicNamespace(core->intern(*sp));
+				core->setDxnsLate(&aux_memory->methodFrame, *sp);
 				sp--;
 				NEXT;
 			}
@@ -2677,19 +2810,18 @@ namespace avmplus
 #ifndef AVMPLUS_WORD_CODE
 					
 			INSTR(abs_jump)	{
-				if (interruptable && core->interrupted) {
+				if (core->interruptCheck(interruptable)) {
 					SAVE_EXPC;
-					env->interrupt();
+					AvmCore::handleInterruptMethodEnv(env);
 				}
 #  ifdef AVMPLUS_64BIT
-				uint32_t base = AvmCore::readU30(pc);
-				uint8_t *target = (uint8_t *) ((uintptr_t(AvmCore::readU30(pc)) << 32));
-				target = (uint8_t*)((uintptr_t)target | base);
-				codeStart = pc = (const uint8_t*) target;
+				uint32_t target_lo = U30ARG;
+				uint32_t target_hi = U30ARG;
+				const uint8_t *target = (const uint8_t *)((uint64_t(target_hi) << 32) | uint64_t(target_lo));
 #  else // !AVMPLUS_64BIT
 				const uint8_t *target = (const uint8_t *) U30ARG;
-				codeStart = pc = target;
 #  endif // AVMPLUS_64BIT
+				codeStart = pc = target;
 				NEXT;
             }
 					
@@ -3051,18 +3183,18 @@ namespace avmplus
 				SAVE_EXPC;
 				GET_MULTINAME_PTR(multiname, u1);
 				AvmAssert(multiname->isBinding());
-				o1 = AvmCore::atomToScriptObject((scope->getSize() > 0) ? scope->getScope(0) : scopeBase[0]); // global
-				o2 = env->findglobalproperty(o1, multiname);  // container
-				if (o2 == NULL) 
+				AvmAssert(globalScope != NULL);
+				a1 = env->findglobalproperty(globalScope->atom(), multiname);  // container
+				if (AvmCore::isNullOrUndefined(a1)) 
 				{
 					if (b1)
 						toplevel->throwReferenceError(kUndefinedVarError, multiname);
 					else
-						*(++sp) = o1->atom();
+						*(++sp) = globalScope->atom();
 				}
 				else
 				{
-					*(++sp) = o2->atom();
+					*(++sp) = a1;
 					env->lookup_cache[u2].timestamp = core->lookupCacheTimestamp();
 					WBRC(core->GetGC(), env->lookup_cache, &env->lookup_cache[u2].object, AvmCore::atomToScriptObject(sp[0]));
 				}
@@ -3111,6 +3243,12 @@ namespace avmplus
 			pc = codeStart + handler->target;
 #endif
 			scopeDepth = 0;
+#ifdef DEBUGGER
+            // in debugger builds, ensure that non-active scope entries are nulled out
+            for (int i = 0, n = ms->max_scope(); i < n; ++i)
+                scopeBase[i] = nullObjectAtom;
+#endif
+			globalScope = (scope->getSize() > 0) ? AvmCore::atomToScriptObject(scope->getScope(0)) : NULL;
 			sp = scopeBase + ms->max_scope() - 1;
 			*(++sp) = exception->atom;
 			goto MainLoop;
@@ -3225,6 +3363,16 @@ namespace avmplus
 		ptrdiff_t scopep = scopebasep + scopeDepth - 1 - framep;
 		ptrdiff_t scopeBase = scopebasep - framep;
 		ptrdiff_t stackBase = scopebasep + max_scope - framep;
+
+// this is handy for debugging 64-specific interpreter bugs.
+//#ifdef AVMPLUS_64BIT
+//		core->console << "                        stack-raw:";
+//		for (ptrdiff_t i=stackBase; i <= sp; i++) {
+//			core->console << " 0x" << MathUtils::convertDoubleToStringRadix(core, framep[i]>>32, 16) << 
+//									MathUtils::convertDoubleToStringRadix(core, framep[i]&0xffffffff, 16);
+//		}
+//		core->console << '\n';
+//#endif
 
 		// stack
 		core->console << "                        stack:";

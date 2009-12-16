@@ -36,39 +36,90 @@
  * ***** END LICENSE BLOCK ***** */
 
 #include "avmplus.h"
+//#define DOPROF
+//#include "../vprof/vprof.h"
 
 namespace avmplus
 {
-	ScriptObject::ScriptObject(VTable *vtable,
-							   ScriptObject *delegate,
-	                           int capacity /*=InlineHashtable::kDefaultCapacity*/)
-		: 
+	ScriptObject::ScriptObject(VTable* _vtable, ScriptObject* _delegate) :
 #ifdef DEBUGGER 
-			AvmPlusScriptableObject((Atom)vtable), 
+		AvmPlusScriptableObject(sotObject(_vtable)), 
 #endif // DEBUGGER
-				vtable(vtable)
+		vtable(_vtable),
+		// note that it's substantially more efficient to initialize this in the ctor
+		// list vs. a later explicit call to setDelegate, as we don't have to check for marking
+		// nor decrement an existing value...
+		delegate(_delegate)
 	{
-		// initialize slots in this object to initial values from traits.
-		Traits* traits = vtable->traits;
-		AvmAssert(traits->isResolved());
+		AvmAssert(vtable->traits->isResolved());
 
 		// Ensure that our object is large enough to hold its extra traits data.
-		AvmAssert(MMgc::GC::Size(this) >= traits->getTotalSize());
+		AvmAssert(MMgc::GC::Size(this) >= vtable->traits->getTotalSize());
+	}
 
- 		setDelegate(delegate);
+	ScriptObject::ScriptObject(VTable* _vtable, ScriptObject* _delegate, int capacity) :
+#ifdef DEBUGGER 
+		AvmPlusScriptableObject(sotObject(_vtable)), 
+#endif // DEBUGGER
+		vtable(_vtable),
+		// note that it's substantially more efficient to initialize this in the ctor
+		// list vs. a later explicit call to setDelegate, as we don't have to check for marking
+		// nor decrement an existing value...
+		delegate(_delegate)
+	{
+		AvmAssert(vtable->traits->isResolved());
 
-		if (traits->needsHashtable())
+		// Ensure that our object is large enough to hold its extra traits data.
+		AvmAssert(MMgc::GC::Size(this) >= vtable->traits->getTotalSize());
+
+		//if capacity not specified then initialize the hashtable lazily
+		if (vtable->traits->needsHashtable() && capacity)
 		{
-			MMGC_MEM_TYPE(this);
-			getTable()->initialize(this->gc(), capacity);
-			getTable()->setDontEnumSupport();
+			initHashtable(capacity);
 		}
 	}
 
 	ScriptObject::~ScriptObject()
 	{
-		setDelegate(NULL);
+		//setDelegate(NULL); -- no longer necessary
 		vtable->traits->destroyInstance(this);
+	}
+	
+	void ScriptObject::initHashtable(int capacity /*=InlineHashtable::kDefaultCapacity*/)
+	{
+		AvmAssert(vtable->traits->isDictionary == 0); //should not be called DictionaryObject uses HeapHashtable
+		
+		MMGC_MEM_TYPE(this);
+		union {
+			uint8_t* p;
+			InlineHashtable* iht;
+		};
+		p = (uint8_t*)this + vtable->traits->getHashtableOffset();
+		iht->initialize(this->gc(), capacity);
+		iht->setDontEnumSupport();
+	}
+	
+	InlineHashtable* ScriptObject::getTable() const
+	{
+		AvmAssert(vtable->traits->getHashtableOffset() != 0);
+		union {
+			uint8_t* p;
+			InlineHashtable* iht;
+			HeapHashtable** hht;
+		};
+		p = (uint8_t*)this + vtable->traits->getHashtableOffset();
+		if(!vtable->traits->isDictionary)
+		{
+			if (iht->getCapacity() == 0)
+				const_cast<ScriptObject*>(this)->initHashtable(); 
+			return iht;
+		}
+		else
+		{
+			//DictionaryObjects store pointer to HeapHashtable at
+			//the hashtable offset
+			return (*hht)->get_ht();
+		}
 	}
 	
     /**
@@ -133,7 +184,8 @@ namespace avmplus
 			}
 			while ((o = o->delegate) != NULL);
 		}
-		Multiname multiname(core()->publicNamespace,AvmCore::atomToString(name));
+		// NOTE use default public since name is not used
+		Multiname multiname(core()->getAnyPublicNamespace(), AvmCore::atomToString(name));
 		toplevel()->throwReferenceError(kReadSealedError, &multiname, origObjTraits);
 		// unreached
 		return undefinedAtom;
@@ -141,19 +193,12 @@ namespace avmplus
 
 	bool ScriptObject::hasMultinameProperty(const Multiname* multiname) const
 	{
-		if (traits()->needsHashtable())
-		{
-			if (isValidDynamicName(multiname))
+		if (traits()->needsHashtable() && multiname->isValidDynamicName())
 			{
 				return hasAtomProperty(multiname->getName()->atom());
 			}
 			else
 			{
-				return false;
-			}
-		}
-		else
-		{
 			// ISSUE should this walk the proto chain?
 			return false;
 		}
@@ -198,7 +243,9 @@ namespace avmplus
 		}
 		else
 		{
-			Multiname multiname(core()->publicNamespace, AvmCore::atomToString(name));
+			// NOTE use default public since name is not used
+			Multiname multiname(core()->getAnyPublicNamespace(), AvmCore::atomToString(name));
+
 			// cannot create properties on a sealed object.
 			toplevel()->throwReferenceError(kWriteSealedError, &multiname, traits());
 		}
@@ -206,7 +253,7 @@ namespace avmplus
 
 	void ScriptObject::setMultinameProperty(const Multiname* name, Atom value)
 	{
-		if (traits()->needsHashtable() && isValidDynamicName(name))
+		if (traits()->needsHashtable() && name->isValidDynamicName())
 		{
 			setStringProperty(name->getName(), value);
 		}
@@ -254,8 +301,8 @@ namespace avmplus
 		}
 		else
 		{
-			// cannot create properties on a sealed object.
-			Multiname multiname(core()->publicNamespace, AvmCore::atomToString(name));
+			// cannot create properties on a sealed object. just use any public
+			Multiname multiname(core()->getAnyPublicNamespace(), AvmCore::atomToString(name));
 			toplevel()->throwReferenceError(kWriteSealedError, &multiname, traits());
 		}
 	}
@@ -283,7 +330,7 @@ namespace avmplus
 	
 	bool ScriptObject::deleteMultinameProperty(const Multiname* name)
 	{
-		if (traits()->needsHashtable() && isValidDynamicName(name))
+		if (traits()->needsHashtable() && name->isValidDynamicName())
 		{
 			return deleteStringProperty(name->getName());
 		}
@@ -341,7 +388,9 @@ namespace avmplus
 			}
 			else
 			{
-				Multiname multiname(core->publicNamespace, core->internUint32(i));
+				// NOTE use default public since name is not used
+				Multiname multiname(core->getAnyPublicNamespace(), core->string(name));
+
 				// cannot create properties on a sealed object.
 				toplevel()->throwReferenceError(kWriteSealedError, &multiname, traits());
 			}
@@ -398,7 +447,7 @@ namespace avmplus
 
 	Atom ScriptObject::getMultinameProperty(const Multiname* multiname) const
 	{
-		if (isValidDynamicName(multiname))
+		if (multiname->isValidDynamicName())
 		{
 			return getStringProperty(multiname->getName());
 		}
@@ -454,7 +503,7 @@ namespace avmplus
 #ifdef AVMPLUS_VERBOSE
 	Stringp ScriptObject::format(AvmCore* core) const
 	{
-		if (traits()->name != NULL) {
+		if (traits()->name() != NULL) {
 			return core->concatStrings(traits()->format(core),
 									   core->concatStrings(core->newConstantStringLatin1("@"),
 														   core->formatAtomPtr(atom())));
@@ -473,12 +522,13 @@ namespace avmplus
 		Atom atomv_out[1];
 
 		// call this.valueOf()
-		Multiname tempname(core->publicNamespace, core->kvalueOf);
+		// NOTE use callers versioned public to get correct valueOf
+		Multiname tempname(core->findPublicNamespace(), core->kvalueOf);
 		atomv_out[0] = atom();
 		Atom result = toplevel->callproperty(atom(), &tempname, 0, atomv_out, vtable);
 
 		// if result is primitive, return it
-		if ((result&7) != kObjectType)
+		if (atomKind(result) != kObjectType)
 			return result;
 
 		// otherwise call this.toString()
@@ -487,7 +537,7 @@ namespace avmplus
 		result = toplevel->callproperty(atom(), &tempname, 0, atomv_out, vtable);
 
 		// if result is primitive, return it
-		if ((result&7) != kObjectType)
+		if (atomKind(result) != kObjectType)
 			return result;
 
 		// could not convert to primitive.
@@ -508,12 +558,13 @@ namespace avmplus
 		Atom atomv_out[1];
 
 		// call this.toString()
-		Multiname tempname(core->publicNamespace, core->ktoString);
+		// NOTE use callers versioned public to get correct toString
+		Multiname tempname(core->findPublicNamespace(), core->ktoString);
 		atomv_out[0] = atom();
 		Atom result = toplevel->callproperty(atom(), &tempname, 0, atomv_out, vtable);
 
 		// if result is primitive, return its ToString
-		if ((result&7) != kObjectType)
+		if (atomKind(result) != kObjectType)
 			return core->string(result)->atom();
 
 		// otherwise call this.valueOf()
@@ -522,7 +573,7 @@ namespace avmplus
 		result = toplevel->callproperty(atom(), &tempname, 0, atomv_out, vtable);
 
 		// if result is primitive, return it
-		if ((result&7) != kObjectType)
+		if (atomKind(result) != kObjectType)
 			return core->string(result)->atom();
 
 		// could not convert to primitive.
@@ -536,7 +587,8 @@ namespace avmplus
 	Atom ScriptObject::call(int /*argc*/, Atom* /*argv*/)
 	{
 		// TypeError in ECMA to execute a non-function
-		Multiname name(core()->publicNamespace, core()->internConstantStringLatin1("value"));
+		// NOTE use default public since name is not used
+		Multiname name(core()->getAnyPublicNamespace(), core()->internConstantStringLatin1("value"));
 		toplevel()->throwTypeError(kCallOfNonFunctionError, core()->toErrorString(&name));
 		return undefinedAtom;
 	}
@@ -600,7 +652,36 @@ namespace avmplus
 		}
 	}
 
-	void ScriptObject::setSlotAtom(uint32_t slot, Atom value)
+	ScriptObject* ScriptObject::getSlotObject(uint32_t slot)
+	{
+		Traits* traits = this->traits();
+		const TraitsBindingsp td = traits->getTraitsBindings();
+		void* p;
+		const SlotStorageType sst = td->calcSlotAddrAndSST(slot, (void*)this, p);
+
+		// based on profiling of Flex apps, it's *much* more common for the slot in this case
+		// to have a type (vs "atom"), so check for that first...
+		if (sst == SST_scriptobject)
+		{
+			return *((ScriptObject**)p);
+		}
+		else if (sst == SST_atom)
+		{
+			Atom const a = *((const Atom*)p);
+
+			// don't call AvmCore::isObject(); it checks for null, which we don't care about here
+			if (atomKind(a) == kObjectType)
+				return (ScriptObject*)atomPtr(a);
+			
+			// else fall thru and return null
+		} 
+
+		return NULL;
+	}
+
+	// note: coerceAndSetSlotAtom now includes a simplified and streamlined version
+	// of Toplevel::coerce. If you modify that code, you might need to modify this code.
+	void ScriptObject::coerceAndSetSlotAtom(uint32_t slot, Atom value)
 	{
 		Traits* traits = this->traits();
 		const TraitsBindingsp td = traits->getTraitsBindings();
@@ -610,35 +691,60 @@ namespace avmplus
 		// SST_atom is most common case, put it first
 		if (sst == SST_atom)
 		{
-			AvmAssert(atomKind(value) != 0);
+			// no call to coerce() needed, since anything will fit here... with one exception:
+			// BUILTIN_object needs to convert undefined->null (though BUILTIN_any does not).
+			// it's cheaper to do that here than call out to coerce().
+			AvmAssert(td->getSlotTraits(slot) == NULL || td->getSlotTraits(slot)->builtinType == BUILTIN_object);
+			if (value == undefinedAtom && td->getSlotTraits(slot) != NULL)
+				value = nullObjectAtom;
 			WBATOM(traits->core->GetGC(), this, (Atom*)p, value);
 		}
 		else if (sst == SST_double)
 		{
-			AvmAssert(atomKind(value) == kIntegerType || atomKind(value) == kDoubleType);
-			*((double*)p) = AvmCore::number_d(value);
+			*((double*)p) = AvmCore::number(value);
 		}
 		else if (sst == SST_int32)
 		{
-			AvmAssert(atomKind(value) == kIntegerType || atomKind(value) == kDoubleType);
-			*((int32_t*)p) = AvmCore::integer_i(value);
+			*((int32_t*)p) = AvmCore::integer(value);
 		}
 		else if (sst == SST_uint32)
 		{
-			AvmAssert(atomKind(value) == kIntegerType || atomKind(value) == kDoubleType);
-			*((uint32_t*)p) = AvmCore::integer_u(value);
+			*((uint32_t*)p) = AvmCore::toUInt32(value);
 		}
 		else if (sst == SST_bool32)
 		{
-			AvmAssert(atomKind(value) == kBooleanType);
-			*((int32_t*)p) = urshift(value,3);
+			*((int32_t*)p) = AvmCore::boolean(value);
 		}
 		else 
 		{
-			AvmAssert(sst == SST_scriptobject || sst == SST_string || sst == SST_namespace);
-			AvmAssert(atomKind(value) == kStringType || atomKind(value) == kNamespaceType || atomKind(value) == kObjectType);
-			WBRC(traits->core->GetGC(), this, p, value & ~7);
+			// null/undefined -> NULL for all of these
+			if (AvmCore::isNullOrUndefined(value))
+			{
+				value = (Atom)0; // don't bother setting tag bits 
+			}
+			else if (sst == SST_string)
+			{
+				value = (Atom)traits->core->string(value); // don't bother setting tag bits 
+			}
+			else if (sst == SST_namespace)
+			{
+				// Namespace is final, so we don't have to do the hard work
+				if (atomKind(value) != kNamespaceType)
+					goto failure;
+			}
+			else // if (sst == SST_scriptobject)
+			{
+				AvmAssert(sst == SST_scriptobject);
+				if (atomKind(value) != kObjectType || !AvmCore::atomToScriptObject(value)->traits()->subtypeof(td->getSlotTraits(slot)))
+					goto failure;
+			}
+			WBRC(traits->core->GetGC(), this, p, atomPtr(value));
 		}
+		return;
+
+	failure:
+		toplevel()->throwTypeError(kCheckTypeFailedError, traits->core->atomToErrorString(value), traits->core->toErrorString(td->getSlotTraits(slot)));
+		return;
 	}
 
 	Atom ScriptObject::nextName(int index)
@@ -705,7 +811,7 @@ namespace avmplus
 	{
 		if (ivtable->base)
 		{
-			ScopeChain* scope = vtable->scope();
+			ScopeChain* scope = vtable->init->scope();
 			if (scope->getSize())
 			{
 				Atom baseAtom = scope->getScope(scope->getSize()-1);
@@ -738,9 +844,11 @@ namespace avmplus
 	
 #endif
 
-	DomainEnv* ScriptObject::domainEnv() const 
+	Stringp ScriptObject::implToString() const
 	{
-		return vtable->abcEnv->domainEnv();
+		AvmCore* core = this->core();
+		Traits* t = this->traits();
+		Stringp s = core->concatStrings(core->newConstantStringLatin1("[object "), t->name());
+		return core->concatStrings(s, core->newConstantStringLatin1("]"));
 	}
-
 }

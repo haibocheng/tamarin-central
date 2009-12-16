@@ -42,6 +42,21 @@
 
 namespace MMgc
 {
+	// Some common functionality for GCAlloc and GCLargeAlloc follows.  (Could be
+	// in a separate header file.)
+	
+	/**
+	 * Common block header for GCAlloc and GCLargeAlloc.
+	 */
+	struct GCBlockHeader
+	{
+		GC*				gc;		// The GC that owns this block
+		GCBlockHeader*	next;	// The next block in the list of blocks for the allocator
+		uint32_t		size;	// Size of objects stored in this block
+	};
+	
+	GCBlockHeader* GetBlockHeader(const void* item);
+
 	/**
 	 *
 	 * This is a fast, fixed-size memory allocator for garbage-collected
@@ -73,138 +88,95 @@ namespace MMgc
 	 * heap size / minimim heap size ratio.
 	 * 
 	 */
-	class GCAlloc : public GCAllocObject
+	class GCAlloc 
 	{
 		friend class GC;
+		friend class GCAllocIterator;
 	public:
 		enum ItemBit { kMark=1, kQueued=2, kFinalize=4, kHasWeakRef=8, kFreelist=kMark|kQueued };
 
 		GCAlloc(GC* gc, int itemSize, bool containsPointers, bool isRC, int sizeClassIndex);
 		~GCAlloc();
 		
+#if defined DEBUG || defined MMGC_MEMORY_PROFILER
 		void* Alloc(size_t size, int flags);
+#else
+		void* Alloc(int flags);
+#endif
 		static void Free(const void *ptr);
+		
 		void Finalize();
-		uint32_t GetItemSize() { return m_itemSize; }
 		void ClearMarks();
 #ifdef _DEBUG
 		void CheckMarks();
+		void CheckFreelist();
 #endif
 
-		static int SetMark(const void *item)
-		{
-			GCBlock *block = GetBlock(item);
-			int index = GetIndex(block, item);
-			int mask = kMark << ((index&7)<<2);
-			uint32_t *bits = &block->GetBits()[index>>3];
-			int set = *bits & mask;
-			*bits |= mask;
-			*bits &= ~(kQueued << ((index&7)<<2));
-			return set;
-		}
+		static int SetMark(const void *item);
 
-		static int SetQueued(const void *item)
-		{
-			GCBlock *block = GetBlock(item);
-			return SetBit(block, GetIndex(block, item), kQueued);
-		}
+		// Not a hot method
+		static int SetFinalize(const void *item);
 		
-		static int SetFinalize(const void *item)
-		{
-			GCBlock *block = GetBlock(item);
-			return SetBit(block, GetIndex(block, item), kFinalize);
-		}
+#ifdef _DEBUG
+		static bool IsWhite(const void *item);
+#endif // _DEBUG
+
+		static int GetMark(const void *item);
+
+		static void *FindBeginning(const void *item);
+
+		static bool IsMarkedThenMakeQueued(const void *item);
+
+		static bool IsQueued(const void *item);
+
+		// not a hot method
+		static void ClearFinalized(const void *item);
+
+		// not a hot method
+		static int IsFinalized(const void *item);
+
+		// not a hot method
+		static int HasWeakRef(const void *item);
 		
-		static int IsWhite(const void *item)
-		{
-			GCBlock *block = GetBlock(item);
-			// not a real item
-			if(item < block->items)
-				return false;
+		// Very hot: called in the inner loop of GC::MarkItem
+		static bool ContainsPointers(const void *item);
 
-			if(FindBeginning(item) != item)
-				return false;
-
-			return IsWhite(block, GetIndex(block, item));
-		}
-
-
-		static int GetMark(const void *item)
-		{
-			GCBlock *block = GetBlock(item);
-			return GetBit(block, GetIndex(block, item), kMark);
-		}
-
-		static void *FindBeginning(const void *item)
-		{
-			GCBlock *block = GetBlock(item);
-			return block->items + block->size * GetIndex(block, item);
-		}
-
-		static void ClearFinalized(const void *item)
-		{
-			GCBlock *block = GetBlock(item);
-			ClearBits(block, GetIndex(block, item), kFinalize);
-		}		
-
-		static int IsFinalized(const void *item)
-		{
-			GCBlock *block = GetBlock(item);
-			return GetBit(block, GetIndex(block, item), kFinalize);
-		}		
-		static int HasWeakRef(const void *item)
-		{
-			GCBlock *block = GetBlock(item);
-			return GetBit(block, GetIndex(block, item), kHasWeakRef);
-		}		
-		
-		static bool ContainsPointers(const void *item)
-		{
-			GCBlock *block = GetBlock(item);
-			return block->alloc->ContainsPointers();
-		}
-
-		static bool IsRCObject(const void *item)
-		{
-			GCBlock *block = GetBlock(item);
-			return item >= block->items && block->alloc->IsRCObject();
-		}
+		// Can be hot - used by PinStackObjects
+		static bool IsRCObject(const void *item);
 
 		static bool IsUnmarkedPointer(const void *val);
 		
-		int GetNumAlloc() const { return m_numAlloc; }
-		int GetMaxAlloc() const { return m_maxAlloc; }
-		int GetNumBlocks() const { return m_numBlocks; }
+		REALLY_INLINE uint32_t GetItemSize() { return m_itemSize; }
+		REALLY_INLINE int GetNumAlloc() const { return m_numAlloc; }
+		REALLY_INLINE int GetMaxAlloc() const { return m_maxAlloc; }
+		REALLY_INLINE int GetNumBlocks() const { return m_numBlocks; }
 
-		bool ContainsPointers() const { return containsPointers; }
-		bool IsRCObject() const { return containsRCObjects; }
+		REALLY_INLINE bool ContainsPointers() const { return containsPointers; }
+		REALLY_INLINE bool ContainsRCObjects() const { return containsRCObjects; }
 
 		void GetBitsPages(void **pages);
 
-		static void SetHasWeakRef(const void *item, bool to)
-		{
-			GCBlock *block = GetBlock(item);
-			if(to) {
-				SetBit(block, GetIndex(block, item), kHasWeakRef);
-			} else {
-				ClearBits(block, GetIndex(block, item), kHasWeakRef);
-			}
-		}
+		// not a hot method
+		static void SetHasWeakRef(const void *item, bool to);
 
+		//This method returns the number bytes allocated for GC objects
 		size_t GetBytesInUse();
+		
+		//This method is for more fine grained allocation details
+		//It reports the total number of bytes requested (i.e. ask size) and
+		//the number of bytes actually allocated.  The latter is the same
+		//number as reported by GetBytesInUse()
+		void GetUsageInfo(size_t& totalAskSize, size_t& totalAllocated);
+		
+#ifdef MMGC_MEMORY_PROFILER	
+		size_t GetTotalAskSize() { return m_totalAskSize; }
+#endif
 
 	private:
 		const static int kBlockSize = 4096;
 
-		struct GCBlock;
-
-		friend struct GCAlloc::GCBlock;
-
-		struct GCBlock
+		struct GCBlock : GCBlockHeader
 		{
-			GC *gc;
-			GCBlock* next;
-			uint32_t size;
 			GCAlloc *alloc;			
 			GCBlock* prev;
 			char*  nextItem;
@@ -217,34 +189,16 @@ namespace MMgc
 			bool finalizeState:1;  // whether we've been visited during the Finalize stage
 			char   *items;
 
-			int GetCount() const
-			{
-				if (nextItem) {
-					return GCAlloc::GetIndex(this, nextItem);
-				} else {
-					return alloc->m_itemsPerBlock;
-				}
-			}
+			int GetCount() const;
 
-			uint32_t *GetBits() const
-			{
-				return bits;
-			}
-			
+			uint32_t *GetBits() const;
+
 			void FreeItem(const void *item, int index);
 
-			bool IsFull() const
-			{
-				bool full = (nextItem == firstFree);
-				// the only time nextItem and firstFree should be equal is when they
-				// are both zero which is also when we are full, assert to be sure
-				GCAssert(!full || nextItem==0);
-				GCAssert(!full || numItems == alloc->m_itemsPerBlock);
-				return full;
-			}
+			bool IsFull();
 		};
 		
-		static GCBlock *GetBlock(const void *item) { return (GCBlock*) ((uintptr_t)item & ~0xFFF); }
+		static GCBlock *GetBlock(const void *item);
 		
 #ifdef MMGC_MEMORY_INFO
 		static void VerifyFreeBlockIntegrity(const void* item, uint32_t size);
@@ -265,6 +219,10 @@ namespace MMgc
 		int m_numBitmapBytes;
 		int m_sizeClassIndex;
 
+#ifdef MMGC_MEMORY_PROFILER
+		size_t m_totalAskSize;
+#endif
+
 		bool m_bitsInPage; 
 
 		int    m_maxAlloc;
@@ -279,116 +237,86 @@ namespace MMgc
 		bool containsRCObjects;
 		bool m_finalized;
 		
-		bool IsOnEitherList(GCBlock *b)
-		{
-			return b->nextFree != NULL || b->prevFree != NULL || b == m_firstFree || b == m_needsSweeping;
-		}
+#ifdef _DEBUG
+		bool IsOnEitherList(GCBlock *b);
+#endif
 
-		GCBlock* CreateChunk();
+		GCBlock* CreateChunk(int flags);
 		void UnlinkChunk(GCBlock *b);
 		void FreeChunk(GCBlock* b);
-		void AddToFreeList(GCBlock *b)
-		{
-			GCAssert(!IsOnEitherList(b) && !b->needsSweeping);
-			b->prevFree = NULL;
-			b->nextFree = m_firstFree;
-			if (m_firstFree) {
-				GCAssert(m_firstFree->prevFree == 0 && m_firstFree != b);
-				m_firstFree->prevFree = b;
-			}
-			m_firstFree = b;			
-		}
+		
+		// not a hot method
+		void AddToFreeList(GCBlock *b);
 
-		void RemoveFromFreeList(GCBlock *b)
-		{
-			GCAssert(m_firstFree == b || b->prevFree != NULL);
-			if ( m_firstFree == b )
-				m_firstFree = b->nextFree;
-			else
-				b->prevFree->nextFree = b->nextFree;
-			
-			if (b->nextFree)
-				b->nextFree->prevFree = b->prevFree;
-			b->nextFree = b->prevFree = NULL;
-		}
+		// not a hot method
+		void RemoveFromFreeList(GCBlock *b);
 
-		void AddToSweepList(GCBlock *b)
-		{
-			GCAssert(!IsOnEitherList(b) && !b->needsSweeping);
-			b->prevFree = NULL;
-			b->nextFree = m_needsSweeping;
-			if (m_needsSweeping) {
-				GCAssert(m_needsSweeping->prevFree == 0);
-				m_needsSweeping->prevFree = b;
-			}
-			m_needsSweeping = b;
-			b->needsSweeping = true;
-		}
+		// not a hot method
+		void AddToSweepList(GCBlock *b);
 
-		void RemoveFromSweepList(GCBlock *b)
-		{
-			GCAssert(m_needsSweeping == b || b->prevFree != NULL);
-			if ( m_needsSweeping == b )
-				m_needsSweeping = b->nextFree;
-			else
-				b->prevFree->nextFree = b->nextFree;
-			
-			if (b->nextFree)
-				b->nextFree->prevFree = b->prevFree;
-			b->needsSweeping = false;
-			b->nextFree = b->prevFree = NULL;
-		}
+		// not a hot method
+		void RemoveFromSweepList(GCBlock *b);
 
 		bool Sweep(GCBlock *b);
 		void SweepGuts(GCBlock *b);
-		
 
 		void ClearMarks(GCAlloc::GCBlock* block);
 		void SweepNeedsSweeping();
 
-		bool IsLastFreeBlock(GCBlock *b) { return m_firstFree == NULL || (m_firstFree == b && b->nextFree == NULL); }
-
-		static int ConservativeGetMark(const void *item, bool bogusPointerReturnValue);
-		
-		static int GetIndex(const GCBlock *block, const void *item)
-		{
-			int index = (int)((((char*) item - block->items) * block->alloc->multiple) >> block->alloc->shift);
 #ifdef _DEBUG
-			GCAssert(((char*) item - block->items) / block->size == (uint32_t) index);
+		static int ConservativeGetMark(const void *item, bool bogusPointerReturnValue);
 #endif
-			return index;
-		}			
 
-		static int IsWhite(GCBlock *block, int index)
-		{
-			return (block->GetBits()[index>>3] & ((kMark|kQueued)<<((index&7)<<2))) == 0;
-		}
+		// very hot
+		static int GetIndex(const GCBlock *block, const void *item);
 
-		static int SetBit(GCBlock *block, int index, int bit)
-		{
-			int mask = bit << ((index&7)<<2);
-			int set = (block->GetBits()[index>>3] & mask);
-			block->GetBits()[index>>3] |= mask;
-			return set;
-		}
+		static int SetBit(GCBlock *block, int index, int bit);
 
-		static int GetBit(GCBlock *block, int index, int bit)
-		{
-			int mask = bit << ((index&7)<<2);
-			return block->GetBits()[index>>3] & mask;
-		}
+		static int GetBit(GCBlock *block, int index, int bit);
 
-		static void ClearBits(GCBlock *block, int index, int bits)
-		{
-			int mask = bits << ((index&7)<<2);
-			block->GetBits()[index>>3] &= ~mask;
-		}
+		static void ClearBits(GCBlock *block, int index, int bits);
+
+		static void Clear4BitsAndSet(GCBlock *block, int index, int bit);
+		
+		// not a hot method
+		static void ClearQueued(const void *item);
+		
+#ifdef _DEBUG
+		static bool IsPointerIntoGCObject(const void *item);
+
+		static bool IsWhite(GCBlock *block, int index);
+#endif
 
 		void ComputeMultiplyShift(uint16_t d, uint16_t &muli, uint16_t &shft);
 
 	protected:
 		GC *m_gc;
 
+	public:
+		static GCBlock* Next(GCBlock* b);
+	};
+
+	/**
+	 * A utility class used by the marker to handle mark stack overflow: it abstracts
+	 * iterating across marked, non-free objects in one allocator instance.
+	 *
+	 * No blocks must be added or removed during the iteration.  If an object's
+	 * bits are changed, those changes will visible to the iterator if the object has
+	 * not yet been reached by the iteration. 
+	 */
+	class GCAllocIterator
+	{
+	public:
+		GCAllocIterator(MMgc::GCAlloc* alloc);
+		
+		bool GetNextMarkedObject(void*& out_ptr, uint32_t& out_size);
+		
+	private:
+		GCAlloc* const alloc;
+		GCAlloc::GCBlock* block;
+		uint32_t idx;
+		uint32_t limit;
+		uint32_t size;
 	};
 }
 

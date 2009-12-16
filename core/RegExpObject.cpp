@@ -48,6 +48,13 @@ namespace avmplus
 	using namespace MMgc;
 
 
+	class PcreState {
+	public:
+		PcreState(Toplevel* t) { AvmCore::setPCREContext(t); }
+		~PcreState() { AvmCore::setPCREContext(NULL); }
+	};
+	
+#define PCRE_STATE(x) PcreState p(x)
 
 #define OVECTOR_SIZE 99 // 32 matches = (32+1)*3
 
@@ -68,17 +75,18 @@ namespace avmplus
 		m_source = core->newConstantStringLatin1("(?:)");
 
 		StUTF8String utf8Pattern(m_source);
+		PCRE_STATE(toplevel());
 		m_pcreInst = (void*)pcre_compile(utf8Pattern.c_str(), m_optionFlags, &error, &errptr, NULL );
 	}
 
 	RegExpObject::RegExpObject(RegExpObject *toCopy)
-		: ScriptObject(toCopy->vtable, toCopy->getDelegate())
+		: ScriptObject(toCopy->vtable, toCopy->getDelegate()), m_source(toCopy->m_source.value())
 	{
 		AvmAssert(traits()->getSizeOfInstance() == sizeof(RegExpObject));
 
 		GC::SetFinalize(this);
 
-		m_source = toCopy->m_source;
+		// m_source = toCopy->m_source; -- no, now done in the initializer list above
 		m_global = toCopy->m_global;
 		m_lastIndex = 0;
 		m_optionFlags = toCopy->m_optionFlags;
@@ -87,16 +95,17 @@ namespace avmplus
 		StUTF8String utf8Pattern(m_source);
 		int errptr;
 		const char *error;
+		PCRE_STATE(toplevel());
 		m_pcreInst = (void*)pcre_compile(utf8Pattern.c_str(), m_optionFlags, &error, &errptr, NULL );
 	}
 		
 	RegExpObject::RegExpObject(RegExpClass *type,
 							   Stringp pattern,
 							   Stringp options)
-	   : ScriptObject(type->ivtable(), type->prototype)
+	   : ScriptObject(type->ivtable(), type->prototype), m_source(pattern)
 	{
 		AvmAssert(traits()->getSizeOfInstance() == sizeof(RegExpObject));
-		m_source = pattern;
+		// m_source = pattern;  -- no, now done in the initializer list above
 
 		GC::SetFinalize(this);
 		
@@ -160,6 +169,7 @@ namespace avmplus
 			}
 		}
 
+		PCRE_STATE(toplevel());
 		
 		m_pcreInst = (void*)pcre_compile(utf8Pattern.c_str(), m_optionFlags, &error, &errptr, NULL );
 		// FIXME: make errors available to actionscript
@@ -167,6 +177,7 @@ namespace avmplus
 
 	RegExpObject::~RegExpObject()
 	{
+		PCRE_STATE(toplevel());
 		(pcre_free)((void*)(pcre*)m_pcreInst);
 		m_global = false;
 		m_lastIndex = 0;
@@ -337,6 +348,7 @@ namespace avmplus
 		int results;
 		int subjectLength = utf8Subject.length();
 
+		PCRE_STATE(toplevel());
 		if( startIndex < 0 ||
 			startIndex > subjectLength ||
 			(results = pcre_exec((pcre*)m_pcreInst,
@@ -356,9 +368,9 @@ namespace avmplus
 		AvmCore *core = this->core();
 		ArrayObject *a = toplevel()->arrayClass->newArray(results);
 
-		a->setAtomProperty(toplevel()->regexpClass()->kindex,
+		a->setAtomProperty(toplevel()->regexpClass()->kindex->atom(),
 			   core->intToAtom(utf8Subject.toIndex(ovector[0])));
-		a->setAtomProperty(toplevel()->regexpClass()->kinput,
+		a->setAtomProperty(toplevel()->regexpClass()->kinput->atom(),
 			   subject->atom());
 		a->setLength(results);
 
@@ -472,6 +484,8 @@ namespace avmplus
 
 		const char *src = utf8Subject.c_str();
 		
+		PCRE_STATE(toplevel());
+
 		// get start/end index of all matches
 		int matchCount;
 		while (lastIndex <= subjectLength &&
@@ -553,7 +567,7 @@ namespace avmplus
 			// prevents infinite looping in certain cases
 			fixReplaceLastIndex(src,
 								subjectLength,
-								lastIndex,
+								matchLen,
 								newLastIndex,
 								resultBuffer);
 
@@ -587,6 +601,8 @@ namespace avmplus
 
 		const char *src = utf8Subject.c_str();
 		
+		PCRE_STATE(toplevel());
+
 		// get start/end index of all matches
 		int matchCount;
 		while (lastIndex < subjectLength &&
@@ -632,7 +648,7 @@ namespace avmplus
 			// prevents infinite looping in certain cases
 			fixReplaceLastIndex(src,
 								subjectLength,
-								lastIndex,
+								matchLen,
 								newLastIndex,
 								resultBuffer);
 
@@ -653,23 +669,23 @@ namespace avmplus
 
 	void RegExpObject::fixReplaceLastIndex(const char *src,
 										   int subjectLength,
-										   int lastIndex,
+										   int matchLen,
 										   int& newLastIndex,
 										   StringBuffer& resultBuffer)
 	{
-		if (lastIndex == newLastIndex && get_global())
+		if (matchLen == 0 && get_global())
 		{
 			// Advance one character
-			if (lastIndex < subjectLength)
+			if (newLastIndex < subjectLength)
 			{
 				uint32 ch;
-				int n = UnicodeUtils::Utf8ToUcs4((const uint8*)src+lastIndex, subjectLength-lastIndex, &ch);
+				int n = UnicodeUtils::Utf8ToUcs4((const uint8*)src+newLastIndex, subjectLength-newLastIndex, &ch);
 				if (n <= 0)
 				{
 					// Invalid UTF8 sequence, advance one byte
 					n = 1;
 				}
-				resultBuffer.write(src+lastIndex, n);
+				resultBuffer.write(src+newLastIndex, n);
 				newLastIndex += n;
 			}
 			else

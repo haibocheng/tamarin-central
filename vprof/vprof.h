@@ -87,6 +87,8 @@
 
 #include "VMPI.h"
 
+// Note, this is not supported in configurations with more than one AvmCore running
+// in the same process.
 
 // portable align macro
 #if defined(_MSC_VER)
@@ -94,6 +96,8 @@
 #elif defined(__GNUC__)
 	#define vprof_align8(t) t __attribute__ ((aligned (8)))
 #elif defined(__SUNPRO_C) || defined(__SUNPRO_CC)
+	#define vprof_align8(t) t __attribute__ ((aligned (8)))
+#elif defined(VMCFG_SYMBIAN)
 	#define vprof_align8(t) t __attribute__ ((aligned (8)))
 #endif
 
@@ -115,12 +119,14 @@ extern void* _tprof_before_id;
 //#define DOPROF
 
 #ifndef DOPROF
+#ifndef VMCFG_SYMBIAN
 #define _vprof(v,...)
 #define _nvprof(e,v,...)
 #define _hprof(h,n,...)
 #define _nhprof(e,v,n,...)
 #define _ntprof(e)
 #define _tprof_end()
+#endif // ! VMCFG_SYMBIAN
 #else
 
 #define _vprof(v,...) \

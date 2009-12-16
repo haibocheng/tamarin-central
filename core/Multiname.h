@@ -54,223 +54,90 @@ namespace avmplus
 	 */
 	class Multiname 
 	{
-		const static int ATTR   = 0x01;	// attribute name
-		const static int QNAME  = 0x02;	// qualified name (size==1, explicit in code)
-		const static int RTNS   = 0x04;	// runtime namespace
-		const static int RTNAME = 0x08;	// runtime name
-		const static int NSSET  = 0x10;
-		const static int PUBLICNS = 0x20; // temporary flag to support 46.15; public implied
-		const static int TYPEPARAM = 0x40;
+		const static int32_t ATTR   = 0x01;	// attribute name
+		const static int32_t QNAME  = 0x02;	// qualified name (size==1, explicit in code)
+		const static int32_t RTNS   = 0x04;	// runtime namespace
+		const static int32_t RTNAME = 0x08;	// runtime name
+		const static int32_t NSSET  = 0x10;
+		const static int32_t TYPEPARAM = 0x20;
 		#ifdef FEATURE_NANOJIT
 		friend class CodegenLIR;
 		#endif 
 		friend class HeapMultiname;
-		int flags;
+
 		Stringp name;
 		union
 		{
 			Namespacep ns;
 			NamespaceSetp nsset;
 		};
-		uint32 next_index;
+		int32_t flags;
+		uint32_t next_index;
 
 	public:
-
-		Stringp getName() const
-		{
-			AvmAssert(!isAnyName() && !isRtname());
-			return name;
-		}
-
-		void setName(Stringp _name)
-		{
-			AvmAssert(_name && _name->isInterned());
-			this->flags &= ~RTNAME;
-			this->name = _name;
-		}
-
-		void setName(const Multiname* other)
-		{
-			// copy name settings from other
-			flags &= ~RTNAME;
-			flags |= other->flags & RTNAME;
-			this->name = other->name;
-		}
-
-		int namespaceCount() const 
-		{
-			return (nsset && (flags & NSSET)) ? nsset->size : 1;
-		}
-
-		Namespacep getNamespace(int i) const;
-
-		Namespacep getNamespace() const
-		{
-			return getNamespace(0);
-		}
-
-		void setNamespace(Namespacep _ns)
-		{
-			flags &= ~(NSSET|RTNS);
-			AvmAssert(_ns != NULL);
-			this->ns = _ns;
-		}
-
-		void setNamespace(const Multiname* other)
-		{
-			// copy namespace settings from other
-			flags &= ~(NSSET|RTNS);
-			flags |= other->flags & (NSSET|RTNS);
-			this->ns = other->ns;
-		}
-
-		NamespaceSetp getNsset() const
-		{
-			AvmAssert(!isRtns() && (flags&NSSET));
-			return nsset;
-		}
-
-		void setNsset(NamespaceSetp _nsset)
-		{
-			flags &= ~RTNS;
-			flags |= NSSET;
-			AvmAssert(_nsset != NULL);
-			this->nsset = _nsset;
-		}
-
-		uint32 getTypeParameter() const
-		{
-			AvmAssert(isParameterizedType());
-			return next_index;
-		}
-
-		void setTypeParameter(uint32 index)
-		{
-			flags |= TYPEPARAM; 
-			this->next_index = index;
-		}
-
 		Multiname();
-
 		Multiname(NamespaceSetp nsset);
+		Multiname(const Multiname &other);
+		Multiname(Namespacep ns, Stringp name);
+		Multiname(Namespacep ns, Stringp name, bool qualified);
+		~Multiname();
 
-		Multiname(const Multiname &other)
-		{
-			*this = other;
-		}
-
-
-		Multiname(Namespacep ns, Stringp name, bool qualified=false);
-
-		~Multiname()
-		{
-			flags = 0;
-			name = NULL;
-			nsset = NULL;
-			next_index = 0;
-		}
+		Stringp getName() const;
+		void setName(Stringp _name);
+		void setName(const Multiname* other);
+		int32_t namespaceCount() const;
+		Namespacep getNamespace(int32_t i) const;
+		Namespacep getNamespace() const;
+		void setNamespace(Namespacep _ns);
+		void setNamespace(const Multiname* other);
+		NamespaceSetp getNsset() const;
+		void setNsset(NamespaceSetp _nsset);
+		uint32_t getTypeParameter() const;
+		void setTypeParameter(uint32_t index);
 
 		bool contains(Namespacep ns) const;
+	    bool containsAnyPublicNamespace() const;
+		bool isValidDynamicName() const;		
 
 		/**
 		 * return the flags we want to keep when copying a compile-time
 		 * multiname into a runtime temporary multiname
 		 */
-		int ctFlags() const {
-			return flags & ~(RTNS|RTNAME);
-		}
+		int32_t ctFlags() const;
 
 		/**
 		 * returns true if this multiname could resolve to a binding.  Attributes,
 		 * wildcards, and runtime parts mean it can't match any binding.
 		 */
-		int isBinding() const {
-			return !(flags & (ATTR|RTNS|RTNAME)) && name && ns;
-		}
-		int isRuntime() const {
-			return flags & (RTNS|RTNAME);
-		}
-		int isRtns() const {
-			return flags & RTNS;
-		}
-		int isRtname() const {
-			return flags & RTNAME;
-		}
-		int isQName() const {
-			return flags & QNAME;
-		}
-		bool isAttr() const {
-			return (bool) (flags & ATTR);
-		}
-		bool isAnyName() const {
-			return !isRtname() && !name;
-		}
-		bool isAnyNamespace() const {
-			return !isRtns() && !(flags&NSSET) && ns == NULL;
-		}
-		int isNsset() const {
-			return flags & NSSET;
-		}
-		int isParameterizedType() const {
-			return flags&TYPEPARAM;
-		}
+		int32_t isBinding() const;
 
-		void setAttr(bool b=true) {
-			if (b)
-				flags |= ATTR;
-			else
-				flags &= ~ATTR;
-		}
-		void setPublic(bool b=true) {
-			if (b)
-				flags |= PUBLICNS;
-			else
-				flags &= ~PUBLICNS;
-		}
-		void setQName() {
-			AvmAssert(namespaceCount()==1 && !(flags&NSSET));
-			flags |= QNAME;
-		}
-		void setRtns() {
-			flags |= RTNS;
-			flags &= ~NSSET;
-			ns = NULL;
-		}
-		void setRtname() {
-			flags |= RTNAME;
-			name = NULL;
-		}
-		void setAnyName() {
-			flags &= ~RTNAME;
-			name = NULL;
-		}
-		void setAnyNamespace() {
-			flags &= ~(NSSET|RTNS);
-			ns = NULL;
-		}
+		int32_t isRuntime() const;
+		int32_t isRtns() const;
+		int32_t isRtname() const;
+		int32_t isQName() const;
+		bool isAttr() const;
+		bool isAnyName() const;
+		bool isAnyNamespace() const;
+		int32_t isNsset() const;
+		int32_t isParameterizedType() const;
 
+		void setAttr(bool b=true);
+		void setQName();
+		void setRtns();
+		void setRtname();
+		void setAnyName();
+		void setAnyNamespace();
 		bool matches(const Multiname *mn) const;
 
-#ifdef AVMPLUS_WORD_CODE
+#ifdef VMCFG_PRECOMP_NAMES
 		// As an optimization a Multiname may be part of a GCRoot.  The following
 		// two methods make sure the reference counted dependents of a Multiname
 		// stick around (or not, as the case may be).  The reference counts are
 		// *not* adjusted by the methods above; multinames on which IncrementRef
 		// and DecrementRef are called *must* be considered constant.
 	public:
-		void IncrementRef() {
-			if (name != NULL)
-				name->IncrementRef();
-			if (ns != NULL && (flags & NSSET) == 0)
-				ns->IncrementRef();
-		}
-		
-		void DecrementRef() {
-			if (name != NULL)
-				name->DecrementRef();
-			if (ns != NULL && (flags & NSSET) == 0)
-				ns->DecrementRef();
-		}
+		void IncrementRef();
+		void DecrementRef();
 #endif
 		
 //#ifdef AVMPLUS_VERBOSE
@@ -289,115 +156,53 @@ namespace avmplus
 	};
 
 	// version of multiname sporting write barriers
+	// NOTE NOTE NOTE
+	// This is embedded into other GCObjects, it's not a GCObject by itself
 	class HeapMultiname 
 	{
 	public:
 
-		HeapMultiname() {}
+		explicit HeapMultiname();
+		explicit HeapMultiname(const Multiname& other);
+		~HeapMultiname();
 
-		HeapMultiname(NamespaceSetp nsset) { name.setNsset(nsset); }
+		operator const Multiname* () const;
+		operator const Multiname& () const;
+		const HeapMultiname& operator=(const HeapMultiname& that);
+		const HeapMultiname& operator=(const Multiname& that);
 
-		HeapMultiname(const Multiname &other)
-		{
-			setMultiname(other);
-		}
-
-		HeapMultiname(Namespacep ns, Stringp name, bool qualified=false);
-
-
-		operator Multiname* () { return &name; }
-
-		const Multiname& getMultiname() const { return name; }
-
-		void setMultiname(const Multiname &other)
-		{
-			WBRC(gc(), this, &name.name, other.name);
-			if(name.isNsset())
-				name.ns = NULL;
-			else
-				WBRC(gc(), this, &name.ns, NULL);
-
-			if(other.isNsset()) {
-				WB(gc(), this, &name.ns, other.ns);
-			} else {
-				WBRC(gc(), this, &name.ns, other.ns);
-			}
-			name.flags = other.flags;
-		}
-
-		void setName(Stringp n) {
-			WBRC(gc(), this, &name.name, n);
-			name.setName(n);
-		}
-
-		void setName(const Multiname* other) {
-			WBRC(gc(), this, &name.name, other->name);
-			name.setName(other);
-		}
-		
-		void setNamespace(Namespacep ns) {
-			WBRC(gc(), this, &name.ns, ns);
-			name.setNamespace(ns);
-		}
-
-		void setNamespace(const Multiname* other)	{
-			WBRC(gc(), this, &name.ns, other->ns);
-			name.setNamespace(other);
-		}
-
-		void setNsset(NamespaceSetp nsset) {
-			WB(gc(), this, &name.nsset, nsset);
-			name.setNsset(nsset);
-		}
-		
-		void setRtns() { 
-			WBRC(gc(), this, &name.name, NULL);
-			name.setRtns(); 
-		}
-		void setRtname() 
-		{ 
-			WBRC(gc(), this, &name.name, NULL);
-			name.setRtname(); 
-		}
-		void setAnyName() { 
-			WBRC(gc(), this, &name.name, NULL);
-			name.setAnyName(); 
-		}
-		void setAnyNamespace() { 
-			WBRC(gc(), this, &name.ns, NULL);
-			name.setAnyNamespace();
-		}
-
-		Stringp getName() const { return name.getName(); }
-		int namespaceCount() const { return name.namespaceCount(); }
-		Namespacep getNamespace(int i) const { return name.getNamespace(i); }
-		Namespacep getNamespace() const { return name.getNamespace(); }
-		NamespaceSetp getNsset() const { return name.getNsset(); }
-		bool contains(Namespacep ns) const { return name.contains(ns); }
-		int ctFlags() const { return name.ctFlags(); }
-		int isBinding() const { return name.isBinding(); }
-		int isRuntime() const { return name.isRuntime(); }
-		int isRtns() const { return name.isRtns(); }
-		int isRtname() const { return name.isRtname(); }
-		int isQName() const { return name.isQName(); }
-		bool isAttr() const { return name.isAttr(); }
-		bool isAnyName() const { return name.isAnyName(); }
-		bool isAnyNamespace() const { return name.isAnyNamespace(); }
-		int isNsset() const { return name.isNsset(); }
-
-		void setAttr(bool b=true) { name.setAttr(b); }
-		void setQName() { name.setQName(); }
-
-		bool matches(const Multiname *mn) const { return name.matches(mn); }
+		Stringp getName() const;
+		int32_t namespaceCount() const;
+		Namespacep getNamespace(int32_t i) const;
+		Namespacep getNamespace() const;
+		NamespaceSetp getNsset() const;
+		bool contains(Namespacep ns) const;
+		int32_t ctFlags() const;
+		int32_t isBinding() const;
+		int32_t isRuntime() const;
+		int32_t isRtns() const;
+		int32_t isRtname() const;
+		int32_t isQName() const;
+		bool isAttr() const;
+		bool isAnyName() const;
+		bool isAnyNamespace() const;
+		int32_t isNsset() const;
+		bool matches(const Multiname *mn) const;
 
 //#ifdef AVMPLUS_VERBOSE
 	public:
-		Stringp format(AvmCore* core, Multiname::MultiFormat form=Multiname::MULTI_FORMAT_FULL) const { return name.format(core, form); }
-		static Stringp format(AvmCore* core, Namespacep ns, Stringp name, bool attr=false, bool hideNonPublicNamespaces=true) { return format(core, ns, name, attr, hideNonPublicNamespaces); }
+		Stringp format(AvmCore* core, Multiname::MultiFormat form=Multiname::MULTI_FORMAT_FULL) const;
+		static Stringp format(AvmCore* core, Namespacep ns, Stringp name, bool attr=false, bool hideNonPublicNamespaces=true);
 //#endif
 	private:
         Multiname name;
-		MMgc::GC* gc() const { return MMgc::GC::GetGC(this); }
+		MMgc::GC* gc() const;
+
+	private:
+		void setMultiname(const Multiname& other);
+
+	private:
+		explicit HeapMultiname(const HeapMultiname& toCopy); // unimplemented
 	};
 }
 

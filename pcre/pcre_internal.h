@@ -45,6 +45,8 @@ functions whose names all begin with "_pcre_". */
 #ifndef PCRE_INTERNAL_H
 #define PCRE_INTERNAL_H
 
+#include "pcre_avmplus.h"
+
 /* Define DEBUG to get debugging output on stdout. */
 
 #if 0
@@ -59,10 +61,6 @@ all, it had only been about 10 years then...
 It turns out that the Mac Debugging.h header also defines the macro DPRINTF, so
 be absolutely sure we get our version. */
 
-#ifdef AVMPLUS_PORTING_API
-#define DPRINTF(p)
-#else
-
 #ifndef __MWERKS__
 #undef DPRINTF
 #ifdef PCRE_DEBUG
@@ -71,14 +69,7 @@ be absolutely sure we get our version. */
 #define DPRINTF(p) /* Nothing */
 #endif
 #endif
-#endif
 
-/* Standard C headers plus the external interface definition. The only time
-setjmp and stdarg are used is when NO_RECURSE is set. */
-
-#ifndef _MAC
-#include <setjmp.h>
-#endif
 /* When compiling a DLL for Windows, the exported symbols have to be declared
 using some MS magic. I found some useful information on this web page:
 http://msdn2.microsoft.com/en-us/library/y4h7bcy6(VS.80).aspx. According to the

@@ -52,6 +52,7 @@
 #undef AVMPLUS_LITTLE_ENDIAN
 #undef AVM10_BIG_ENDIAN
 #undef VMCFG_DOUBLE_MSW_FIRST
+#undef NJ_ARM_VFP
 #undef VMCFG_IA32
 #undef MMGC_IA32
 #undef AVMPLUS_IA32
@@ -69,10 +70,13 @@
 #undef VMCFG_SPARC
 #undef MMGC_SPARC
 #undef AVMPLUS_SPARC
+#undef VMCFG_MIPS
 #undef AVMPLUS_UNIX
 #undef AVMPLUS_MAC
 #undef MMGC_MAC
 #undef AVMPLUS_WIN32
+#undef AVMPLUS_SYMBIAN
+#undef VMCFG_SYMBIAN
 #undef VMCFG_DEBUGGER
 #undef VMCFG_VERIFYALL
 #undef AVMPLUS_VERBOSE
@@ -82,19 +86,23 @@
 #undef VTUNE
 #undef AVMPLUS_VERBOSE
 #undef VMCFG_NANOJIT
+#undef VMCFG_PRECOMP_NAMES
+#undef VMCFG_LOOKUP_CACHE
 #undef FEATURE_NANOJIT
+#undef VMCFG_AOT
+#undef VMCFG_AOTSHELL
 #undef VMCFG_INTERPRETER
 #undef VMCFG_INTERPRETER
 #undef VMCFG_WORDCODE
 #undef VMCFG_WORDCODE_PEEPHOLE
+#undef VMCFG_PRECOMP_NAMES
+#undef VMCFG_LOOKUP_CACHE
 #undef AVMPLUS_WORD_CODE
 #undef AVMPLUS_PEEPHOLE_OPTIMIZER
 #undef VMCFG_WORDCODE_THREADED
 #undef AVMPLUS_DIRECT_THREADED
 #undef VMCFG_SELFTEST
 #undef AVMPLUS_SELFTEST
-#undef VMCFG_UTF32
-#undef FEATURE_UTF32_SUPPORT
 #undef VMCFG_EVAL
 #undef AVMPLUS_JIT_READONLY
 #undef MMGC_LOCKING
@@ -104,6 +112,11 @@
 #undef AVMPLUS_WITH_JNI
 #undef AVMPLUS_HEAP_ALLOCA
 #undef AVMPLUS_STATIC_POINTERS
+#undef AVMPLUS_INDIRECT_NATIVE_THUNKS
+#undef MMGC_OVERRIDE_GLOBAL_NEW
+#undef MMGC_MEMORY_PROFILER
+#undef VMCFG_CACHE_GQCN
+#undef VMCFG_TEST_API_VERSIONING
 
 
 
@@ -157,6 +170,16 @@
 #endif
 
 
+/* AVMSYSTEM_ARM_FPU
+ *
+ * Enables the just-in-time compiler to generate vector floating point 
+ * instructions for ARM based architectures.
+ */
+#if !defined AVMSYSTEM_ARM_FPU || AVMSYSTEM_ARM_FPU != 0 && AVMSYSTEM_ARM_FPU != 1
+#  error "AVMSYSTEM_ARM_FPU must be defined and 0 or 1 (only)."
+#endif
+
+
 /* AVMSYSTEM_IA32
  *
  * Selects the x86-32 architecture
@@ -203,6 +226,15 @@
 #endif
 
 
+/* AVMSYSTEM_MIPS
+ *
+ * Selects the MIPS architecture (version left unspecified for now).
+ */
+#if !defined AVMSYSTEM_MIPS || AVMSYSTEM_MIPS != 0 && AVMSYSTEM_MIPS != 1
+#  error "AVMSYSTEM_MIPS must be defined and 0 or 1 (only)."
+#endif
+
+
 /* AVMSYSTEM_UNIX
  *
  * Selects Unix / Linux (but not MacOS)
@@ -227,6 +259,15 @@
  */
 #if !defined AVMSYSTEM_WIN32 || AVMSYSTEM_WIN32 != 0 && AVMSYSTEM_WIN32 != 1
 #  error "AVMSYSTEM_WIN32 must be defined and 0 or 1 (only)."
+#endif
+
+
+/* AVMSYSTEM_SYMBIAN
+ *
+ * Selects Symbian
+ */
+#if !defined AVMSYSTEM_SYMBIAN || AVMSYSTEM_SYMBIAN != 0 && AVMSYSTEM_SYMBIAN != 1
+#  error "AVMSYSTEM_SYMBIAN must be defined and 0 or 1 (only)."
 #endif
 
 
@@ -258,7 +299,7 @@
  * FIXME: more information needed.
  * 
  * Note that this is enabled always by AVMFEATURE_DEBUGGER.
- *  * 
+ * 
  * It is known that the Flash Player wants to enable this if SCRIPT_DEBUGGER
  * is enabled in the Player code.
  */
@@ -283,6 +324,15 @@
  */
 #if !defined AVMFEATURE_JIT || AVMFEATURE_JIT != 0 && AVMFEATURE_JIT != 1
 #  error "AVMFEATURE_JIT must be defined and 0 or 1 (only)."
+#endif
+
+
+/* AVMFEATURE_AOT
+ *
+ * Enables the ahead-of-time compiler. This feature is highly experimental.
+ */
+#if !defined AVMFEATURE_AOT || AVMFEATURE_AOT != 0 && AVMFEATURE_AOT != 1
+#  error "AVMFEATURE_AOT must be defined and 0 or 1 (only)."
 #endif
 
 
@@ -329,18 +379,6 @@
  */
 #if !defined AVMFEATURE_SELFTEST || AVMFEATURE_SELFTEST != 0 && AVMFEATURE_SELFTEST != 1
 #  error "AVMFEATURE_SELFTEST must be defined and 0 or 1 (only)."
-#endif
-
-
-/* AVMFEATURE_UTF32
- *
- * Select support for 32 bit strings. If disabled, only 8 and 16 bits strings are supported. 
- * If enabled, string can be 32 bits internally, and the String method createUTF32() is defined, 
- * which also takes care of surrogate pairs, and createUTF16() converts surrogate pairs to UTF-32 
- * if the desired string width is 32 bits.
- */
-#if !defined AVMFEATURE_UTF32 || AVMFEATURE_UTF32 != 0 && AVMFEATURE_UTF32 != 1
-#  error "AVMFEATURE_UTF32 must be defined and 0 or 1 (only)."
 #endif
 
 
@@ -397,6 +435,10 @@
  * this means decorating the global new and delete operator with appropriate 'throw'
  * clauses.  It is unlikely to mean anything more, as AVM+ and MMgc do not use and
  * do not generally support C++ exceptions.  
+ * 
+ * Note that even if this is enabled, the global new and delete operators may
+ * not throw exceptions when memory can't be allocated, because the out-of-memory
+ * handling in MMgc may take precedence.
  * 
  * FixedMalloc never throws an exception for a failed allocation.
  */
@@ -456,6 +498,59 @@
 #  error "AVMFEATURE_STATIC_FUNCTION_PTRS must be defined and 0 or 1 (only)."
 #endif
 
+
+/* AVMFEATURE_INDIRECT_NATIVE_THUNKS
+ *
+ * Enabling this will recycle native thunks with similar signatures.
+ * This decreases code size at the expense of slightly slower thunks
+ * and an extra field in NativeMethodInfo.
+ */
+#if !defined AVMFEATURE_INDIRECT_NATIVE_THUNKS || AVMFEATURE_INDIRECT_NATIVE_THUNKS != 0 && AVMFEATURE_INDIRECT_NATIVE_THUNKS != 1
+#  error "AVMFEATURE_INDIRECT_NATIVE_THUNKS must be defined and 0 or 1 (only)."
+#endif
+
+
+/* AVMFEATURE_OVERRIDE_GLOBAL_NEW
+ *
+ * Enabling this will cause the mmfx_* memory macros to use global new/delete.
+ * By default we use specialized new/delete operators and avoid global new/delete.  However
+ * this requires some tricks to get multiple inheritance and private destructors to work
+ * so some codebases may want to use the simpler path of overriding global new/delete.
+ * Note that this feature works independently of AVMFEATURE_USE_SYSTEM_MALLOC.
+ */
+#if !defined AVMFEATURE_OVERRIDE_GLOBAL_NEW || AVMFEATURE_OVERRIDE_GLOBAL_NEW != 0 && AVMFEATURE_OVERRIDE_GLOBAL_NEW != 1
+#  error "AVMFEATURE_OVERRIDE_GLOBAL_NEW must be defined and 0 or 1 (only)."
+#endif
+
+
+/* AVMFEATURE_MEMORY_PROFILER
+ *
+ * Enabling this will compile in code to enable memory profiling. (Must still be
+ * enabled at runtime.)
+ */
+#if !defined AVMFEATURE_MEMORY_PROFILER || AVMFEATURE_MEMORY_PROFILER != 0 && AVMFEATURE_MEMORY_PROFILER != 1
+#  error "AVMFEATURE_MEMORY_PROFILER must be defined and 0 or 1 (only)."
+#endif
+
+
+/* AVMFEATURE_CACHE_GQCN
+ *
+ * Enabling this will cache the result of getQualifiedClassName, making it run
+ * much more quickly, at the expense of more memory usage.
+ */
+#if !defined AVMFEATURE_CACHE_GQCN || AVMFEATURE_CACHE_GQCN != 0 && AVMFEATURE_CACHE_GQCN != 1
+#  error "AVMFEATURE_CACHE_GQCN must be defined and 0 or 1 (only)."
+#endif
+
+
+/* AVMFEATURE_API_VERSIONING
+ *
+ * Enabling this will enable api-versioning in the avmshell
+ */
+#if !defined AVMFEATURE_API_VERSIONING || AVMFEATURE_API_VERSIONING != 0 && AVMFEATURE_API_VERSIONING != 1
+#  error "AVMFEATURE_API_VERSIONING must be defined and 0 or 1 (only)."
+#endif
+
 #if AVMSYSTEM_32BIT
 #  if AVMSYSTEM_64BIT
 #    error "AVMSYSTEM_64BIT is precluded for AVMSYSTEM_32BIT"
@@ -479,6 +574,11 @@
 #if AVMSYSTEM_DOUBLE_MSW_FIRST
 #  if !AVMSYSTEM_LITTLE_ENDIAN
 #    error "AVMSYSTEM_LITTLE_ENDIAN is required for AVMSYSTEM_DOUBLE_MSW_FIRST"
+#  endif
+#endif
+#if AVMSYSTEM_ARM_FPU
+#  if !AVMSYSTEM_ARM
+#    error "AVMSYSTEM_ARM is required for AVMSYSTEM_ARM_FPU"
 #  endif
 #endif
 #if AVMSYSTEM_IA32
@@ -508,9 +608,17 @@
 
 
 
+
+
 #if AVMFEATURE_JIT
-#if AVMSYSTEM_IA32+AVMSYSTEM_AMD64+AVMSYSTEM_ARM+AVMSYSTEM_PPC+AVMSYSTEM_SPARC != 1
-#  error "Exactly one of AVMSYSTEM_IA32,AVMSYSTEM_AMD64,AVMSYSTEM_ARM,AVMSYSTEM_PPC,AVMSYSTEM_SPARC must be defined."
+#if AVMSYSTEM_IA32+AVMSYSTEM_AMD64+AVMSYSTEM_ARM+AVMSYSTEM_PPC+AVMSYSTEM_SPARC+AVMSYSTEM_MIPS != 1
+#  error "Exactly one of AVMSYSTEM_IA32,AVMSYSTEM_AMD64,AVMSYSTEM_ARM,AVMSYSTEM_PPC,AVMSYSTEM_SPARC,AVMSYSTEM_MIPS must be defined."
+#endif
+
+#endif
+#if AVMFEATURE_AOT
+#if AVMSYSTEM_IA32+AVMSYSTEM_ARM != 1
+#  error "Exactly one of AVMSYSTEM_IA32,AVMSYSTEM_ARM must be defined."
 #endif
 
 #endif
@@ -527,26 +635,29 @@
 
 
 
-#if AVMFEATURE_CPP_EXCEPTIONS
-#  if !AVMFEATURE_USE_SYSTEM_MALLOC
-#    error "AVMFEATURE_USE_SYSTEM_MALLOC is required for AVMFEATURE_CPP_EXCEPTIONS"
-#  endif
+
+
+
+
+
+
+
+
+
+
+
+#if AVMSYSTEM_IA32+AVMSYSTEM_AMD64+AVMSYSTEM_ARM+AVMSYSTEM_PPC+AVMSYSTEM_SPARC+AVMSYSTEM_MIPS > 1
+#  error "At most one of AVMSYSTEM_IA32,AVMSYSTEM_AMD64,AVMSYSTEM_ARM,AVMSYSTEM_PPC,AVMSYSTEM_SPARC,AVMSYSTEM_MIPS must be defined."
+#endif
+#if AVMFEATURE_WORDCODE_INTERP+AVMFEATURE_ABC_INTERP > 1
+#  error "At most one of AVMFEATURE_WORDCODE_INTERP,AVMFEATURE_ABC_INTERP must be defined."
+#endif
+#if AVMFEATURE_WORDCODE_INTERP+AVMFEATURE_JIT > 1
+#  error "At most one of AVMFEATURE_WORDCODE_INTERP,AVMFEATURE_JIT must be defined."
 #endif
 
-
-
-
-
-
-#if AVMSYSTEM_IA32+AVMSYSTEM_AMD64+AVMSYSTEM_ARM+AVMSYSTEM_PPC+AVMSYSTEM_SPARC > 1
-#  error "At most one of AVMSYSTEM_IA32,AVMSYSTEM_AMD64,AVMSYSTEM_ARM,AVMSYSTEM_PPC,AVMSYSTEM_SPARC must be defined."
-#endif
-
-#if AVMSYSTEM_UNIX+AVMSYSTEM_MAC+AVMSYSTEM_WIN32 != 1
-#  error "Exactly one of AVMSYSTEM_UNIX,AVMSYSTEM_MAC,AVMSYSTEM_WIN32 must be defined."
-#endif
-#if AVMFEATURE_WORDCODE_INTERP+AVMFEATURE_ABC_INTERP != 1
-#  error "Exactly one of AVMFEATURE_WORDCODE_INTERP,AVMFEATURE_ABC_INTERP must be defined."
+#if AVMSYSTEM_UNIX+AVMSYSTEM_MAC+AVMSYSTEM_WIN32+AVMSYSTEM_SYMBIAN != 1
+#  error "Exactly one of AVMSYSTEM_UNIX,AVMSYSTEM_MAC,AVMSYSTEM_WIN32,AVMSYSTEM_SYMBIAN must be defined."
 #endif
 
 #if AVMSYSTEM_32BIT
@@ -578,6 +689,9 @@
 #endif
 #if AVMSYSTEM_DOUBLE_MSW_FIRST
 #  define VMCFG_DOUBLE_MSW_FIRST
+#endif
+#if AVMSYSTEM_ARM_FPU
+#  define NJ_ARM_VFP
 #endif
 #if AVMSYSTEM_IA32
 #  define VMCFG_IA32
@@ -630,6 +744,9 @@
 #if AVMSYSTEM_SPARC
 #  define AVMPLUS_SPARC
 #endif
+#if AVMSYSTEM_MIPS
+#  define VMCFG_MIPS
+#endif
 #if AVMSYSTEM_UNIX
 #  define AVMPLUS_UNIX
 #endif
@@ -641,6 +758,12 @@
 #endif
 #if AVMSYSTEM_WIN32
 #  define AVMPLUS_WIN32
+#endif
+#if AVMSYSTEM_SYMBIAN
+#  define AVMPLUS_SYMBIAN
+#endif
+#if AVMSYSTEM_SYMBIAN
+#  define VMCFG_SYMBIAN
 #endif
 #if AVMFEATURE_DEBUGGER
 #  define VMCFG_DEBUGGER
@@ -670,7 +793,19 @@
 #  define VMCFG_NANOJIT
 #endif
 #if AVMFEATURE_JIT
+#  define VMCFG_PRECOMP_NAMES
+#endif
+#if AVMFEATURE_JIT
+#  define VMCFG_LOOKUP_CACHE
+#endif
+#if AVMFEATURE_JIT
 #  define FEATURE_NANOJIT
+#endif
+#if AVMFEATURE_AOT
+#  define VMCFG_AOT
+#endif
+#if AVMFEATURE_AOT
+#  define VMCFG_AOTSHELL
 #endif
 #if AVMFEATURE_ABC_INTERP
 #  define VMCFG_INTERPRETER
@@ -683,6 +818,12 @@
 #endif
 #if AVMFEATURE_WORDCODE_INTERP
 #  define VMCFG_WORDCODE_PEEPHOLE
+#endif
+#if AVMFEATURE_WORDCODE_INTERP
+#  define VMCFG_PRECOMP_NAMES
+#endif
+#if AVMFEATURE_WORDCODE_INTERP
+#  define VMCFG_LOOKUP_CACHE
 #endif
 #if AVMFEATURE_WORDCODE_INTERP
 #  define AVMPLUS_WORD_CODE
@@ -701,12 +842,6 @@
 #endif
 #if AVMFEATURE_SELFTEST
 #  define AVMPLUS_SELFTEST
-#endif
-#if AVMFEATURE_UTF32
-#  define VMCFG_UTF32
-#endif
-#if AVMFEATURE_UTF32
-#  define FEATURE_UTF32_SUPPORT
 #endif
 #if AVMFEATURE_EVAL
 #  define VMCFG_EVAL
@@ -734,6 +869,21 @@
 #endif
 #if AVMFEATURE_STATIC_FUNCTION_PTRS
 #  define AVMPLUS_STATIC_POINTERS
+#endif
+#if AVMFEATURE_INDIRECT_NATIVE_THUNKS
+#  define AVMPLUS_INDIRECT_NATIVE_THUNKS
+#endif
+#if AVMFEATURE_OVERRIDE_GLOBAL_NEW
+#  define MMGC_OVERRIDE_GLOBAL_NEW
+#endif
+#if AVMFEATURE_MEMORY_PROFILER
+#  define MMGC_MEMORY_PROFILER
+#endif
+#if AVMFEATURE_CACHE_GQCN
+#  define VMCFG_CACHE_GQCN
+#endif
+#if AVMFEATURE_API_VERSIONING
+#  define VMCFG_TEST_API_VERSIONING
 #endif
 
 #ifdef AVMSHELL_BUILD

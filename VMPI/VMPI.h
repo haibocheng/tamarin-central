@@ -71,23 +71,32 @@
 // maintainability.
 
 #include "avmfeatures.h"
-  
+
+// used by platform headers below
+typedef void * vmpi_thread_t;
+
 #if AVMSYSTEM_WIN32
   #include "win32/win32-platform.h"
 #elif AVMSYSTEM_UNIX
   #include "unix/unix-platform.h"
 #elif AVMSYSTEM_MAC
   #include "mac/mac-platform.h"
-#elif defined AVMPLUS_SYMBIAN // needs to become an AVMSYSTEM_ name
+#elif AVMSYSTEM_SYMBIAN
   #include "symbian/symbian-platform.h"
 #endif
 
 // Catchall, though in general the platform files are really responsible for giving
-// REALLY_INLINE a definition.
+// REALLY_INLINE and FASTCALL a definition.
 
 #ifndef REALLY_INLINE
     #define REALLY_INLINE inline
 #endif
+#ifndef FASTCALL
+    #define FASTCALL 
+#endif
+
+
+#define ARRAY_SIZE(x) (sizeof(x)/sizeof(x[0]))
 
 // Legacy types used by some embedding host code, eg avmplus::uint64.
 // These types are not to be used inside the avm code.
@@ -186,18 +195,25 @@ extern void			VMPI_free(void* ptr);
 
 
 /**
+* This method is used to free a previously allocated block
+* @param ptr pointer to the memory that needs to be released
+* @return none
+*/
+extern size_t			VMPI_size(void* ptr);
+
+
+/**
 * This method is used to get the size of the memory page of the system
 * @return return the size, if bytes, of memory page
 */
 extern size_t		VMPI_getVMPageSize();
 
 /**
-* Method to retrieve number of pages in virtual address space of a process
-* @param pageSize size, in bytes, of a page.  This value is the same as the one returned by VMPI_getVMPageSize
+* Method to retrieve number of VM pages in virtual address space of a process
 * @return number of pages
 * @see VMPI_getVMPageSize()
 */
-extern size_t		VMPI_getVMPageCount(size_t pageSize);
+extern size_t		VMPI_getPrivateResidentPageCount();
 
 /**
 * Method to find whether the platform supports merging of contiguous memory regions from heap
@@ -247,10 +263,13 @@ extern bool			VMPI_decommitMemory(char *address, size_t size);
  * SetPageProtection changes the page access protections on a block of pages,
  * to make JIT-ted code executable or not.
  *
- * If executableFlag is true, the memory is made executable and read-only.
- *
- * If executableFlag is false, the memory is made non-executable and
- * read-write.
+ * @param address pointer to start of memory block.  It is possible that the memory block pointed to by address
+ * could be acquired from more than one calls to VMPI_reserveMemoryRegion.  The implementation of this method 
+ * is expected to handle such cases and identify the region boundaries if the underlying system requires
+ * setting the protection flags on blocks individually if they were allocated separately.
+ * @param executableFlag If executableFlag is true, the memory is made executable and read-only.
+ * If executableFlag is false, the memory is made non-executable and read-write.
+ * @param writeableFlag If true memory block is made read-write
  */
 extern void VMPI_setPageProtection(void *address, size_t size, bool executeFlag, bool writeableFlag);
 
@@ -269,6 +288,13 @@ extern void*		VMPI_allocateAlignedMemory(size_t size);
 * @return none
 */
 extern void			VMPI_releaseAlignedMemory(void* address);
+
+/**
+* This method is used to determind should MMgc zero initalize newly allocated memory,
+* either allocated with VMPI_commitMemory or VMPI_allocateAlignedMemory.
+* @return false if the memory is zero initialized by the OS, otherwise true
+*/
+extern bool			VMPI_areNewPagesDirty();
 
 /**
 * Method to get the frequency of a high performance counter/timer on the system
@@ -301,6 +327,8 @@ extern bool			VMPI_captureStackTrace(uintptr_t* buffer, size_t bufferSize, uint3
 /**
 * Method to retrieve the name of the method/function given a specific address in code space
 * Used by the MMgc memory profiler to get and display function names
+* This method is expected to write a null terminated string representing the function name 
+* in to the buffer
 * @param pc address whose corresponding function name should be returned
 * @param buffer buffer to write the function name to
 * @param bufferSize size, in bytes, of the buffer passed
@@ -311,6 +339,8 @@ extern bool			VMPI_getFunctionNameFromPC(uintptr_t pc, char *buffer, size_t buff
 /**
 * Method to retrieve the source filename and line number given a specific address in a code space
 * Used by the MMgc memory profiler to display location info of source code
+* This method is expected to write a null terminated string representing the file name 
+* in to the buffer
 * @param pc address of code whose corresponding location should be returned
 * @param buffer buffer to write the filename to
 * @param bufferSize size, in bytes, of the buffer for filename
@@ -320,28 +350,23 @@ extern bool			VMPI_getFunctionNameFromPC(uintptr_t pc, char *buffer, size_t buff
 extern bool			VMPI_getFileAndLineInfoFromPC(uintptr_t pc, char *buffer, size_t bufferSize, uint32_t* lineNumber);
 
 /**
-* Type defintion for an opaque data type representing platform-defined spin lock used by MMgc
-* @see VMPI_lockCreate(), VMPI_lockAcquire()
-*/
-typedef void* vmpi_spin_lock_t;
-
-/**
 * Method to create a new instance of vmpi_spin_lock_t
 * This instance will subsequently be passed to acquire/release lock methods
 * @return newly created vmpi_spin_lock_t instance
 */
-extern vmpi_spin_lock_t		VMPI_lockCreate();
+extern void			VMPI_lockInit(vmpi_spin_lock_t* lock);
 
 /**
 * Method to destroy the vmpi_spin_lock_t instance
 * This method is called when MMgc no longer intends to use the vmpi_spin_lock_t
 * instance created and return via VMPI_lockCreate.
 * The implementation can safely destroy the lock instance.
+* It is allowed for the caller to have acquired the lock when this function is called.
 * @param lock instance of vmpi_spin_lock_t to be destroyed
 * @return none
 * @see VMPI_lockCreate
 */
-extern void			VMPI_lockDestroy(vmpi_spin_lock_t lock);
+extern void			VMPI_lockDestroy(vmpi_spin_lock_t* lock);
 
 /**
 * Method to acquire a lock on a vmpi_spin_lock_t instance
@@ -353,14 +378,21 @@ extern void			VMPI_lockDestroy(vmpi_spin_lock_t lock);
 * @param lock instance to acquire the lock on
 * @return true if lock was successfully acquired, false in event of failure
 */
-extern bool			VMPI_lockAcquire(vmpi_spin_lock_t lock);
+extern bool			VMPI_lockAcquire(vmpi_spin_lock_t* lock);
 
 /**
 * Method to release a lock on a vmpi_spin_lock_t instance
 * @param lock instance to release the lock on
 * @return true if lock was successfully release, false in event of failure
 */
-extern bool			VMPI_lockRelease(vmpi_spin_lock_t lock);
+extern bool			VMPI_lockRelease(vmpi_spin_lock_t* lock);
+
+/**
+* Method to obtain a lock on a vmpi_spin_lock_t instance if it isn't locked
+* @param lock instance to release the lock on
+* @return true if lock was successfully aqcuired, false if another thread has it
+*/
+extern bool			VMPI_lockTestAndAcquire(vmpi_spin_lock_t* lock);
 
 /**
  * can two consecutive calls to VMPI_reserveMemoryRegion be freed with one VMP_releaseMemoryRegion call?
@@ -373,6 +405,12 @@ extern bool VMPI_canMergeContiguousRegions();
  * @return true if they are
  */
 extern bool VMPI_useVirtualMemory();
+
+/**
+* Method to check whether MMgc memory profiling is turned on or not
+* @return true if profiling is enabled, false otherwise
+*/
+extern bool VMPI_isMemoryProfilingEnabled();
 
 /** 
  * Method to setup a spy channel on MMgc/avmplus
@@ -389,6 +427,18 @@ extern bool VMPI_spySetup();
  * @return none
 */
 extern void VMPI_spyCallback();
+
+/**
+ * Clean from the current stack pointer amt bytes
+ * @param the amout of bytes to clear
+ */
+extern void VMPI_cleanStack(size_t amt);
+
+/** 
+ * MEthod to determine whether we have access to symbol information
+ * @return a bool indicating whether we have 
+*/
+extern bool VMPI_hasSymbols();
 
 /** 
  * Method to create a thread local storage (TLS) identifier 
@@ -423,5 +473,49 @@ extern bool VMPI_tlsSetValue(uintptr_t tlsId, void* value);
  * @see VMPI_tlsSetValue
 */
 extern void* VMPI_tlsGetValue(uintptr_t tlsId);
+
+/**
+ * Obtain current thread identifier
+ * @return thread id
+ */
+extern vmpi_thread_t VMPI_currentThread();
+
+/**
+ * Method to setup a spy channel on MMgc/avmplus
+ * If the platform intends to periodically retrieve information from MMgc/avmplus
+ * then it can perform the necessary setup during this function call and return true
+ * @return true if the spy is setup successfully else false
+ * @see VMPI_spyCallback
+*/
+extern bool VMPI_spySetup();
+extern void VMPI_spyTeardown();
+
+/** 
+ * Callback method for spy
+ * Currently called on every allocation in MMgc if VMPI_spySetup returned true
+ * @return none
+*/
+extern void VMPI_spyCallback();
+
+/*
+ * Method to perform any initialization activities to assist
+ * the program counter to symbols resolution for MMgc memory profiler
+ * @return none
+ */
+extern void VMPI_setupPCResolution();
+
+/**
+ * Method to perform any cleanup of items that were created/setup
+ * for program counter to symbols resolution for MMgc memory profiler
+ * @return none
+ * @see VMPI_setupPCResolution
+*/
+extern void VMPI_desetupPCResolution();
+
+/**
+ * wrapper around getenv function, return's NULL on platforms with no env vars
+ * @return value of env var
+ */
+extern const char *VMPI_getenv(const char *name);
 
 #endif /* __avmplus_VMPI__ */

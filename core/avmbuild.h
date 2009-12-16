@@ -46,14 +46,13 @@
 // For sanity's sake, please note the reason for the presence of each clause in the
 // following.
 
-
 // This is here as a sanity check, nuke after a few more release cycles (now == Apr-2009).
 #ifdef AVMPLUS_DISABLE_NJ
     #error "AVMPLUS_DISABLE_NJ is no longer supported"
 #endif
 
 // This is here because the configuration system does not deal with DEBUG
-#if defined DEBUG && !defined AVMPLUS_VERBOSE
+#if defined DEBUG && !defined AVMPLUS_VERBOSE && !defined VMCFG_SYMBIAN
     #define AVMPLUS_VERBOSE
 #endif
 
@@ -97,9 +96,15 @@
 // library.  See pcre/pcre_internal.h, pcre/pcre.h, and pcre/config.h.
 #define PCRE_STATIC
 
-// The PREFM macros are here because they are for VM debugging.
+// The PERFM macros are here because they are for VM debugging.
 //
 // Enable performance metrics for NJ
+//
+// *** NOTE ON THREAD SAFETY ***
+// PERFM is not supported in configurations where more than one AvmCore is
+// instantiated in the same process, as the monitoring code is not thread
+// safe and the results will be unpredictable.
+
 //#define PERFM
 
 #ifdef PERFM
@@ -112,30 +117,6 @@
 # define PERFM_TPROF_END() 
 #endif
 
-// This is here because it hasn't yet been refactored - it's platform code.
-// FIXME: refactor this.
-//
-// One wonders why GCC on x86 alone gets fastcall, and not GCC generally.
-//
-// FASTCALL 
-#ifdef AVMPLUS_IA32
-	#if _MSC_VER
-		#define FASTCALL __fastcall
-	#elif __GNUC__
-		#define FASTCALL __attribute__((fastcall))
-	#else
-		#define FASTCALL
-	#endif
-#else
-	#define FASTCALL
-#endif
-
-// This is here because it's a hack that will go away and does not need a permanent solution.
-//
-// temporary impedance-matching define for code that needs to build with different versions of tamarin...
-// will be removed soon
-#define AVMPLUS_REDUX_API 1
-
 // This is here for VM performance profiling.
 //
 // The use of the SUPERWORD_PROFILING switch is described in comments at the head of
@@ -144,6 +125,12 @@
 // The limit is optional and describes a cutoff for sampling; the program continues to
 // run after sampling ends but data are no longer gathered or stored.  A limit of 250e6
 // produces 1GB of sample data.  There is one sample per VM instruction executed.
+//
+// *** NOTE ON THREAD SAFETY ***
+// SUPERWORD_PROFILING is not supported in configurations where more than one
+// AvmCore is instantiated in the same process, as the monitoring code is not
+// thread safe and the results will be unpredictable.
+
 //#define SUPERWORD_PROFILING
 //#define SUPERWORD_LIMIT 250000000
 
@@ -155,14 +142,6 @@
 #    error "You must disable direct threading to perform superword profiling"
 #  endif
 #endif
-
-// This is here for VM memory profiling.
-//
-// this can be useful in tracking down memory usage for Traits and Traits-related caches,
-// but is very invasive and should only be used in special engineering builds. It should be
-// be left in place (but disabled) for now, as it's still in use...
-// it will go away at some point in the not-too-distant future, however.
-//#define AVMPLUS_TRAITS_MEMTRACK
 
 // This is here for VM development.
 //
@@ -192,7 +171,8 @@
 	// The portapi_avmbuild.h file is used to override
 	// definitions in this file. E.g. turning off
 	// features, etc.
-	#include "portapi_avmbuild.h"
+	//#include "portapi_avmbuild.h"
+    #error "Obsolete define"
 #endif
 
 #endif /* __avmbuild__ */

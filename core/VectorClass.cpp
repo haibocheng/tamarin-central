@@ -117,7 +117,9 @@ namespace avmplus
 		}
 		else
 		{
-			Multiname mn(core()->publicNamespace,core()->string(name));
+			// NOTE use default public for message gen
+			Multiname mn(core()->getAnyPublicNamespace(), core()->string(name));
+
 			// Vector is sorta sealed, can only write to "indexed" properties
 			toplevel()->throwReferenceError(kWriteSealedError, &mn, traits());
 		}
@@ -137,7 +139,8 @@ namespace avmplus
 			if(isNumber)
 			{
 				// Not a valid indexed name - has a decimal part
-				Multiname mn(core->publicNamespace,core->string(name));
+				// NOTE use default public for message gen
+				Multiname mn(core->findPublicNamespace(), core->string(name));
 				toplevel()->throwReferenceError(kReadSealedError, &mn, traits());
 			}
 			// Check the prototype chain - that will throw if there is no match
@@ -220,16 +223,17 @@ namespace avmplus
 		ScriptObject *d = this;
 		uint32 len = m_length;
 
-		// If thisObject is null, the call function will substitute the global object 
-		Atom args[4] = { thisObject, nullObjectAtom, nullObjectAtom, this->atom() };
-
 		for (uint32 i = 0; i < len; i++)
 		{
-			args[1] = d->getUintProperty (i); // element
-			args[2] = core->uintToAtom (i); // index
-
+			// If thisObject is null, the call function will substitute the global object 
+			// args are modified in place by callee
+			Atom args[4] = {
+				thisObject,
+				d->getUintProperty(i), // element
+				core->uintToAtom(i), // index
+				this->atom()
+			};
 			Atom result = callback->call(3, args);
-
 			r->setUintProperty (i, result);
 		}
 
@@ -247,20 +251,20 @@ namespace avmplus
 		ScriptObject *d = this;
 		uint32 len = m_length;
 
-		// If thisObject is null, the call function will substitute the global object 
-		Atom args[4] = { thisObject, nullObjectAtom, nullObjectAtom, this->atom() };
-
 		for (uint32 i = 0, k = 0; i < len; i++)
 		{
-			args[1] = d->getUintProperty (i); // element
-			args[2] = core->uintToAtom (i); // index
-
+			// If thisObject is null, the call function will substitute the global object 
+			// args are modified in place by callee
+			Atom element = d->getUintProperty(i);
+			Atom args[4] = {
+				thisObject,
+				element,
+				core->uintToAtom(i), // index
+				this->atom()
+			};
 			Atom result = callback->call(3, args);
-
 			if (result == trueAtom)
-			{
-				r->setUintProperty (k++, args[1]);
-			}
+				r->setUintProperty(k++, element);
 		}
 
 		return r->atom();
@@ -469,10 +473,11 @@ namespace avmplus
 			return toplevel()->uintVectorClass->atom();
 
 		Traits* param_traits = so->vtable->ivtable->traits;
-		Stringp fullname = VectorClass::makeVectorClassName(core, param_traits);
 
-		if (!instantiated_types->contains(fullname->atom()))
+		if (!instantiated_types->contains(type))
 		{
+			Stringp fullname = VectorClass::makeVectorClassName(core, param_traits);
+
 			VTable* vtab = this->vtable->newParameterizedVTable(param_traits, fullname);
 
 			ObjectVectorClass* new_type = new (vtab->gc(), vtab->getExtraSize()) ObjectVectorClass(vtab);
@@ -481,17 +486,9 @@ namespace avmplus
 
 			// Is this right?  Should each instantiation get its own prototype?
 			new_type->prototype = toplevel()->objectVectorClass->prototype;
-			instantiated_types->add(fullname->atom(), new_type->atom());
+			instantiated_types->add(type, new_type->atom());
 		}
-		return (Atom)instantiated_types->get(fullname->atom());
-	}
-
-
-	ScriptObject* VectorClass::createInstance(VTable * /*ivtable*/,
-		ScriptObject * /*prototype*/)
-	{
-		toplevel()->throwTypeError(kConstructOfNonFunctionError);
-		return 0;
+		return (Atom)instantiated_types->get(type);
 	}
 
 	Atom ObjectVectorClass::call(int argc, Atom* argv) 
@@ -510,6 +507,12 @@ namespace avmplus
 
 		return v->atom();
 	}
+    
+    ScriptObject* VectorClass::createInstance(VTable * /*ivtable*/, ScriptObject * /*prototype*/)
+    {
+        toplevel()->throwTypeError(kConstructOfNonFunctionError);
+        return 0;
+    }    
 
 	ObjectVectorObject* VectorClass::newVector(ClassClosure* type, uint32 length)
 	{
@@ -608,6 +611,14 @@ namespace avmplus
 			toplevel()->throwRangeError(kOutOfRangeError, core()->intToString(index), core()->uintToString(m_length));
 	}
 
+	// using VMPI_memset to clear an atom range to zero is not really right and will generate assertions in Box
+	// code. Let's set it to what we really want, a nullObjectAtom.
+	static void nullAtomRange(Atom* a, size_t count)
+	{
+		while (count--)
+			*a++ = nullObjectAtom;
+	}
+
 	void ObjectVectorObject::set_length(uint32 newLength)
 	{
 		if (newLength > m_length)
@@ -622,7 +633,7 @@ namespace avmplus
 			if( m_fixed )
 				toplevel()->throwRangeError(kVectorFixedError);
 
-			VMPI_memset(m_array+newLength, 0, (m_length-newLength)*sizeof(Atom));
+			nullAtomRange(m_array+newLength, (m_length-newLength));
 			//_spliceHelper (newLength, 0, (m_length - newLength), 0, 0);
 		}
 		m_length = newLength;
@@ -646,7 +657,8 @@ namespace avmplus
 				newCapacity = newCapacity + (newCapacity >>2);
 			//newCapacity = ((newCapacity+kGrowthIncr)/kGrowthIncr)*kGrowthIncr;
 			GC* gc = GC::GetGC(this);
-			Atom* newArray = (Atom*) gc->Calloc(newCapacity, sizeof(Atom), GC::kContainsPointers|GC::kZero);
+			Atom* newArray = (Atom*) gc->Calloc(newCapacity, sizeof(Atom), GC::kContainsPointers);
+			nullAtomRange(newArray, newCapacity);
 			Atom* oldAtoms = m_array;
 			if (!newArray)
 			{
@@ -655,7 +667,7 @@ namespace avmplus
 			if (m_array)
 			{
 				VMPI_memcpy(newArray, m_array, m_length * sizeof(Atom));
-				VMPI_memset(oldAtoms, 0, m_length*sizeof(Atom));
+				nullAtomRange(oldAtoms, m_length);
 				gc->Free(oldAtoms);
 			}
 			m_array = newArray;
@@ -665,7 +677,10 @@ namespace avmplus
 
 	VectorBaseObject* ObjectVectorObject::newVector(uint32 length)
 	{
-		return toplevel()->vectorClass->newVector(t, length);
+        Atom args[1] = {t->atom()};
+        
+		ObjectVectorClass* vecclass = (ObjectVectorClass*)AvmCore::atomToScriptObject(toplevel()->vectorClass->applyTypeArgs(1, args));
+		return vecclass->newVector(length);
 	}
 
 	void ObjectVectorObject::_spliceHelper(uint32 insertPoint, uint32 insertCount, uint32 deleteCount, Atom args, int offset)
@@ -676,7 +691,7 @@ namespace avmplus
 
 		Atom *arr = m_array;
 
-		ScriptObject* so_args = (args&7)==kObjectType ?  AvmCore::atomToScriptObject(args) : 0;
+		ScriptObject* so_args = atomKind(args)==kObjectType ?  AvmCore::atomToScriptObject(args) : 0;
 		ObjectVectorObject* vec_args = isVector(args);
 
 		if (l_shiftAmount < 0) 
@@ -685,15 +700,15 @@ namespace avmplus
 
 			// shift elements down
 			int toMove = m_length - insertPoint - deleteCount;
-			VMPI_memmove (arr + insertPoint + insertCount, arr + insertPoint + deleteCount, toMove * sizeof(Atom));
+			VMPI_memmove(arr + insertPoint + insertCount, arr + insertPoint + deleteCount, toMove * sizeof(Atom));
 
-			VMPI_memset (arr + m_length - numberBeingDeleted, 0, numberBeingDeleted * sizeof(Atom));
+			nullAtomRange(arr + m_length - numberBeingDeleted, numberBeingDeleted);
 		}
 		else if (l_shiftAmount > 0)
 		{
-			VMPI_memmove (arr + insertPoint + l_shiftAmount, arr + insertPoint, (m_length - insertPoint) * sizeof(Atom));
+			VMPI_memmove(arr + insertPoint + l_shiftAmount, arr + insertPoint, (m_length - insertPoint) * sizeof(Atom));
 			//clear for gc purposes
-			VMPI_memset (arr + insertPoint, 0, l_shiftAmount * sizeof(Atom));
+			nullAtomRange(arr + insertPoint, l_shiftAmount);
 		}
 
 		set_length(m_length + l_shiftAmount);
@@ -747,9 +762,9 @@ namespace avmplus
 				toplevel()->throwRangeError(kVectorFixedError);
 			grow (m_length + argc);
 			Atom *arr = m_array;
-			VMPI_memmove (arr + argc, arr, m_length * sizeof(Atom));
+			VMPI_memmove(arr + argc, arr, m_length * sizeof(Atom));
 			// clear moved element for RC purposes
-			VMPI_memset (arr, 0, argc * sizeof(Atom));
+			nullAtomRange(arr, argc);
 			m_length += argc;
 			for(int i=0; i<argc; i++) {
 				_setUintProperty(i, argv[i]);

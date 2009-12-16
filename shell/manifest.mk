@@ -40,7 +40,7 @@ PROGRAMS += shell
 shell_BASENAME = avmshell
 shell_INCLUDES = -I$(srcdir) -I$(topsrcdir)/extensions
 shell_DEFINES = -DAVMPLUS_SHELL
-shell_STATIC_LIBRARIES = MMgc avmplus
+shell_STATIC_LIBRARIES = zlib MMgc avmplus
 shell_DIR := $(curdir)/
 shell_EXTRA_CPPFLAGS := $(AVMSHELL_CPPFLAGS)
 shell_EXTRA_LDFLAGS := $(AVMSHELL_LDFLAGS)
@@ -58,6 +58,7 @@ shell_CXXSRCS := $(shell_CXXSRCS) \
   $(curdir)/DomainClass.cpp \
   $(curdir)/FileClass.cpp \
   $(curdir)/FileInputStream.cpp \
+  $(curdir)/ShellCore.cpp \
   $(curdir)/SystemClass.cpp \
   $(curdir)/swf.cpp \
   $(curdir)/../extensions/DictionaryGlue.cpp \
@@ -68,6 +69,7 @@ shell_CXXSRCS := $(shell_CXXSRCS) \
   $(curdir)/../extensions/ST_avmplus_basics.cpp \
   $(curdir)/../extensions/ST_avmplus_peephole.cpp \
   $(curdir)/../extensions/ST_mmgc_basics.cpp \
+  $(curdir)/../extensions/ST_mmgc_threads.cpp \
   $(NULL)
   
   
@@ -102,4 +104,9 @@ shell_CXXSRCS := $(shell_CXXSRCS) \
   $(NULL)
 endif
 
+$(shell_CXXSRCS): $(curdir)/shell_toplevel.h
 
+$(curdir)/shell_toplevel.h $(curdir)/shell_toplevel.cpp: $(curdir)/shell_toplevel.as
+	cd $(topsrcdir)/shell; python shell_toplevel.py
+
+$(curdir)/ShellCore.cpp: $(curdir)/shell_toplevel.cpp

@@ -51,9 +51,11 @@
 const char* spy_socket_channel = "/tmp/MMgc_Spy"; //name of unix domain for spy connections
 
 bool spy_connected  = false; 
+bool spy_running = false;
 
 pthread_cond_t spy_cond; //condition variable for synchronizing spy signalling and socket communication
 pthread_mutex_t spy_mutex; //mutex for spy_signal and spy_cond condition variable
+pthread_t spy_thread;
 
 int serverSocket = -1; //fd for spy server socket
 int clientSocket = -1; //fd for spy socket connection (one at a time)
@@ -63,7 +65,7 @@ void* SpyConnectionLoop(void*)
 	struct sockaddr_un sockAddr;
 
 	socklen_t len = sizeof(sockAddr.sun_family) + strlen(sockAddr.sun_path)+1;
-	while(true)
+	while(spy_running)
 	{
 		//wait for spy socket connection
 		if((clientSocket = accept(serverSocket, (struct sockaddr*)&sockAddr, &len)) >= 0)
@@ -122,8 +124,7 @@ bool SetupSpyServer()
 	pthread_cond_init(&spy_cond, NULL);
 	
 	//wait for spy connections on a separate thread
-	pthread_t threadId;
-	if(pthread_create(&threadId, NULL, SpyConnectionLoop, NULL))
+	if(pthread_create(&spy_thread, NULL, SpyConnectionLoop, NULL))
 	{
 		close(serverSocket);
 		return false;
@@ -133,12 +134,12 @@ bool SetupSpyServer()
 }
 
 //log redirector function for outputting log messages to the spy
-int SpyLog(const char* message)
+void SpyLog(const char* message)
 {
-	return send(clientSocket, message, strlen(message+1), 0);
+	send(clientSocket, message, VMPI_strlen(message)+1, 0);
 }
 
-extern int RedirectLogOutput(int (*)(const char*));
+extern void RedirectLogOutput(void (*)(const char*));
 
 void VMPI_spyCallback()
 {
@@ -149,7 +150,7 @@ void VMPI_spyCallback()
 		spy_connected = false;
 
 		RedirectLogOutput(SpyLog);
-		MMgc::GCHeap::GetGCHeap()->DumpMemoryInfo();
+		MMgc::GCHeap::GetGCHeap()->DumpMemoryInfoLocked();
 		RedirectLogOutput(NULL);
 		
 		//we are done dumping memory info to the spy
@@ -163,15 +164,24 @@ void VMPI_spyCallback()
 
 bool VMPI_spySetup()
 {
-	//read the mmgc profiling option switch
-	const char *env = getenv("MMGC_PROFILE");
-	if(env && (VMPI_strncmp(env, "1", 1) == 0))
-	{
-		//setup server socket for spy connections
-		return SetupSpyServer();
-	}
+	//setup server socket for spy connections
+	return SetupSpyServer();
+}
 
-	return false;
+void VMPI_spyTeardown()
+{
+	spy_running = false;
+
+	if(spy_connected)
+	{
+		spy_connected = false;
+		pthread_cond_signal(&spy_cond);
+	}		
+}
+
+bool VMPI_hasSymbols()
+{
+	return true;
 }
 
 #endif //MMGC_MEMORY_PROFILER

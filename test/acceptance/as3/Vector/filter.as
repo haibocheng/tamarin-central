@@ -108,4 +108,49 @@ AddTestCase(	"filter use thisobj",
 		"messagemessagemessage",
 		msg);
 
+// Bugzilla https://bugzilla.mozilla.org/show_bug.cgi?id=513095
+var items:Vector.<String> = new Vector.<String>;
+items.push("one");
+items.push("two");
+items.push("three");
+
+var filtered:Vector.<String> = items.filter(function(item:String, index:int,
+                                                     source:Vector.<String>):Boolean
+                                            {
+                                                return item == "two";
+                                            });
+AddTestCase("Bug 513095: Type-check filter function",
+            "two",
+            filtered.toString()
+            );
+
+class TestClass {
+    private var myVal:Object;
+    
+    static public function over100(item:TestClass, index:int, vector:Vector.<TestClass>):Boolean {
+        if (item.myVal > 100) 
+            return true;
+        return false;
+    }
+    
+    public function TestClass(v:Object):void {
+        myVal = v;
+    }
+    
+    public function toString():String {
+        return myVal.toString();
+    }
+    
+    
+}
+
+var v2 = new <TestClass> [new TestClass(150), new TestClass(40), new TestClass(-200), new TestClass(400)];
+var v2filtered = v2.filter(TestClass.over100);
+
+AddTestCase("Filtered custom class",
+            "150,400",
+            v2filtered.toString()
+            );
+
+
 test();

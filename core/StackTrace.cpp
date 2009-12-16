@@ -43,15 +43,16 @@ namespace avmplus
 #ifdef DEBUGGER
 	void CallStackNode::init(
 					MethodEnv*				env
-					, Atom*					framep
+					, FramePtr				framep
 					, Traits**				frameTraits
 					, intptr_t volatile*	eip
-					, bool                  boxed
 			)
 	{
 		AvmAssert(env != NULL);
+		m_functionId	= 0;
 		m_core			= env->core();
 		m_env			= env;
+		m_info			= env ? env->method : NULL;
 		m_next			= m_core->callStack; m_core->callStack = this;
 		m_fakename		= NULL;
 		m_depth			= m_next ? (m_next->m_depth + 1) : 1;
@@ -60,13 +61,31 @@ namespace avmplus
 		m_framep		= framep;
 		m_traits		= frameTraits;
 		m_linenum		= 0;
-		m_boxed			= boxed;
 	}
 
+	void CallStackNode::init(MethodInfo* methodInfo)
+	{
+		AvmAssert(methodInfo != NULL);
+		
+		m_env			= NULL;
+		m_info			= methodInfo;
+		m_fakename		= NULL;
+		m_core			= NULL;
+		m_next			= NULL;
+		m_depth			= 0;
+		m_eip			= NULL;    
+		m_filename		= NULL;
+		m_framep		= NULL;
+		m_traits		= NULL;
+		m_linenum		= 0;
+	}
+	
 	void CallStackNode::init(AvmCore* core, Stringp name)
 	{
 		// careful, core and/or name can be null
+		m_functionId	= 0;
 		m_env			= NULL;
+		m_info			= NULL;
 		m_fakename		= name;
 		if (name)
 		{
@@ -86,7 +105,25 @@ namespace avmplus
 		m_framep		= 0;
 		m_traits		= 0;
 		m_linenum		= 0;
-		m_boxed			= false;
+	}
+	
+	void CallStackNode::init(AvmCore* core, uint64_t functionId, int32_t lineno)
+	{
+		AvmAssert(core != NULL);
+		AvmAssert(functionId != 0);
+		
+		m_functionId	= functionId;
+		m_info			= NULL;
+		m_env			= NULL;
+		m_fakename		= NULL;
+		m_core          = core;
+		m_next          = core->callStack; core->callStack = this;
+		m_depth         = m_next ? (m_next->m_depth + 1) : 1;
+		m_eip			= NULL;    
+		m_filename		= NULL;
+		m_framep		= NULL;
+		m_traits		= NULL;
+		m_linenum		= lineno;
 	}
 
 	CallStackNode::~CallStackNode()
@@ -108,15 +145,42 @@ namespace avmplus
 		}
 	}
 
-	void** FASTCALL CallStackNode::scopeBase()
+	void CallStackNode::enumerateScopeChainAtoms(IScopeChainEnumerator& scb)
 	{
-		// If we were given a real frame, calculate the scope base; otherwise return NULL
-		if (m_framep && m_env)
+		// First, get the "dynamic" portion of the scope chain, that is, the
+		// part that is modified on-the-fly within the function.  This includes
+		// activation objects for try/catch blocks and "with" clauses.
+
+		if (m_info)
 		{
-            // @todo disabling this for now see https://bugzilla.mozilla.org/show_bug.cgi?id=484039
-			//return (void**) (m_framep + m_env->method->getMethodSignature()->local_count());
+            MethodSignaturep const ms = m_info->getMethodSignature();
+            for (int i = (ms->max_scope() + ms->local_count() - 1), n = ms->local_count(); i >= n; --i)
+            {
+                Atom const scope = m_info->boxOneLocal(m_framep, i, m_traits);
+                AvmAssert(atomKind(scope) != kUnusedAtomTag);
+                // go ahead and call addScope, even if null or undefined.
+                scb.addScope(scope);
+            }
 		}
-		return NULL;
+
+		// Next, get the "static" portion of the scope chain, that is, the
+		// part that is defined as part of the definition of the function.  This
+		// includes the locals of any functions that enclose this one, and the "this"
+		// object, if any.
+
+		ScopeChain* scopeChain = m_env ? m_env->scope() : NULL;
+		if (scopeChain) 
+		{
+			int scopeChainLength = scopeChain->getSize();
+			for (int i = scopeChainLength - 1; i >= 0; --i)
+			{
+				Atom scope = scopeChain->getScope(i);
+				if (AvmCore::isObject(scope))
+				{
+                    scb.addScope(scope);
+				}
+			}
+		}
 	}
 
 	// Dump a filename.  The incoming filename is of the form

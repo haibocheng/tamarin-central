@@ -82,11 +82,11 @@
 #include "VMPI.h"			// also includes avmfeatures.h
 #include "avmbuild.h"			// old-style configuration, may disappear, handles a few things not yet handled by the feature system
 
-#include "avmplusTypes.h"
+#include "GCTypes.h"
 #include "avmplusVersion.h"
 #include "AvmDebug.h"
 #include "AvmLog.h"
-#include "AtomConstants.h"
+#include "atom.h"
 #include "ActionBlockConstants.h"
 #include "wopcodes.h"
 #include "ErrorConstants.h"
@@ -110,6 +110,8 @@ namespace avmplus
 	class Atan2Method;
 	class AtomArray;
 	class AvmCore;
+    class AvmPlusScriptableObject;
+	class MethodFrame;
 	class BooleanClass;
 	class BuiltinTraits;
 	class CallStackNode;
@@ -135,7 +137,10 @@ namespace avmplus
 	class ExceptionFrame;
 	class ExceptionHandler;
 	class ExceptionHandlerTable;
+	class FixedBitSet;
 	class FrameState;
+    class GlobalMemoryProvider;
+    class GlobalMemorySubscriber;
 	class HeapHashtable;
 	class HeapMultiname;
 	class InlineHashtable;
@@ -210,12 +215,33 @@ namespace avmplus
 	typedef const TraitsBindings* TraitsBindingsp;
 	typedef const TraitsMetadata* TraitsMetadatap;
 	typedef const MethodSignature* MethodSignaturep;
+	
+	typedef struct FramePtr_* FramePtr;
+}
+
+#ifdef VMCFG_AOT
+struct ABCInfo;
+#endif
+
+#include "avm.h"
+
+namespace avmplus
+{
+	// conversion routines -- intended only for Tamarin internal use
+	// but, other the short term, clients may need to make use of them as
+	// they adapt to the new api
+	#define AVM_MAP(EXT, INT) \
+		inline avm::EXT avmTo##EXT(const avmplus::INT e) { return (avm::EXT)e; } \
+		inline avmplus::INT avmFrom##EXT(avm::EXT m) { return (avmplus::INT)m; } \
+	
+	AVM_MAP(Instance, AvmCore*)
+	AVM_MAP(Object, ScriptObject*)
+	AVM_MAP(CodeContext, CodeContext*)
+	
+	#undef AVM_MAP
 }
 
 #include "MMgc.h"
-
-#define MMGC_SUBCLASS_DECL : public GCObject
-
 #include "QCache.h"
 #include "MathUtils.h"
 #include "UnicodeUtils.h"
@@ -224,7 +250,7 @@ namespace avmplus
 #include "ScriptBuffer.h"
 #include "avmplusList.h"
 #include "avmplusStack.h"
-#include "SortedIntMap.h"
+#include "SortedMap.h"
 #include "BitSet.h"
 #include "AvmPlusScriptableObject.h"
 #include "Namespace.h"
@@ -238,11 +264,11 @@ namespace avmplus
 #include "AvmCore.h"
 #include "AtomWriteBarrier.h"
 #include "avmplusHashtable.h"
-#include "CodeContext.h"
 #include "Traits.h"
 #include "VTable.h"
 #include "ScriptObject.h"
 #include "NativeFunction.h"
+#include "BuiltinNatives.h"
 #include "Coder.h"
 #include "WordcodeTranslator.h"
 #include "WordcodeEmitter.h"
@@ -250,8 +276,9 @@ namespace avmplus
 #include "PoolObject.h"
 #include "AbcEnv.h"
 #include "TraitsIterator.h"
-#include "MethodEnv.h"
 #include "ScopeChain.h"
+#include "MethodEnv.h"
+#include "CodeContext.h"
 #include "avmplusProfiler.h"
 #include "StringBuffer.h"
 #include "AtomArray.h"
@@ -297,5 +324,28 @@ namespace avmplus
 #include "avmplusDebugger.h"
 #include "E4XNode.h"
 #include "AbcGen.h"
+#include "instr.h"
+#ifdef VMCFG_AOT
+#include "AOTCompiler.h"
+#endif
+
+// inline implementations
+#include "AbcEnv-inlines.h"
+#include "AbcParser-inlines.h"
+#include "atom-inlines.h"
+#include "AvmCore-inlines.h"
+#include "Coder-inlines.h"
+#include "instr-inlines.h"
+#include "MethodEnv-inlines.h"
+#include "MethodInfo-inlines.h"
+#include "Multiname-inlines.h"
+#include "MultinameHashtable-inlines.h"
+#include "NamespaceSet-inlines.h"
+#include "PoolObject-inlines.h"
+#include "ScopeChain-inlines.h"
+#include "Toplevel-inlines.h"
+#include "Traits-inlines.h"
+#include "Verifier-inlines.h"
+#include "VTable-inlines.h"
 
 #endif /* __avmplus__ */ 

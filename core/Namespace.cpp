@@ -45,7 +45,7 @@ namespace avmplus
 	// See E4X 13.2.2, pg 64
     Namespace::Namespace(Atom prefix, Stringp uri, NamespaceType flags)
 #ifdef DEBUGGER
-		: AvmPlusScriptableObject(kNamespaceType)
+		: AvmPlusScriptableObject(sotNamespace())
 #endif // DEBUGGER
 	{
 		// verify our parameters are interned strings
@@ -60,6 +60,7 @@ namespace avmplus
 	{
 		WBATOM(MMgc::GC::GetGC(this), this, &m_prefix, 0);
 		setUri(NULL, NS_Public);
+		setAPI(0);
 	}
 
 	void Namespace::setUri(Stringp uri, NamespaceType flags)
@@ -81,6 +82,12 @@ namespace avmplus
 		return (AvmCore::isName(m_prefix) && AvmCore::atomToString(m_prefix)->length()>0);
 	}
 
+	bool Namespace::isPublic() const
+	{
+		Stringp uri = (Stringp)(((uintptr)m_uri)&~7);
+		return getType() == Namespace::NS_Public && uri->isEmpty();
+	}
+
 	bool Namespace::EqualTo(const Namespace* other) const
 	{
 		if (isPrivate() || other->isPrivate())
@@ -92,7 +99,7 @@ namespace avmplus
 		{
 			// both are public, so compare using uri's.  they are intern'ed so we
 			// can do a fast pointer compare.
-            return m_uri == other->m_uri;
+			return m_uri == other->m_uri && m_api==other->m_api;
 		}
 	}
 
@@ -130,15 +137,15 @@ namespace avmplus
 			return 0;
 	}
 
-	Stringp Namespace::format(AvmCore* /*core*/) const
+	Stringp Namespace::format(AvmCore* core) const
 	{
+		(void) core;
 		return getURI();
 	}
 
-	Stringp Namespace::get_uri() const
+	Stringp Namespace::getURI() const
 	{
-		Stringp uri = (Stringp)(((uintptr)m_uri)&~7);
-		return uri;
+		return (Stringp)atomPtr(m_uri);
 	}
 }
 

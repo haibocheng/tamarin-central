@@ -41,13 +41,70 @@
 
 namespace avmplus
 {
-#undef DEBUG_EARLY_BINDING
+	// only unbox the value (convert atom to native representation), coerce
+	// must have already happened.
+	Atom* FASTCALL MethodEnv::unbox1(Atom atom, Traits* t, Atom* arg0)
+	{
+		// atom must be correct type already, we're just unboxing it.
+		AvmAssert(atom == this->toplevel()->coerce(atom, t));
+		switch (Traits::getBuiltinType(t))
+		{
+			case BUILTIN_any:
+			case BUILTIN_object:
+			case BUILTIN_void:
+				// my, that was easy
+				break;
+
+			case BUILTIN_boolean:
+				atom = (Atom) ((atom>>3) != 0);
+				break;
+
+			case BUILTIN_int:
+				atom = AvmCore::integer_i(atom);
+				break;
+
+			case BUILTIN_uint:
+				atom = AvmCore::integer_u(atom);
+				break;
+
+			case BUILTIN_number:
+			{
+				#ifdef AVMPLUS_64BIT
+					AvmAssert(sizeof(Atom) == sizeof(double));
+					union 
+					{
+						double d;
+						Atom a;
+					};
+					d = AvmCore::number_d(atom);
+					atom = a;
+				#else
+					AvmAssert(sizeof(Atom)*2 == sizeof(double));
+					union 
+					{
+						double d;
+						Atom a[2];
+					};
+					d = AvmCore::number_d(atom);
+					arg0[0] = a[0];
+					arg0 += 1;
+					atom = a[1];	// fall thru, will be handled at end
+				#endif
+				break;
+			}
+
+			default:
+				atom = (Atom)atomPtr(atom);
+				break;
+		}
+		// every case increments by at least 1
+		arg0[0] = atom;
+		return arg0+1;
+	}
 
 	// note that some of these have (partial) guts of Toplevel::coerce replicated here, for efficiency.
 	// if you find bugs here, you might need to update Toplevel::coerce as well (and vice versa).
-	// (Note: toplevel is passed as the final parameter as it's only used in exception cases,
-	// thus preserving our precious FASTCALL args (only 2 on x86-32) for more-frequently used args.)
-	static Atom* FASTCALL unbox1(Atom atom, Traits* t, Atom* args, Toplevel* toplevel)
+	Atom* FASTCALL MethodEnv::coerceUnbox1(Atom atom, Traits* t, Atom* args)
 	{
 		// using computed-gotos here doesn't move the needle appreciably in my testing
 		switch (Traits::getBuiltinType(t))
@@ -111,7 +168,7 @@ namespace avmplus
 				break;
 
 			case BUILTIN_string:
-				atom = AvmCore::isNullOrUndefined(atom) ? NULL : (Atom)toplevel->core()->string(atom);
+				atom = AvmCore::isNullOrUndefined(atom) ? NULL : (Atom)this->core()->string(atom);
 				break;
 
 			case BUILTIN_null:
@@ -130,7 +187,7 @@ namespace avmplus
 			case BUILTIN_vectoruint:
 			case BUILTIN_xml:
 			case BUILTIN_xmlList:
-				// a few intrinsic final classes can skip containsInterface calls
+				// a few intrinsic final classes can skip subtypeof calls
 				if (AvmCore::isNullOrUndefined(atom))
 				{
 					atom = 0;
@@ -164,7 +221,7 @@ namespace avmplus
 				else if (atomKind(atom) == kObjectType)
 				{
 					Traits* actual = AvmCore::atomToScriptObject(atom)->traits();
-					if (actual->containsInterface(t))
+					if (actual->subtypeof(t))
 					{
 						atom = (Atom)atomPtr(atom);
 						break;
@@ -178,10 +235,11 @@ namespace avmplus
 		return args+1;
 
 	failure:
+		AvmCore* core = this->core();
 		#ifdef AVMPLUS_VERBOSE
-		// core->console << "checktype failed " << t << " <- " << atom << "\n";
+		//core->console << "checktype failed " << t << " <- " << core->format(atom) << "\n";
 		#endif
-		toplevel->throwTypeError(kCheckTypeFailedError, toplevel->core()->atomToErrorString(atom), toplevel->core()->toErrorString(t));
+		this->toplevel()->throwTypeError(kCheckTypeFailedError, core->atomToErrorString(atom), core->toErrorString(t));
 		return NULL;	// unreachable
 	}
 
@@ -193,9 +251,9 @@ namespace avmplus
 		case BUILTIN_number:
 			return (atomKind(atom) == kDoubleType) ? atom : core->numberAtom(atom);
 		case BUILTIN_int:
-			return (atomKind(atom) == kIntegerType) ? atom : core->intAtom(atom);
+			return (atomKind(atom) == kIntptrType) ? atom : core->intAtom(atom);
 		case BUILTIN_uint:
-			return (atomKind(atom) == kIntegerType && atom >= 0) ? atom : core->uintAtom(atom);
+			return (atomKind(atom) == kIntptrType && atom >= 0) ? atom : core->uintAtom(atom);
 		case BUILTIN_boolean:
 			return (atomKind(atom) == kBooleanType) ? atom : AvmCore::booleanAtom(atom);
 		case BUILTIN_object:
@@ -206,41 +264,49 @@ namespace avmplus
 			return toplevel->coerce(atom, t);
 		}
 	}
+
+	void MethodEnv::argcError(int32_t argc)
+	{
+		MethodSignaturep ms = get_ms();
+		AvmAssert(!ms->argcOk(argc));
+		toplevel()->argumentErrorClass()->throwError(kWrongArgumentCountError, 
+												   core()->toErrorString(method), 
+												   core()->toErrorString(ms->requiredParamCount()), 
+												   core()->toErrorString(argc));
+	}
 	
 	// helper
-	inline int MethodEnv::startCoerce(int argc, MethodSignaturep ms)
+	inline int32_t MethodEnv::startCoerce(int32_t argc, MethodSignaturep ms)
 	{
-		Toplevel* toplevel = this->toplevel();
+		// getting toplevel() is slightly more expensive than it used to be (more indirection)...
+		// so only extract in the (rare) event of an exception
 
 		if (!ms->argcOk(argc))
-		{
-			toplevel->argumentErrorClass()->throwError(kWrongArgumentCountError, 
-													   core()->toErrorString(method), 
-													   core()->toErrorString(ms->requiredParamCount()), 
-													   core()->toErrorString(argc));
-		}
+			argcError(argc);
 
 		// Can happen with duplicate function definitions from corrupt ABC data.  F1 is defined
 		// and F2 overrides the F1 slot which is okay as long as F1's MethodEnv is never called again.
 		if (method->declaringScope() != this->scope()->scopeTraits())
 		{
-			toplevel->throwVerifyError(kCorruptABCError);
+			//core()->console<<method<<" "<<int(method->declaringTraits()->posType())<<"\n";
+			//core()->console<<"expected "<<this->scope()->scopeTraits()<<" but got "<<method->declaringScope()<<"\n";
+			toplevel()->throwVerifyError(kCorruptABCError);
 		}
 
 		// now unbox everything, including instance and rest args
-		const int param_count = ms->param_count();
-		const int extra = argc > param_count ? argc - param_count : 0;
+		const int32_t param_count = ms->param_count();
+		const int32_t extra = argc > param_count ? argc - param_count : 0;
 		AvmAssert(ms->rest_offset() > 0 && extra >= 0);
 
 		return extra;
 	}
 
 	// helper
-	inline Atom MethodEnv::endCoerce(int argc, uint32 *ap, MethodSignaturep ms)
+	inline Atom MethodEnv::endCoerce(int32_t argc, uint32_t *ap, MethodSignaturep ms)
 	{
 		// we know we have verified the method, so we can go right into it.
 		AvmCore* core = this->core();
-		const int bt = ms->returnTraitsBT();
+		const int32_t bt = ms->returnTraitsBT();
 		if (bt == BUILTIN_number)
 		{
 			AvmAssert(method->implFPR() != NULL);
@@ -252,9 +318,9 @@ namespace avmplus
 		switch (bt)
 		{
 		case BUILTIN_int:
-			return core->intToAtom((int)i);
+			return core->intToAtom((int32_t)i);
 		case BUILTIN_uint:
-			return core->uintToAtom((uint32)i);
+			return core->uintToAtom((uint32_t)i);
 		case BUILTIN_boolean:
 			return i ? trueAtom : falseAtom;
 		case BUILTIN_any:
@@ -270,16 +336,6 @@ namespace avmplus
 		}
 	}
 
-	// In interp-only builds this could still be delegateInvoke or verifyEnter.
-	//
-	// OPTIMIZEME: It would be nice to avoid the unbox / rebox paths through
-	// those functions in interpreter-only builds!
-	
-	inline bool MethodEnv::isInterpreted()
-	{
-		return implGPR() == interpGPR || implFPR() == interpFPR;
-	}
-	
 	inline MethodSignaturep MethodEnv::get_ms()
 	{
 		if (!method->isResolved())
@@ -287,70 +343,47 @@ namespace avmplus
 		return method->getMethodSignature();
 	}
 	
-	// Optimization opportunities: since we call interp() directly, it is
+	// Optimization opportunities: since we call interpBoxed() directly, it is
 	// probably possible to allocate its stack frame here and pass it in.
-	// If we do so then interp() should deallocate it.  This affords us
+	// If we do so then interpBoxed() should deallocate it.  This affords us
 	// the optimization of getting rid of alloca() allocation here, 
 	// which means improved tail calls for once.  For another, if the argv
 	// pointer points into the stack segment s.t. argv+argc+1 equals the
 	// current stack pointer then the stack may be extended in place 
 	// provided there's space.  But that optimization may equally well
-	// be performed inside interp(), and in fact if we alloc temp
-	// space on the alloca stack here then interp() would always perform
-	// that optimization.  So we'd just be moving the decision into interp().
-	
-	// fast/optimized call to a function without parameters
-	Atom MethodEnv::coerceEnter(Atom thisArg)
-	{
-		MethodSignaturep ms = get_ms();
+	// be performed inside interpBoxed(), and in fact if we alloc temp
+	// space on the alloca stack here then interpBoxed() would always perform
+	// that optimization.  So we'd just be moving the decision into interpBoxed().
 
-		startCoerce(0, ms);
-		// check receiver type first
-		// caller will coerce instance if necessary,
-		// so make sure it was done.
-		AvmAssert(thisArg == toplevel()->coerce(thisArg, ms->paramTraits(0)));
-		if (isInterpreted())
-		{
-			// Tail call inhibited by &thisArg, and also by &thisArg in "else" clause
-			return interpBoxed(this, 0, &thisArg, ms);
-		}
-		else
-		{
-			unbox1(thisArg, ms->paramTraits(0), &thisArg, toplevel());
-			return endCoerce(0, (uint32*)&thisArg, ms);
-		}
-	}
-	
+	// specialized to be called from Function.apply
 	Atom MethodEnv::coerceEnter(Atom thisArg, ArrayObject *a)
 	{
-		int argc = a->getLength();
+		int32_t argc = a->getLength();
 		if (argc == 0)
 			return coerceEnter(thisArg);
 
 		MethodSignaturep ms = get_ms();
-		const int extra = startCoerce(argc, ms);
-
-		// check receiver type first
-		// caller will coerce instance if necessary,
-		// so make sure it was done.
-		AvmAssert(thisArg == toplevel()->coerce(thisArg, ms->paramTraits(0)));
+		const int32_t extra = startCoerce(argc, ms);
 
 		if (isInterpreted())
 		{
+			// caller will coerce instance if necessary, so make sure it was done.
+			AvmAssert(thisArg == coerce(this, thisArg, ms->paramTraits(0)));
+
 			// Tail call inhibited by local allocation/deallocation
 			MMgc::GC::AllocaAutoPtr _atomv;
 			Atom* atomv = (Atom*)VMPI_alloca(core(), _atomv, sizeof(Atom)*(argc+1));
 			atomv[0] = thisArg;
-			for ( int i=0 ; i < argc ; i++ )
+			for (int32_t i=0 ; i < argc ; i++ )
 				atomv[i+1] = a->getUintProperty(i);
 			return coerceEnter(argc, atomv);
 		}
 		else
 		{
-			const int rest_offset = ms->rest_offset();
+			const int32_t rest_offset = ms->rest_offset();
 			const size_t extra_sz = rest_offset + sizeof(Atom)*extra;
 			MMgc::GC::AllocaAutoPtr _ap;
-			uint32 *ap = (uint32 *)VMPI_alloca(core(), _ap, extra_sz);
+			uint32_t *ap = (uint32_t *)VMPI_alloca(core(), _ap, extra_sz);
 
 			unboxCoerceArgs(thisArg, a, ap, ms);
 			return endCoerce(argc, ap, ms);
@@ -361,23 +394,22 @@ namespace avmplus
 	// If TRY captures the current stack top and the CATCH and/or FINALLY just reset it, then
 	// we're done.
 	//
-	// Then we can just call it AVMPI_alloca() and be done.
-	//
-	// Woot!
-	
+	// Then we can just call it AVMPI_alloca() and be done.  W00t!
+
+	// specialized to be called from Function.call
 	Atom MethodEnv::coerceEnter(Atom thisArg, int argc, Atom *argv)
 	{
+		if (argc == 0)
+			return coerceEnter(thisArg);
+
 		MethodSignaturep ms = get_ms();
-
-		const int extra = startCoerce(argc, ms);
-
-		// check receiver type first
-		// caller will coerce instance if necessary,
-		// so make sure it was done.
-		AvmAssert(thisArg == toplevel()->coerce(thisArg, ms->paramTraits(0)));
+		const int32_t extra = startCoerce(argc, ms);
 
 		if (isInterpreted())
 		{
+			// caller will coerce instance if necessary, so make sure it was done.
+			AvmAssert(thisArg == coerce(this, thisArg, ms->paramTraits(0)));
+
 			// Tail call inhibited by local allocation/deallocation
 			MMgc::GC::AllocaAutoPtr _atomv;
 			Atom* atomv = (Atom*)VMPI_alloca(core(), _atomv, sizeof(Atom)*(argc+1));
@@ -387,11 +419,11 @@ namespace avmplus
 		}
 		else
 		{
-			const int rest_offset = ms->rest_offset();
+			const int32_t rest_offset = ms->rest_offset();
 			const size_t extra_sz = rest_offset + sizeof(Atom)*extra;
 			MMgc::GC::AllocaAutoPtr _ap;
-			uint32 *ap = (uint32 *)VMPI_alloca(core(), _ap, extra_sz);
-				
+			uint32_t *ap = (uint32_t *)VMPI_alloca(core(), _ap, extra_sz);
+
 			unboxCoerceArgs(thisArg, argc, argv, ap, ms);
 			return endCoerce(argc, ap, ms);
 		}
@@ -399,50 +431,66 @@ namespace avmplus
 
 	// note that GCC typically restricts tailcalls to functions with similar signatures
 	// ("sibcalls") -- see http://www.ddj.com/architect/184401756 for a useful explanation.
-	// anyway, since we really want coerceUnboxEnter to be a tailcall from
+	// anyway, since we really want interpBoxed to be a tailcall from
 	// here, be sure to keep it using a compatible signature...
-	Atom MethodEnv::coerceEnter(int argc, Atom* atomv)
+	Atom MethodEnv::coerceEnter_interp(MethodEnv* env, int32_t argc, Atom* atomv)
 	{
-		// Trying hard here to allow this to be a tail call, so don't inline
-		// coerceUnboxEnter into this function - the allocation it performs
-		// may prevent the compiler from performing the tail call.
-		//
-		// The tail call is important in order to keep stack consumption down in an
+		// The tail call to interpBoxed is important in order to keep stack consumption down in an
 		// interpreter-only configuration, but it's good always.
 
-		if (isInterpreted())
-		{
-			AvmCore* core = this->core();
-			Toplevel* toplevel = this->toplevel();
-			
-			MethodSignaturep ms = get_ms();
-			AvmAssert(atomv[0] == toplevel->coerce(atomv[0], ms->paramTraits(0)));
-			startCoerce(argc, ms);
-			const int param_count = ms->param_count();
-			const int end = argc >= param_count ? param_count : argc;
-			for ( int i=1 ; i <= end ; i++ )
-				atomv[i] = coerceAtom(core, atomv[i], ms->paramTraits(i), toplevel);
-			return interpBoxed(this, argc, atomv, ms);
-		}
-		else
-			return coerceUnboxEnter(argc, atomv);
+		AvmAssert(env->isInterpreted());
+		AvmCore* core = env->core();
+		Toplevel* toplevel = env->toplevel();
+
+		MethodSignaturep ms = env->get_ms();
+		env->startCoerce(argc, ms);
+
+		// caller will coerce instance if necessary, so make sure it was done.
+		AvmAssert(atomv[0] == coerce(env, atomv[0], ms->paramTraits(0)));
+
+		const int32_t param_count = ms->param_count();
+		const int32_t end = argc >= param_count ? param_count : argc;
+		for (int32_t i=1 ; i <= end ; i++ )
+			atomv[i] = coerceAtom(core, atomv[i], ms->paramTraits(i), toplevel);
+		return interpBoxed(env, argc, atomv);
 	}
 
-
-	// In principle we want this to be inlined if the compiler is not tailcall-aware,
-	// and not inlined if it is tailcall-aware (as doing so may inhibit tail calls).
-	Atom MethodEnv::coerceUnboxEnter(int argc, Atom* atomv)
+	Atom MethodEnv::coerceEnter_interp_nocoerce(MethodEnv* env, int32_t argc, Atom* atomv)
 	{
-		MethodSignaturep ms = get_ms();
-		AvmAssert(atomv[0] == toplevel()->coerce(atomv[0], ms->paramTraits(0)));
-		const int extra = startCoerce(argc, ms);
-		const int rest_offset = ms->rest_offset();
+		// The tail call to interpBoxed is important in order to keep stack consumption down in an
+		// interpreter-only configuration, but it's good always.
+
+		MethodSignaturep ms = env->get_ms();
+		env->startCoerce(argc, ms);
+
+#ifdef DEBUG
+		AvmAssert(env->isInterpreted());
+		// caller will coerce instance if necessary, so make sure it was done.
+		AvmAssert(atomv[0] == coerce(env, atomv[0], ms->paramTraits(0)));
+		const int32_t param_count = ms->param_count();
+		const int32_t end = argc >= param_count ? param_count : argc;
+		for (int32_t i=1 ; i <= end ; i++ )
+			AvmAssert(ms->paramTraits(i) == NULL);
+#endif
+
+		return interpBoxed(env, argc, atomv);
+	}
+
+	Atom MethodEnv::coerceEnter_generic(MethodEnv *env, int32_t argc, Atom* atomv)
+	{
+		MethodSignaturep ms = env->get_ms();
+		const int32_t extra = env->startCoerce(argc, ms);
+
+		// caller will coerce instance if necessary, so make sure it was done.
+		AvmAssert(atomv[0] == coerce(env, atomv[0], ms->paramTraits(0)));
+
+		const int32_t rest_offset = ms->rest_offset();
 		const size_t extra_sz = rest_offset + sizeof(Atom)*extra;
 		MMgc::GC::AllocaAutoPtr _ap;
-		uint32 *ap = (uint32 *)VMPI_alloca(core(), _ap, extra_sz);
+		uint32_t *ap = (uint32_t *)VMPI_alloca(env->core(), _ap, extra_sz);
 			
-		unboxCoerceArgs(argc, atomv, ap, ms);
-		return endCoerce(argc, ap, ms);
+		env->unboxCoerceArgs(argc, atomv, ap, ms);
+		return env->endCoerce(argc, ap, ms);
 	}
 
 	/**
@@ -450,136 +498,89 @@ namespace avmplus
 	 * args, not counting the instance which is arg[0].  the
 	 * layout is [instance][arg1..argN]
 	 */
-	void MethodEnv::unboxCoerceArgs(int argc, Atom* in, uint32 *argv, MethodSignaturep ms)
+	void MethodEnv::unboxCoerceArgs(int32_t argc, Atom* in, uint32_t *argv, MethodSignaturep ms)
 	{
-		Toplevel* toplevel = this->toplevel();
-		
 		Atom* args = (Atom*)argv;
 
-		const int param_count = ms->param_count();
-		int end = argc >= param_count ? param_count : argc;
-		for (int i=0; i <= end; i++)
-			args = unbox1(in[i], ms->paramTraits(i), args, toplevel);
+		const int32_t param_count = ms->param_count();
+		int32_t end = argc >= param_count ? param_count : argc;
+		args = unbox1(in[0], ms->paramTraits(0), args); // no need to coerce
+		for (int32_t i=1; i <= end; i++)
+			args = coerceUnbox1(in[i], ms->paramTraits(i), args);
 		while (end < argc)
 			*args++ = in[++end];
 	}
 
-	void MethodEnv::unboxCoerceArgs(Atom thisArg, ArrayObject *a, uint32 *argv, MethodSignaturep ms)
+	// specialized for Function.apply
+	void MethodEnv::unboxCoerceArgs(Atom thisArg, ArrayObject *a, uint32_t *argv, MethodSignaturep ms)
 	{
-		Toplevel* toplevel = this->toplevel();
-		int argc = a->getLength();
+		int32_t argc = a->getLength();
 
-		Atom *args = unbox1(thisArg, ms->paramTraits(0), (Atom *) argv, toplevel);
+		Atom *args = unbox1(thisArg, ms->paramTraits(0), (Atom *) argv);
 
-		const int param_count = ms->param_count();
-		int end = argc >= param_count ? param_count : argc;
-		for (int i=0; i < end; i++)
-			args = unbox1(a->getUintProperty(i), ms->paramTraits(i+1), args, toplevel);
+		const int32_t param_count = ms->param_count();
+		int32_t end = argc >= param_count ? param_count : argc;
+		for (int32_t i=0; i < end; i++)
+			args = coerceUnbox1(a->getUintProperty(i), ms->paramTraits(i+1), args);
 		while (end < argc)
 			*args++ = a->getUintProperty(end++);
 	}
 
-	void MethodEnv::unboxCoerceArgs(Atom thisArg, int argc, Atom* in, uint32 *argv, MethodSignaturep ms)
+	// specialized for Function.call 
+	void MethodEnv::unboxCoerceArgs(Atom thisArg, int32_t argc, Atom* in, uint32_t *argv, MethodSignaturep ms)
 	{
-		Toplevel* toplevel = this->toplevel();
+		Atom *args = unbox1(thisArg, ms->paramTraits(0), (Atom *) argv);
 
-		Atom *args = unbox1(thisArg, ms->paramTraits(0), (Atom *) argv, toplevel);
-
-		const int param_count = ms->param_count();
-		int end = argc >= param_count ? param_count : argc;
-		for (int i=0; i < end; i++)
-			args = unbox1(in[i], ms->paramTraits(i+1), args, toplevel);
+		const int32_t param_count = ms->param_count();
+		int32_t end = argc >= param_count ? param_count : argc;
+		for (int32_t i=0; i < end; i++)
+			args = coerceUnbox1(in[i], ms->paramTraits(i+1), args);
 		while (end < argc)
 			*args++ = in[end++];
 	}
 
 #if VMCFG_METHODENV_IMPL32
-	uintptr_t MethodEnv::delegateInvoke(MethodEnv* env, int argc, uint32 *ap)
+	uintptr_t MethodEnv::delegateInvoke(MethodEnv* env, int32_t argc, uint32_t *ap)
 	{
 		env->_implGPR = env->method->implGPR();
+		AvmAssert(env->_implGPR != (GprMethodProc)MethodEnv::delegateInvoke);
 		return env->_implGPR(env, argc, ap);
 	}
 #endif // VMCFG_METHODENV_IMPL32
 
-#ifdef FEATURE_NANOJIT
-	MethodEnv::MethodEnv(TrampStub, MethodInfo *method, VTable *vtable)
-		: _vtable(vtable), method(method), activationOrMCTable(0)
-	{
-		#if VMCFG_METHODENV_IMPL32
-		// set trampoline to IMT stub; we cannot go through delegateInvoke
-		// because the register holding the IID (interface id) will be clobbered
-		_implGPR = method->implGPR();
-		#endif
-		AVMPLUS_TRAITS_MEMTRACK_ONLY( tmt_add_inst( TMT_methodenv, this); )
-	}
+	MethodEnv::MethodEnv(MethodInfo* method, ScopeChain* scope) : 
+#if VMCFG_METHODENV_IMPL32
+		MethodEnvProcHolder(delegateInvoke),
+		method(method),
+#else
+		MethodEnvProcHolder(method),
 #endif
-
-	MethodEnv::MethodEnv(MethodInfo* method, VTable *vtable)
-		: _vtable(vtable)
-		, method(method)
-		, activationOrMCTable(0)
+		_scope(scope),
+		activationOrMCTable(0)
 	{
 		AvmAssert(method != NULL);
 		
-#if VMCFG_METHODENV_IMPL32
-	#if !defined(AVMPLUS_TRAITS_MEMTRACK) && !defined(MEMORY_INFO)
-		MMGC_STATIC_ASSERT(offsetof(MethodEnv, _implGPR) == 0);
-	#endif
-		// make the first call go to the method impl
-		_implGPR = delegateInvoke;
-#endif
-
-		AvmCore* core = this->core();
-		if (method->declaringTraits() != this->_vtable->traits)
+		if (method->declaringTraits() != this->vtable()->traits)
 		{
 		#ifdef AVMPLUS_VERBOSE
-			core->console << "ERROR " << method->getMethodName() << " " << method->declaringTraits() << " " << vtable->traits << "\n";
+			core()->console << "ERROR " << method->getMethodName() << " " << method->declaringTraits() << " " << this->vtable()->traits << "\n";
 		#endif
 			AvmAssertMsg(0, "(method->declaringTraits != vtable->traits)");
 			toplevel()->throwVerifyError(kCorruptABCError);
 		}
-
-		if (method->needActivation())
-		{
-			Traits* activationTraits = method->activationTraits();
-
-			// This can happen when the ABC has MethodInfo data but not MethodBody data
-			if (!activationTraits)
-			{
-				toplevel()->throwVerifyError(kCorruptABCError);
-			}
-			
-			if (activationTraits->scope() != NULL && activationTraits->scope() != this->scope()->scopeTraits())
-			{
-				AvmAssert(!"unexpected scope for activationTraits");
-				toplevel()->throwVerifyError(kCorruptABCError);
-			}
-			// ensure the ScopeTypeChain is set, we now rely on this later on in startCoerce
-			activationTraits->set_scope(this->scope()->scopeTraits());
-
-			VTable *activation = core->newVTable(activationTraits, NULL, this->scope(), this->abcEnv(), toplevel());
-			activation->resolveSignatures();
-			setActivationOrMCTable(activation, kActivation);
-		}
-		AVMPLUS_TRAITS_MEMTRACK_ONLY( tmt_add_inst( TMT_methodenv, this); )
+		
+		// activation info used to be created here, but is now created lazily
 	}
 	
-#ifdef AVMPLUS_TRAITS_MEMTRACK 
-	MethodEnv::~MethodEnv()
-	{
-		AVMPLUS_TRAITS_MEMTRACK_ONLY( tmt_sub_inst(TMT_methodenv, this); )
-	}
-#endif
-
 #ifdef DEBUGGER
 	void MethodEnv::debugEnter(	Traits** frameTraits, 
 								CallStackNode* callstack,
-								Atom* framep, 
-								volatile sintptr *eip)
+								FramePtr framep, 
+								volatile intptr_t *eip)
 	{
 		AvmAssert(this != 0);
 		AvmAssert(callstack != 0); 
-		callstack->init(this, framep, frameTraits, eip, /*boxed*/false);		
+		callstack->init(this, framep, frameTraits, eip);		
 		debugEnterInner();
 	}
 	
@@ -605,7 +606,7 @@ namespace avmplus
 
 		// method_id can legitimately be -1 for activations, but we don't care about those here,
 		// so just ignore them.
-		const int method_id = this->method->method_id();
+		const int32_t method_id = this->method->method_id();
 		if (method_id >= 0)
 		{
 			this->abcEnv()->invocationCount(method_id) += 1;	// returns a reference, so this works
@@ -629,7 +630,7 @@ namespace avmplus
 		// trigger a faked "line number changed" since we exited the function and are now back on the old line (well, almost)
 		if (core->callStack && core->callStack->linenum() > 0)
 		{
-			int line = core->callStack->linenum();
+			int32_t line = core->callStack->linenum();
 			core->callStack->set_linenum(-1);
 			Debugger* debugger = core->debugger();
 			if (debugger) 
@@ -639,7 +640,7 @@ namespace avmplus
 
 	uint64_t MethodEnv::invocationCount() const 
 	{ 
-		const int method_id = this->method->method_id();
+		const int32_t method_id = this->method->method_id();
 		if (method_id < 0) return 0;
 		return this->abcEnv()->invocationCount(method_id);
 	}
@@ -650,13 +651,14 @@ namespace avmplus
 		AvmAssert(AvmCore::isNullOrUndefined(atom));
 
 		// TypeError in ECMA
-		ErrorClass *error = toplevel()->typeErrorClass();
+		Toplevel* toplevel = this->toplevel();
+		ErrorClass *error = toplevel->typeErrorClass();
 		if( error ){
 			error->throwError(
 					(atom == undefinedAtom) ? kConvertUndefinedToObjectError :
 										kConvertNullToObjectError);
 		} else {
-			toplevel()->throwVerifyError(kCorruptABCError);
+			toplevel->throwVerifyError(kCorruptABCError);
 		}
     }
 
@@ -665,38 +667,28 @@ namespace avmplus
 		toplevel()->throwTypeError(kConvertNullToObjectError);
 	}
 
-	void MethodEnv::interrupt()
-	{
-		this->core()->interrupt(this);
-	}
-
-    void MethodEnv::stkover()
-    {
-        this->core()->stackOverflow(this);
-    }
-
-	ArrayObject* MethodEnv::createRest(Atom* argv, int argc)
+	ArrayObject* MethodEnv::createRest(Atom* argv, int32_t argc)
 	{
 		// create arguments Array using argv[param_count..argc]
 		MethodSignaturep ms = get_ms();
-		const int param_count = ms->param_count();
+		const int32_t param_count = ms->param_count();
 		Atom* extra = argv + param_count + 1;
-		const int extra_count = argc > param_count ? argc - param_count : 0;
+		const int32_t extra_count = argc > param_count ? argc - param_count : 0;
 		return toplevel()->arrayClass->newarray(extra, extra_count);
 	}
 
-#if defined FEATURE_NANOJIT
+#if defined FEATURE_NANOJIT || defined VMCFG_AOT
 
 	Atom MethodEnv::getpropertyHelper(Atom obj, /* not const */ Multiname *multi, VTable *vtable, Atom index)
 	{
-		if ((index&7) == kIntegerType)
+		if (atomIsIntptr(index) && atomCanBeInt32(index))
 		{
-			return getpropertylate_i(obj, (int)(index>>3));
+			return getpropertylate_i(obj, (int32_t)atomGetIntptr(index));
 		}
 
-		if ((index&7) == kDoubleType)
+		if (atomKind(index) == kDoubleType)
 		{
-			int i = AvmCore::integer_i(index);
+			int32_t i = AvmCore::integer_i(index);
 			if ((double)i == AvmCore::atomToDouble(index))
 			{
 				return getpropertylate_i(obj, i);
@@ -730,16 +722,16 @@ namespace avmplus
 
 	void MethodEnv::initpropertyHelper(Atom obj, /* not const */ Multiname *multi, Atom value, VTable *vtable, Atom index)
 	{
-		if ((index&7) == kIntegerType)
+		if (atomIsIntptr(index) && atomCanBeInt32(index))
 		{
-			setpropertylate_i(obj, (int)(index>>3), value);
+			setpropertylate_i(obj, (int32_t)atomGetIntptr(index), value);
 			return;
 		}
 
-		if ((index&7) == kDoubleType)
+		if (atomKind(index) == kDoubleType)
 		{
-			int i = AvmCore::integer(index);
-			uint32 u = (uint32)(i);
+			int32_t i = AvmCore::integer(index);
+			uint32_t u = uint32_t(i);
 			if ((double)u == AvmCore::atomToDouble(index))
 			{
 				setpropertylate_u(obj, u, value);
@@ -775,16 +767,18 @@ namespace avmplus
 
 	void MethodEnv::setpropertyHelper(Atom obj, /* not const */ Multiname *multi, Atom value, VTable *vtable, Atom index)
 	{
-		if ((index&7) == kIntegerType)
+		// the positive-integer case is inlined into setprop_index in jit-calls.h,
+		// this handles the negative case
+		if (atomIsIntptr(index) && atomCanBeInt32(index))
 		{
-			setpropertylate_i(obj, (int)(index>>3), value);
+			setpropertylate_i(obj, (int32_t)atomGetIntptr(index), value);
 			return;
 		}
 
-		if ((index&7) == kDoubleType)
+		if (atomKind(index) == kDoubleType)
 		{
-			int i = AvmCore::integer(index);
-			uint32 u = (uint32)(i);
+			int32_t i = AvmCore::integer(index);
+			uint32_t u = uint32_t(i);
 			if ((double)u == AvmCore::atomToDouble(index))
 			{
 				setpropertylate_u(obj, u, value);
@@ -898,14 +892,15 @@ namespace avmplus
 		}
 		else
 		{
-			VTable *vt = core->newVTable(traits, NULL, this->scope(), this->abcEnv(), toplevel);
-			vt->resolveSignatures();
+			VTable* vt = core->newVTable(traits, NULL, toplevel);
+			ScopeChain* catchScope = this->scope()->cloneWithNewVTable(core->GetGC(), vt, this->abcEnv());
+			vt->resolveSignatures(catchScope);
 			return core->newObject(vt, NULL);
 		}
 	}
 
 #if defined FEATURE_NANOJIT
-	ArrayObject* MethodEnv::createArgumentsHelper(int argc, uint32 *ap)
+	ArrayObject* MethodEnv::createArgumentsHelper(int argc, uint32_t *ap)
 	{
 		// create arguments using argv[1..argc].
 		// Even tho E3 says create an Object, E4 says create an Array so thats what we will do.
@@ -916,12 +911,16 @@ namespace avmplus
 		return createArguments(atomv, argc);
 	}
 
-	ArrayObject* MethodEnv::createRestHelper(int argc, uint32 *ap)
+	ArrayObject* MethodEnv::createRestHelper(int argc, uint32_t *ap)
 	{
 		// create rest Array using argv[param_count..argc]
 		MethodSignaturep ms = get_ms();
 		const int rest_offset = ms->rest_offset();
-		Atom* extra = (Atom*) (rest_offset + (char*)ap);
+		union {
+			char* extra_8;
+			Atom* extra;
+		};
+		extra_8 = (char*)ap + rest_offset;
 		const int param_count = ms->param_count();
 		const int extra_count = argc > param_count ? argc - param_count : 0;
 		return toplevel()->arrayClass->newarray(extra, extra_count);
@@ -929,11 +928,11 @@ namespace avmplus
 
 #endif // FEATURE_NANOJIT
 
-	Atom MethodEnv::getpropertylate_i(Atom obj, int index) const
+	Atom MethodEnv::getpropertylate_i(Atom obj, int32_t index) const
 	{
 		// here we put the case for bind-none, since we know there are no bindings
 		// with numeric names.
-		if ((obj&7) == kObjectType)
+		if (atomKind(obj) == kObjectType)
 		{
 			if (index >= 0)
 			{
@@ -958,11 +957,11 @@ namespace avmplus
 		}
 	}
 
-	Atom MethodEnv::getpropertylate_u(Atom obj, uint32 index) const
+	Atom MethodEnv::getpropertylate_u(Atom obj, uint32_t index) const
 	{
 		// here we put the case for bind-none, since we know there are no bindings
 		// with numeric names.
-		if ((obj&7) == kObjectType)
+		if (atomKind(obj) == kObjectType)
 		{
 			// try dynamic lookup on instance.  even if the traits are sealed,
 			// we might need to search the prototype chain
@@ -981,21 +980,21 @@ namespace avmplus
 
 	ScriptObject* MethodEnv::finddef(const Multiname* multiname) const
 	{
-		Toplevel* toplevel = this->toplevel();
+		// getting toplevel() is slightly more expensive than it used to be (more indirection)...
+		// so only extract in the (rare) event of an exception
 
 		ScriptEnv* script = getScriptEnv(multiname);
 		if (script == (ScriptEnv*)BIND_AMBIGUOUS)
-            toplevel->throwReferenceError(kAmbiguousBindingError, multiname);
+            this->toplevel()->throwReferenceError(kAmbiguousBindingError, multiname);
 
 		if (script == (ScriptEnv*)BIND_NONE)
-            toplevel->throwReferenceError(kUndefinedVarError, multiname);
+			this->toplevel()->throwReferenceError(kUndefinedVarError, multiname);
 
 		ScriptObject* global = script->global;
 		if (!global)
 		{
 			global = script->initGlobal();
-			Atom argv[1] = { global->atom() };
-			script->coerceEnter(0, argv);
+			script->coerceEnter(global->atom());
 		}
 		return global;
 	}
@@ -1011,26 +1010,20 @@ namespace avmplus
 		return se;
 	}
 
-	ScriptObject* MethodEnv::finddefNsset(NamespaceSet* nsset, Stringp name) const
+	/*static*/ ScopeChain* ScriptEnv::createScriptScope(const ScopeTypeChain* stc, VTable* _vtable, AbcEnv* _abcEnv)
 	{
-		Multiname m(nsset);
-		m.setName(name);
-		return finddef(&m);
-	}
-
-	ScriptObject* MethodEnv::finddefNs(Namespace* ns, Stringp name) const
-	{
-		Multiname m(ns, name);
-		return finddef(&m);
+		AvmCore* core = _vtable->core();
+		// NOTE the namespace here is the default xml namespaces. we use the caller's public
+		return ScopeChain::create(core->GetGC(), _vtable, _abcEnv, stc, NULL, core->findPublicNamespace());
 	}
 
 	ScriptObject* ScriptEnv::initGlobal()
 	{
 		// object not defined yet.  define it by running the script that exports it
-		this->_vtable->resolveSignatures();
+		this->vtable()->resolveSignatures(this->scope());
 		// resolving the vtable also resolves the traits, if necessary
 		ScriptObject* delegate = this->toplevel()->objectClass->prototype;
-		return global = this->core()->newObject(this->_vtable, delegate);
+		return global = this->core()->newObject(this->vtable(), delegate);
 	}
 
     ScriptObject* MethodEnv::op_newobject(Atom* sp, int argc) const
@@ -1059,10 +1052,22 @@ namespace avmplus
 
 	Atom MethodEnv::nextname(Atom objAtom, int index) const
 	{
-		if (index <= 0)
+        //  Handle special case inputs;
+        //  bad index returns null,
+        //  null object throws error.
+        if (index <= 0)
+        {
 			return nullStringAtom;
+        }
 
-		switch (objAtom&7)
+        if (AvmCore::isNullOrUndefined(objAtom))
+        {
+            toplevel()->throwTypeError(
+                           (objAtom == undefinedAtom) ? kConvertUndefinedToObjectError :
+                           kConvertNullToObjectError);
+        }
+
+		switch (atomKind(objAtom))
 		{
 		case kObjectType:
 			return AvmCore::atomToScriptObject(objAtom)->nextName(index);
@@ -1076,10 +1081,22 @@ namespace avmplus
 
 	Atom MethodEnv::nextvalue(Atom objAtom, int index) const
 	{
-		if (index <= 0)
+        //  Handle special case inputs;
+        //  bad index returns undefined,
+        //  null object throws error.
+        if (index <= 0)
+        {
 			return undefinedAtom;
+        }
 
-		switch (objAtom&7)
+        if (AvmCore::isNullOrUndefined(objAtom))
+        {
+            toplevel()->throwTypeError(
+                           (objAtom == undefinedAtom) ? kConvertUndefinedToObjectError :
+                           kConvertNullToObjectError);
+        }
+
+		switch (atomKind(objAtom))
 		{
 		case kObjectType:
 			return AvmCore::atomToScriptObject(objAtom)->nextValue(index);
@@ -1098,7 +1115,7 @@ namespace avmplus
 
 		if (!AvmCore::isNullOrUndefined(objAtom))
 		{
-			switch (objAtom&7)
+			switch (atomKind(objAtom))
 			{
 			case kObjectType:
 				return AvmCore::atomToScriptObject(objAtom)->nextNameIndex(index);
@@ -1125,7 +1142,7 @@ namespace avmplus
 		
 		if (!AvmCore::isNullOrUndefined(objAtom))
 		{
-			switch (objAtom&7)
+			switch (atomKind(objAtom))
 			{
 			case kObjectType:
 				{
@@ -1171,175 +1188,30 @@ namespace avmplus
 		return index != 0;
 	}
 	
-	
-	void MethodEnv::mopRangeCheckFailed() const
-	{
-		toplevel()->throwRangeError(kInvalidRangeError);
-	}
-
-	int MethodEnv::li8(int addr) const
-	{
-		const Domain *dom = domainEnv()->domain();
-
-		if(addr < 0 || (uint32)(addr + 1) > dom->globalMemorySize)
-			mopRangeCheckFailed();
-		uint8 result = *(uint8 *)(dom->globalMemoryBase + addr);
-		return result;
-	}
-
-	int MethodEnv::li16(int addr) const
-	{
-		const Domain *dom = domainEnv()->domain();
-
-		if(addr < 0 || (uint32)(addr + 2) > dom->globalMemorySize)
-			mopRangeCheckFailed();
-
-		uint16_t result = *(uint16_t *)(dom->globalMemoryBase + addr);
-
-		MOPS_SWAP_BYTES(&result);
-
-		return result;
-	}
-
-	int MethodEnv::li32(int addr) const
-	{
-		const Domain *dom = domainEnv()->domain();
-
-		if(addr < 0 || (uint32)(addr + 4) > dom->globalMemorySize)
-			mopRangeCheckFailed();
-
-		// TODO is using raw "int" type correct?
-		int32_t result = *(int32_t *)(dom->globalMemoryBase + addr);
-
-		MOPS_SWAP_BYTES(&result);
-
-		return result;
-	}
-
-	double MethodEnv::lf32(int addr) const
-	{
-		const Domain *dom = domainEnv()->domain();
-
-		if(addr < 0 || (uint32)(addr + 4) > dom->globalMemorySize)
-			mopRangeCheckFailed();
-
-		float result = *(float *)(dom->globalMemoryBase + addr);
-
-		MOPS_SWAP_BYTES(&result);
-
-		return result;
-	}
-
-	double MethodEnv::lf64(int addr) const
-	{
-		const Domain *dom = domainEnv()->domain();
-
-		if(addr < 0 || (uint32)(addr + 8) > dom->globalMemorySize)
-			mopRangeCheckFailed();
-
-		double result = *(double *)(dom->globalMemoryBase + addr);
-
-		MOPS_SWAP_BYTES(&result);
-
-		return result;
-	}
-
-	void MethodEnv::si8(int value, int addr) const
-	{
-		const Domain *dom = domainEnv()->domain();
-
-		if(addr < 0 || (uint32)(addr + 1) > dom->globalMemorySize)
-			mopRangeCheckFailed();
-
-		*(uint8 *)(dom->globalMemoryBase + addr) = (uint8)value;
-	}
-
-	void MethodEnv::si16(int value, int addr) const
-	{
-		const Domain *dom = domainEnv()->domain();
-
-		if(addr < 0 || (uint32)(addr + 2) > dom->globalMemorySize)
-			mopRangeCheckFailed();
-
-		uint16 svalue = (uint16)value;
-
-		MOPS_SWAP_BYTES(&svalue);
-
-		*(uint16 *)(dom->globalMemoryBase + addr) = svalue;
-	}
-
-	void MethodEnv::si32(int value, int addr) const
-	{
-		const Domain *dom = domainEnv()->domain();
-
-		if(addr < 0 || (uint32)(addr + 4) > dom->globalMemorySize)
-			mopRangeCheckFailed();
-
-		MOPS_SWAP_BYTES(&value);
-
-		*(int *)(dom->globalMemoryBase + addr) = value;
-	}
-
-	void MethodEnv::sf32(double value, int addr) const
-	{
-		const Domain *dom = domainEnv()->domain();
-
-		if(addr < 0 || (uint32)(addr + 4) > dom->globalMemorySize)
-			mopRangeCheckFailed();
-
-		float fvalue = (float)value;
-
-		MOPS_SWAP_BYTES(&fvalue);
-
-		*(float *)(dom->globalMemoryBase + addr) = fvalue;
-	}
-
-	void MethodEnv::sf64(double value, int addr) const
-	{
-		const Domain *dom = domainEnv()->domain();
-
-		if(addr < 0 || (uint32)(addr + 8) > dom->globalMemorySize)
-			mopRangeCheckFailed();
-
-		MOPS_SWAP_BYTES(&value);
-
-		*(double *)(dom->globalMemoryBase + addr) = value;
-	}
-
 	// see 13.2 creating function objects
     ClassClosure* MethodEnv::newfunction(MethodInfo *function,
 									 ScopeChain* outer,
 									 Atom* scopes) const
     {
-		AvmCore* core = this->core();
+		Toplevel* toplevel = this->toplevel();
+		AvmCore* core = toplevel->core();
 		MMgc::GC* gc = core->GetGC();
-		AbcEnv* abcEnv = this->abcEnv();
 
-		// TODO: if we have already created a function and the scope chain
-		// is the same as last time, re-use the old closure?
+		FunctionClass* functionClass = toplevel->functionClass;
+		VTable* fvtable = functionClass->ivtable();
+		AvmAssert(fvtable->ivtable == NULL || fvtable->ivtable == toplevel->object_ivtable);
+		fvtable->ivtable = toplevel->object_ivtable;
+		AvmAssert(fvtable->linked);
 
-		// declaringTraits must have been filled in by verifier.
-		Traits* ftraits = function->declaringTraits();
-		AvmAssert(ftraits != NULL);
-		AvmAssert(ftraits->scope() != NULL);
-
-		ScopeChain* fscope = ScopeChain::create(core->GetGC(), ftraits->scope(), outer, *core->dxnsAddr);
+		ScopeChain* fscope = ScopeChain::create(gc, fvtable, this->abcEnv(), function->declaringScope(), outer, core->dxns());
 		for (int i=outer->getSize(), n=fscope->getSize(); i < n; i++)
 		{
 			fscope->setScope(gc, i, *scopes++);
 		}
-		//core->console<<"New fscope: "<<fscope->format(core)<<"\n";
 
-		FunctionClass* functionClass = toplevel()->functionClass;
-
-		// the vtable for the new function object
-		VTable* fvtable = core->newVTable(ftraits, functionClass->ivtable(), fscope, abcEnv, toplevel());
-		fvtable->resolveSignatures();
-		FunctionEnv *fenv = new (core->GetGC()) FunctionEnv(function, fvtable);
-		fvtable->ivtable = toplevel()->object_ivtable;
-
-		FunctionObject* c = new (core->GetGC(), fvtable->getExtraSize()) FunctionObject(fvtable, fenv);
-		c->setDelegate( functionClass->prototype );
+		FunctionEnv* fenv = new (gc) FunctionEnv(function, fscope);
+		FunctionObject* c = new (gc, fvtable->getExtraSize()) FunctionObject(fvtable, fenv);
+		c->setDelegate(functionClass->prototype);
 
 		c->createVanillaPrototype();
 		c->prototype->setStringProperty(core->kconstructor, c->atom());
@@ -1364,15 +1236,17 @@ namespace avmplus
 		// adds clarity to what is usually just global$init()
 		SAMPLE_FRAME("[newclass]", core);
 		Toplevel* toplevel = this->toplevel();
+		AbcEnv* abcEnv = this->abcEnv();
 
 		Traits* itraits = ctraits->itraits;
+		const BuiltinType bt = Traits::getBuiltinType(itraits);
 
 		// finish resolving the base class
 		if (!base && itraits->base)
 		{
 			// class has a base but no base object was provided
-			ErrorClass *error = toplevel->typeErrorClass();
-			if( error )
+			ErrorClass* error = toplevel->typeErrorClass();
+			if (error)
 				error->throwError(kConvertNullToObjectError);
 			else
 				toplevel->throwTypeError(kCorruptABCError);
@@ -1384,8 +1258,8 @@ namespace avmplus
 		// make sure the traits of the base vtable matches the base traits
 		if (!((base == NULL && itraits->base == NULL) || (base != NULL && itraitsBase == baseIvtableTraits)))
 		{
-			ErrorClass *error = toplevel->verifyErrorClass();
-			if( error )
+			ErrorClass* error = toplevel->verifyErrorClass();
+			if (error)
 				error->throwError(kInvalidBaseClassError);
 			else
 				toplevel->throwTypeError(kCorruptABCError);
@@ -1394,61 +1268,75 @@ namespace avmplus
 		ctraits->resolveSignatures(toplevel);
 		itraits->resolveSignatures(toplevel);
 
+		VTable* ivtable = core->newVTable(itraits, base ? base->ivtable() : NULL, toplevel);
+		
+		// This is a little weird, as the cvtable should have the ivtable as its base
+		// i.e. Class$ derives from Class
+		VTable* cvbase = (bt == BUILTIN_class) ? ivtable : toplevel->class_ivtable;
+		VTable* cvtable = core->newVTable(ctraits, cvbase, toplevel);
+
 		// class scopechain = [..., class]
-		ScopeChain* cscope = ScopeChain::create(core->GetGC(), ctraits->scope(), outer, *core->dxnsAddr);
+		AvmAssert(ctraits->init != NULL);
+		ScopeChain* cscope = ScopeChain::create(gc, cvtable, abcEnv, ctraits->init->declaringScope(), outer, core->dxns());
 		int i = outer->getSize();
 		for (int n=cscope->getSize(); i < n; i++)
 		{
 			cscope->setScope(gc, i, *scopes++);
 		}
-		//core->console<<"NewClass: "<<ctraits<<"\n";
-		//core->console<<"New cscope: "<<cscope->format(core)<<"\n";
-
-		ScopeChain* iscope = ScopeChain::create(core->GetGC(), itraits->scope(), cscope, *core->dxnsAddr);
-
-		AbcEnv* abcEnv = this->abcEnv();
-		VTable* cvtable = NULL;
-		VTable* ivtable = NULL;
 
 		// Note: iff itraits == class_itraits, we used to use cscope (rather than iscope) for ivtable, 
 		// but that appears to be simply wrong: it doesn't match the expectations of the ScopeTypeChain filled in for Class.
-		ivtable = core->newVTable(itraits, base ? base->ivtable() : NULL, iscope, abcEnv, toplevel);
-		ivtable->resolveSignatures();
-		
-		// special-case Class: the cvtable should have the ivtable as its base
-		// i.e. Class$ derives from Class
-		VTable* cbase = (itraits == core->traits.class_itraits) ? ivtable : toplevel->class_ivtable;
-		cvtable = core->newVTable(ctraits, cbase, cscope, abcEnv, toplevel);
-		// Don't resolve signatures for Object$ until after Class has been set up
-		// which should happen very soon after Object is setup.
-		if (itraits != core->traits.object_itraits)
-			cvtable->resolveSignatures();
+		AvmAssert(itraits->init != NULL);
+		ScopeChain* iscope = ScopeChain::create(gc, ivtable, abcEnv, itraits->init->declaringScope(), cscope, core->dxns());
+		ivtable->resolveSignatures(iscope);
+			// Don't resolve signatures for Object$ until after Class has been set up
+			// which should happen very soon after Object is setup.
+		if (bt != BUILTIN_object)
+			cvtable->resolveSignatures(cscope);
 
 		cvtable->ivtable = ivtable;
 
-		if (itraits == core->traits.object_itraits) 
+		switch (itraits->builtinType)
 		{
-			// we just defined Object
-			toplevel->object_ivtable = ivtable;
+			case BUILTIN_object:
+			{
+				// we just defined Object
+				toplevel->object_ivtable = ivtable;
 
-			// We can finish setting up the toplevel object now that
-			// we have the real Object vtable
-			VTable* toplevel_vtable = toplevel->global()->vtable;
-			toplevel_vtable->base = ivtable;
-			toplevel_vtable->linked = false;
-			toplevel_vtable->resolveSignatures();
-		}
-		else if (itraits == core->traits.class_itraits) 
-		{
-			// we just defined Class
-			toplevel->class_ivtable = ivtable;
-			
-			// Can't run the Object$ initializer until after Class is done since
-			// Object$ needs the real Class vtable as its base
-			VTable* objectclass_ivtable = toplevel->objectClass->vtable;
-			objectclass_ivtable->base = ivtable;
-			objectclass_ivtable->resolveSignatures();
-			objectclass_ivtable->init->coerceEnter(toplevel->objectClass->atom());
+				AvmAssert(toplevel->object_cscope == NULL);
+				// save for later
+				toplevel->object_cscope = cscope;
+
+				// We can finish setting up the toplevel object now that
+				// we have the real Object vtable
+				VTable* toplevel_vtable = toplevel->global()->vtable;
+				toplevel_vtable->base = ivtable;
+				toplevel_vtable->linked = false;
+				toplevel_vtable->resolveSignatures(toplevel->toplevel_scope);
+				break;
+			}
+			case BUILTIN_class:
+			{
+				// we just defined Class
+				toplevel->class_ivtable = ivtable;
+				
+				// Can't run the Object$ initializer until after Class is done since
+				// Object$ needs the real Class vtable as its base
+				VTable* objectclass_cvtable = toplevel->objectClass->vtable;
+				objectclass_cvtable->base = ivtable;
+				objectclass_cvtable->resolveSignatures(toplevel->object_cscope);
+				objectclass_cvtable->init->coerceEnter(toplevel->objectClass->atom());
+				break;
+			}
+			case BUILTIN_vectorobj:
+			{
+				AvmAssert(toplevel->vectorobj_cscope == NULL);
+				AvmAssert(toplevel->vectorobj_iscope == NULL);
+				// save for later
+				toplevel->vectorobj_cscope = cscope;
+				toplevel->vectorobj_iscope = iscope;
+				break;
+			}
 		}
 
 		CreateClassClosureProc createClassClosure = cvtable->traits->getCreateClassClosureProc();
@@ -1474,18 +1362,20 @@ namespace avmplus
 			cc->prototype->setStringProperty(core->kconstructor, cc->atom());
 			cc->prototype->setStringPropertyIsEnumerable(core->kconstructor, false);
 		}
+		
+		if (bt != BUILTIN_class)
+		{
+			AvmAssert(i == iscope->getSize()-1);
+			iscope->setScope(gc, i, cc->atom());
+		}
 
-		AvmAssert(i == iscope->getSize()-1);
-		iscope->setScope(gc, i, cc->atom());
-		//core->console<<"New iscope: "<<iscope->format(core)<<"\n";
 		if (toplevel->classClass)
 		{
 			cc->setDelegate( toplevel->classClass->prototype );
 		}
 
 		// Invoke the class init function.
-		// Don't run it for Object - that has to wait until after Class$
-		// is set up
+		// Don't run it for Object - that has to wait until after Class$ is set up
 		if (cvtable != toplevel->objectClass->vtable)
 			cvtable->init->coerceEnter(cc->atom());
 		return cc;
@@ -1494,17 +1384,21 @@ namespace avmplus
     void MethodEnv::initproperty(Atom obj, const Multiname* multiname, Atom value, VTable* vtable) const
     {
 		Toplevel* toplevel = this->toplevel();
-		Binding b = toplevel->getBinding(vtable->traits, multiname);
+
+		Traitsp declarer = NULL;
+		Binding b = toplevel->getBindingAndDeclarer(vtable->traits, *multiname, declarer);
+
 		if (AvmCore::bindingKind(b) == BKIND_CONST)
 		{
-			if (vtable->init != this)
+			if (this->method != declarer->init.value())
 				toplevel->throwReferenceError(kConstWriteError, multiname, vtable->traits);
+
 			b = AvmCore::makeSlotBinding(AvmCore::bindingToSlotId(b), BKIND_VAR);
 		}
 		toplevel->setproperty_b(obj, multiname, value, vtable, b);
     }
 
-	void MethodEnv::setpropertylate_i(Atom obj, int index, Atom value) const
+	void MethodEnv::setpropertylate_i(Atom obj, int32_t index, Atom value) const
 	{
 		if (AvmCore::isObject(obj))
 		{
@@ -1525,12 +1419,12 @@ namespace avmplus
 			// are sealed and final.  Cannot add dynamic vars to them.
 
 			// throw a ReferenceError exception  Property not found and could not be created.
-			Multiname tempname(core()->publicNamespace, core()->internInt(index));
+			Multiname tempname(core()->getPublicNamespace(method->pool()), core()->internInt(index));
 			toplevel()->throwReferenceError(kWriteSealedError, &tempname, toplevel()->toTraits(obj));
 		}
 	}
 
-	void MethodEnv::setpropertylate_u(Atom obj, uint32 index, Atom value) const
+	void MethodEnv::setpropertylate_u(Atom obj, uint32_t index, Atom value) const
 	{
 		if (AvmCore::isObject(obj))
 		{
@@ -1542,14 +1436,14 @@ namespace avmplus
 			// are sealed and final.  Cannot add dynamic vars to them.
 
 			// throw a ReferenceError exception  Property not found and could not be created.
-			Multiname tempname(core()->publicNamespace, core()->internUint32(index));
+			Multiname tempname(core()->getPublicNamespace(method->pool()), core()->internUint32(index));
 			toplevel()->throwReferenceError(kWriteSealedError, &tempname, toplevel()->toTraits(obj));
 		}
 	}
 
 	Atom MethodEnv::callsuper(const Multiname* multiname, int argc, Atom* atomv) const
 	{
-		VTable* base = this->_vtable->base;
+		VTable* base = this->vtable()->base;
 		Toplevel* toplevel = this->toplevel();
 		Binding b = toplevel->getBinding(base->traits, multiname);
 		switch (AvmCore::bindingKind(b))
@@ -1559,41 +1453,31 @@ namespace avmplus
 
 		case BKIND_METHOD:
 		{
-			#ifdef DEBUG_EARLY_BINDING
-			core()->console << "callsuper method " << base->traits << " " << multiname->name << "\n";
-			#endif
 			MethodEnv* superenv = base->methods[AvmCore::bindingToMethodId(b)];
 			return superenv->coerceEnter(argc, atomv);
 		}
 		case BKIND_VAR:
 		case BKIND_CONST:
 		{
-			#ifdef DEBUG_EARLY_BINDING
-			core()->console << "callsuper slot " << base->traits << " " << multiname->name << "\n";
-			#endif
-			uint32 slot = AvmCore::bindingToSlotId(b);
-			Atom method = AvmCore::atomToScriptObject(atomv[0])->getSlotAtom(slot);
-			return toplevel->op_call(method, argc, atomv);
+			uint32_t slot = AvmCore::bindingToSlotId(b);
+			ScriptObject* method = AvmCore::atomToScriptObject(atomv[0])->getSlotObject(slot);
+			// inlined equivalent of op_call
+			if (!method)
+				toplevel->throwTypeErrorWithName(kCallOfNonFunctionError, "value");
+			return method->call(argc, atomv);
 		}
 		case BKIND_SET:
 		{
-			#ifdef DEBUG_EARLY_BINDING
-			core()->console << "callsuper setter " << base->traits << " " << multiname->name << "\n";
-			#endif
 			// read on write-only property
 			toplevel->throwReferenceError(kWriteOnlyError, multiname, base->traits);
 		}
 		case BKIND_GET:
 		case BKIND_GETSET:
 		{
-			#ifdef DEBUG_EARLY_BINDING
-			core()->console << "callsuper getter " << base->traits << " " << multiname->name << "\n";
-			#endif
 			// Invoke the getter
 			int m = AvmCore::bindingToGetterId(b);
 			MethodEnv *f = base->methods[m];
-			Atom atomv_out[1] = { atomv[0] };
-			Atom method = f->coerceEnter(0, atomv_out);
+			Atom method = f->coerceEnter(atomv[0]);
 			return toplevel->op_call(method, argc, atomv);
 		}
 		}
@@ -1609,7 +1493,7 @@ namespace avmplus
 			if (b == BIND_NONE) 
 			{
 				bool b = AvmCore::atomToScriptObject(obj)->deleteMultinameProperty(multiname);
-#ifdef AVMPLUS_WORD_CODE
+#ifdef VMCFG_LOOKUP_CACHE
 				// Deleting a deletable bound property means deleting a dynamic global property, so
 				// invalidate the lookup cache (because subsequent lookups should fail).
 				if (b)
@@ -1619,7 +1503,7 @@ namespace avmplus
 			}
 			else if (AvmCore::isMethodBinding(b))
 			{
-				if (multiname->contains(core()->publicNamespace) && toplevel->isXmlBase(obj))
+				if (AvmCore::isXMLorXMLList(obj) && multiname->containsAnyPublicNamespace())
 				{
 					// dynamic props should hide declared methods on delete
 					ScriptObject* so = AvmCore::atomToScriptObject(obj);
@@ -1638,7 +1522,7 @@ namespace avmplus
 	
     Atom MethodEnv::getsuper(Atom obj, const Multiname* multiname) const
     {
-		VTable* vtable = this->_vtable->base;
+		VTable* vtable = this->vtable()->base;
 		Toplevel* toplevel = this->toplevel();
 		Binding b = toplevel->getBinding(vtable->traits, multiname);
         switch (AvmCore::bindingKind(b))
@@ -1648,9 +1532,6 @@ namespace avmplus
 
 		case BKIND_METHOD: 
 		{
-			#ifdef DEBUG_EARLY_BINDING
-			core->console << "getsuper method " << vtable->traits << " " << multiname->name << "\n";
-			#endif
 			// extracting a virtual method
 			MethodEnv *m = vtable->methods[AvmCore::bindingToMethodId(b)];
 			return toplevel->methodClosureClass->create(m, obj)->atom();
@@ -1658,30 +1539,20 @@ namespace avmplus
 
         case BKIND_VAR:
         case BKIND_CONST:
-			#ifdef DEBUG_EARLY_BINDING
-			core->console << "getsuper slot " << vtable->traits << " " << multiname->name << "\n";
-			#endif
 			return AvmCore::atomToScriptObject(obj)->getSlotAtom(AvmCore::bindingToSlotId(b));
 
 		case BKIND_SET:
 		{
-			#ifdef DEBUG_EARLY_BINDING
-			core->console << "getsuper setter " << vtable->traits << " " << multiname->name << "\n";
-			#endif
 			// read on write-only property
 			toplevel->throwReferenceError(kWriteOnlyError, multiname, vtable->traits);
 		}
 		case BKIND_GET:
 		case BKIND_GETSET:
 		{
-			#ifdef DEBUG_EARLY_BINDING
-			core->console << "getsuper getter " << vtable->traits << " " << multiname->name << "\n";
-			#endif
 			// Invoke the getter
 			int m = AvmCore::bindingToGetterId(b);
 			MethodEnv *f = vtable->methods[m];
-			Atom atomv_out[1] = { obj };
-			return f->coerceEnter(0, atomv_out);
+			return f->coerceEnter(obj);
 		}
 		}
     }
@@ -1689,7 +1560,7 @@ namespace avmplus
 	
     void MethodEnv::setsuper(Atom obj, const Multiname* multiname, Atom value) const
     {
-		VTable* vtable = this->_vtable->base;
+		VTable* vtable = this->vtable()->base;
 		Toplevel* toplevel = this->toplevel();
 		Binding b = toplevel->getBinding(vtable->traits, multiname);
         switch (AvmCore::bindingKind(b))
@@ -1704,26 +1575,18 @@ namespace avmplus
 			toplevel->throwReferenceError(kCannotAssignToMethodError, multiname, vtable->traits);
 
 		case BKIND_GET: 
-			#ifdef DEBUG_EARLY_BINDING
-			core()->console << "setsuper getter " << vtable->traits << " " << multiname->name << "\n";
-			#endif
 			toplevel->throwReferenceError(kConstWriteError, multiname, vtable->traits);
 
 		case BKIND_VAR:
-			#ifdef DEBUG_EARLY_BINDING
-			core()->console << "setsuper slot " << vtable->traits << " " << multiname->name << "\n";
-			#endif
-			AvmCore::atomToScriptObject(obj)->setSlotAtom(AvmCore::bindingToSlotId(b), value);
+			// @todo, this does a redundant coercion -- no harm done, just slightly more work than necessary
+			AvmCore::atomToScriptObject(obj)->coerceAndSetSlotAtom(AvmCore::bindingToSlotId(b), value);
             return;
 
 		case BKIND_SET: 
 		case BKIND_GETSET: 
 		{
-			#ifdef DEBUG_EARLY_BINDING
-			core()->console << "setsuper setter " << vtable->traits << " " << multiname->name << "\n";
-			#endif
 			// Invoke the setter
-			uint32 m = AvmCore::bindingToSetterId(b);
+			uint32_t m = AvmCore::bindingToSetterId(b);
 			AvmAssert(m < vtable->traits->getTraitsBindings()->methodCount);
 			MethodEnv* method = vtable->methods[m];
 			Atom atomv_out[2] = { obj, value };
@@ -1737,7 +1600,7 @@ namespace avmplus
 	Atom MethodEnv::findWithProperty(Atom atom, const Multiname* multiname)
 	{
 		Toplevel* toplevel = this->toplevel();
-		if ((atom&7)==kObjectType)
+		if (atomKind(atom)==kObjectType)
 		{
 			// usually scope objects are ScriptObject's
 
@@ -1885,19 +1748,26 @@ namespace avmplus
 
 		// now we have searched all the scopes, except global
 		{
-			ScriptObject* global = AvmCore::atomToScriptObject(outer->getSize() > 0 ? outer->getScope(0) : *scopes);
-			ScriptObject* obj = findglobalproperty(global, multiname);
-			if (obj == NULL) {
+			Atom global = outer->getSize() > 0 ? outer->getScope(0) : *scopes;
+			Atom obj = findglobalproperty(global, multiname);
+			if (AvmCore::isNullOrUndefined(obj)) {
 				if (strict)
 					toplevel->throwReferenceError(kUndefinedVarError, multiname);
 				obj = global;
 			}
-			return obj->atom();
+			return obj;
 		}
+
 	}
 	
-	ScriptObject* MethodEnv::findglobalproperty(ScriptObject* target_global, const Multiname* multiname)
+	Atom MethodEnv::findglobalproperty(Atom target_global, const Multiname* multiname)
 	{
+		// in theory, anyname shouldn't get passed to us, but in practice, sometimes it does.
+		// it will always fail later on, but will generate an assert further downstream,
+		// so let's just check and bail now.
+		if (multiname->isAnyName())
+			return nullObjectAtom;
+
 		Toplevel* toplevel = this->toplevel();
 		
 		// look for imported definition (similar logic to OP_finddef).  This will
@@ -1912,35 +1782,34 @@ namespace avmplus
 			if (global == NULL)
 			{
 				global = script->initGlobal();
-				Atom argv[1] = { script->global->atom() };
-				script->coerceEnter(0, argv);
+				script->coerceEnter(script->global->atom());
 			}
-			return global;
+			return global->atom();
 		}
 
 		// no imported definition found.  look for dynamic props
 		// on the global object
 
-		ScriptObject* global = target_global;
-
 		// search the delegate chain for a value.  The delegate
 		// chain for the global object will only contain vanilla
 		// objects (Object.prototype) so we can skip traits
 
-		ScriptObject* o = global;
+		ScriptObject* o = AvmCore::isObject(target_global) ? 
+            AvmCore::atomToScriptObject(target_global) : 
+            toplevel->toPrototype(target_global);
 		do
 		{
 			if (o->hasMultinameProperty(multiname))
-				return global;
+				return target_global;
 		}
 		while ((o = o->getDelegate()) != NULL);
 
-		return NULL;
+		return nullObjectAtom;
     }
 
 	Namespace* MethodEnv::internRtns(Atom nsAtom)
 	{
-		if (((nsAtom&7) != kNamespaceType) || AvmCore::isNull(nsAtom))
+		if ((atomKind(nsAtom) != kNamespaceType) || AvmCore::isNull(nsAtom))
 			toplevel()->throwTypeError(kIllegalNamespaceError);
 		return core()->internNamespace(AvmCore::atomToNamespace(nsAtom));
 	}
@@ -1978,39 +1847,14 @@ namespace avmplus
 		}
 	}
 
-	Atom MethodEnv::getdescendantslate(Atom obj, Atom index, bool attr)
-	{
-		if (AvmCore::isObject(index))
-		{
-			ScriptObject* i = AvmCore::atomToScriptObject(index);
-			if (i->traits() == core()->traits.qName_itraits)
-			{
-				QNameObject* qname = (QNameObject*) i;
-				Multiname n2;
-				qname->getMultiname(n2);
-				if (attr)
-					n2.setAttr(attr);
-				return getdescendants(obj, &n2);
-			}
-		}
-
-		// convert index to string
-
-		AvmCore* core = this->core();
-		Multiname name(core->publicNamespace, core->intern(index));
-		if (attr)
-			name.setAttr();
-		return getdescendants(obj, &name);
-	}
-
 	void MethodEnv::checkfilter(Atom obj)
 	{
-		if ( !toplevel()->isXmlBase(obj) )
+		if ( !AvmCore::isXMLorXMLList(obj) )
 		{
-			toplevel()->throwTypeError(kFilterError, core()->toErrorString(toplevel()->toTraits(obj)));
+			Toplevel* toplevel = this->toplevel();
+			toplevel->throwTypeError(kFilterError, core()->toErrorString(toplevel->toTraits(obj)));
 		}
 	}
-
 		
 	/**
 	 * implements ECMA implicit coersion.  returns the coerced value,
@@ -2026,10 +1870,10 @@ namespace avmplus
 		if (AvmCore::isNullOrUndefined(atom))
 			return NULL;
 
-		if ((atom&7) == kObjectType)
+		if (atomKind(atom) == kObjectType)
 		{
 			ScriptObject* so = AvmCore::atomToScriptObject(atom);
-			if (so->traits()->containsInterface(expected))
+			if (so->traits()->subtypeof(expected))
 			{
 				return so;
 			}
@@ -2043,23 +1887,61 @@ namespace avmplus
 		return NULL;
     }
 
-	VTable *MethodEnv::getActivation()
+	VTable* MethodEnv::buildActivationVTable()
 	{
-		int type = getType();
-		switch(type)
+		const ScopeTypeChain* activationScopeTraits = method->activationScope();
+
+		Toplevel* toplevel = this->toplevel();
+
+		// This can happen when the ABC has MethodInfo data but not MethodBody data
+		if (!activationScopeTraits)
 		{
-		case kActivation:
-			return (VTable *)(activationOrMCTable&~7);
-		case kActivationMethodTablePair:
-			return getPair()->activation;
-		default:
-			return NULL;
+			toplevel->throwVerifyError(kCorruptABCError);
 		}
+		
+		Traits* activationTraits = activationScopeTraits->traits();
+		AvmAssert(activationTraits != NULL);
+		
+		AvmCore* core = this->core();
+		VTable* activation = core->newVTable(activationTraits, NULL, toplevel);
+		ScopeChain* activationScope = this->scope()->cloneWithNewVTable(core->GetGC(), activation, this->abcEnv(), activationScopeTraits);
+		activation->resolveSignatures(activationScope);
+		return activation;
+	}
+
+	VTable* MethodEnv::getActivationVTable()
+	{
+		if (!method->needActivation())
+			return NULL;
+
+		VTable* activation;
+		const int type = getType();
+		if (!activationOrMCTable)
+		{
+			activation = buildActivationVTable();		
+			setActivationOrMCTable(activation, kActivation);
+		}
+		else if (type == kMethodTable)
+		{
+			activation = buildActivationVTable();		
+			ActivationMethodTablePair *amtp = new (core()->GetGC()) ActivationMethodTablePair(activation, getMethodClosureTable());					
+			setActivationOrMCTable(amtp, kActivationMethodTablePair);
+		}
+		else if (type == kActivationMethodTablePair)
+		{
+			activation = getPair()->activation;
+		}
+		else
+		{
+			activation = (VTable*)(activationOrMCTable&~7);
+		}
+		AvmAssert(activation != NULL);
+		return activation;
 	}
 
     ScriptObject *MethodEnv::newActivation()
     {
-        VTable *vtable = getActivation();
+        VTable *vtable = getActivationVTable();
 		AvmCore *core = this->core();
         MMgc::GC *gc = core->GetGC();
 		SAMPLE_FRAME("[activation-object]", core);
@@ -2082,7 +1964,7 @@ namespace avmplus
 		else if(type == kActivation)
 		{
 			WeakKeyHashtable *wkh = new (core()->GetGC()) WeakKeyHashtable(core()->GetGC());
-			ActivationMethodTablePair *amtp = new (core()->GetGC()) ActivationMethodTablePair(getActivation(), wkh);					
+			ActivationMethodTablePair *amtp = new (core()->GetGC()) ActivationMethodTablePair(getActivationVTable(), wkh);					
 			setActivationOrMCTable(amtp, kActivationMethodTablePair);
 			return wkh;
 		}
@@ -2092,4 +1974,11 @@ namespace avmplus
 		}
 		return (WeakKeyHashtable*)(activationOrMCTable&~7);
 	}
+
+#ifdef _DEBUG
+	void FASTCALL check_unbox(MethodEnv* env, bool u)
+	{
+		AvmAssert((env->method->unboxThis() != 0) == u); 
+	}
+#endif
 }

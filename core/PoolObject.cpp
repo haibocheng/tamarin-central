@@ -38,29 +38,35 @@
 
 #include "avmplus.h"
 
+#ifdef VMCFG_NANOJIT
+#  include "CodegenLIR.h"
+#endif
+
 namespace avmplus
 {
-	PoolObject::PoolObject(AvmCore* core, ScriptBuffer& sb, const byte* startPos) :
+	PoolObject::PoolObject(AvmCore* core, ScriptBuffer& sb, const byte* startPos, uint32_t api) :
 		core(core),
 		cpool_int(0),
 		cpool_uint(0),
 		cpool_double(core->GetGC(), 0),
-		cpool_string(core->GetGC(), 0),
 		cpool_ns(core->GetGC(), 0),
 		cpool_ns_set(core->GetGC(), 0),
 #ifndef AVMPLUS_64BIT
 		cpool_int_atoms(core->GetGC(), 0),
 		cpool_uint_atoms(core->GetGC(), 0),
 #endif
-		cpool_mn(0),
+		cpool_mn_offsets(0),
 		metadata_infos(0),
-		scripts(core->GetGC(), 0),
 		bugFlags(0),
 		_namedTraits(new(core->GetGC()) MultinameHashtable()),
 		_privateNamedScripts(new(core->GetGC()) MultinameHashtable()),
 		_code(sb.getImpl()),
 		_abcStart(startPos),
+		_abcStringStart(NULL),
+		_abcStringEnd(NULL),
+		_abcStrings(core->GetGC()),
 		_classes(core->GetGC(), 0),
+		_scripts(core->GetGC(), 0),
 		_methods(core->GetGC(), 0)
 #ifdef DEBUGGER
 		, _method_dmi(core->GetGC(), 0)
@@ -68,17 +74,63 @@ namespace avmplus
 #if VMCFG_METHOD_NAMES
 		, _method_name_indices(0)
 #endif
+		, api(api)
+#ifdef VMCFG_AOT
+		, aotInfo(NULL)
+#endif
 	{
 		version = AvmCore::readU16(&code()[0]) | AvmCore::readU16(&code()[2])<<16;
+		core->addLivePool(this);
+		core->setActiveAPI(api);
 	}
 
 	PoolObject::~PoolObject()
 	{
-		#ifdef AVMPLUS_WORD_CODE
-		delete word_code.cpool_mn;
+		#ifdef VMCFG_PRECOMP_NAMES
+		delete precompNames;
+		#endif
+
+		#ifdef VMCFG_NANOJIT
+		mmfx_delete( codeMgr );
 		#endif
 	}
 	
+	void PoolObject::dynamicizeStrings()
+	{
+		if (!MMgc::GC::GetGC(this)->Destroying())
+		{
+			// make all strings created so far dynamic,
+			// making sure that no pointers into ABC data persist
+			// (string 0 is always core->kEmptyString: skip it)
+			ConstantStringData* dataP = _abcStrings.data;
+			for (uint32_t i = 1; i < constantStringCount; i++)
+			{
+				++dataP;
+				
+				if (dataP->abcPtr >= _abcStringStart && dataP->abcPtr < _abcStringEnd)
+				{
+					// it's still a raw ABC ptr, not a String
+					continue;
+				}
+
+				Stringp s = dataP->str;
+
+				// in theory, only index 0 should be the empty string... but in practice,
+				// any index could be empty, and makeDynamic doesn't work on zero-length strings.
+				// since that call doesn't have easy access to an AvmCore, do the check here.
+                // (s can be null in the obscure case of a fuzzed ABC)
+				if (!s || s->isEmpty())
+				{
+					// all zero-length strings should be kEmptyString.
+					AvmAssert(!s || s == core->kEmptyString);
+					continue;
+				}
+				
+				s->makeDynamic(_abcStringStart, uint32_t(_abcStringEnd - _abcStringStart));
+			}
+		}
+	}
+
 	Traits* PoolObject::getBuiltinTraits(Stringp name) const
 	{
 		AvmAssert(BIND_NONE == 0);
@@ -98,7 +150,7 @@ namespace avmplus
 
 	Traits* PoolObject::getTraits(Stringp name, bool recursive/*=true*/) const
 	{
-		return getTraits(name, core->publicNamespace, recursive);
+		return getTraits(name, core->getPublicNamespace((PoolObject*) this), recursive);
 	}
 
 	Traits* PoolObject::getTraits(const Multiname& mname, const Toplevel* toplevel, bool recursive/*=true*/) const
@@ -109,7 +161,7 @@ namespace avmplus
 		if (mname.isBinding())
 		{
 			// multiname must not be an attr name, have wildcards, or have runtime parts.
-			for (int i=0, n=mname.namespaceCount(); i < n; i++)
+			for (int32_t i=0, n=mname.namespaceCount(); i < n; i++)
 			{
 				Traits* t = getTraits(mname.getName(), mname.getNamespace(i), recursive);
 				if (t != NULL)
@@ -136,19 +188,37 @@ namespace avmplus
 		_namedTraits->add(name, ns, (Binding)traits);
 	}
 
-	Namespace* PoolObject::getNamespace(int index) const
+	Namespace* PoolObject::getNamespace(int32_t index) const
 	{
 		return cpool_ns[index];  
 	}
 
-	NamespaceSetp PoolObject::getNamespaceSet(int index) const
+	NamespaceSetp PoolObject::getNamespaceSet(int32_t index) const
 	{
 		return cpool_ns_set[index];  
 	}
 
-	Stringp PoolObject::getString(int index) const
+	////////////////////////////////////////////////////////////////////
+
+	void PoolObject::setupConstantStrings(uint32_t count)
 	{
-		return cpool_string[index];  
+		_abcStrings.setup(count);
+		constantStringCount = count;
+	}
+
+	Stringp PoolObject::getString(int32_t index) const
+	{
+		ConstantStringData* dataP = _abcStrings.data + index;
+		if (dataP->abcPtr >= _abcStringStart && dataP->abcPtr < _abcStringEnd)
+		{
+			// String not created yet; grab the pointer to the (verified) ABC data
+			uint32_t len = AvmCore::readU30(dataP->abcPtr);
+			Stringp s = core->internStringUTF8((const char*) dataP->abcPtr, len, true);
+			// must be made sticky for now...
+			s->Stick();
+			dataP->str = s;
+		}
+		return dataP->str;
 	}
 
 	/*static*/ bool PoolObject::isLegalDefaultValue(BuiltinType bt, Atom value)
@@ -175,7 +245,7 @@ namespace avmplus
 						return true;
 				}
 
-				return AvmCore::isInteger(value);
+				return atomIsIntptr(value) && atomCanBeUint32(value);
 
 			case BUILTIN_int:
 				if (AvmCore::isDouble(value))
@@ -185,7 +255,7 @@ namespace avmplus
 						return true;
 				}
 
-				return AvmCore::isInteger(value);
+				return atomIsIntptr(value) && atomCanBeInt32(value);
 
 			case BUILTIN_string:
 				return AvmCore::isNull(value) || AvmCore::isString(value);
@@ -200,7 +270,7 @@ namespace avmplus
 		//return false; // unreachable
 	}
 
-	Atom PoolObject::getLegalDefaultValue(const Toplevel* toplevel, uint32 index, CPoolKind kind, Traits* t) 
+	Atom PoolObject::getLegalDefaultValue(const Toplevel* toplevel, uint32_t index, CPoolKind kind, Traits* t) 
 	{
 		// toplevel actually can be null, when resolving the builtin classes...
 		// but they should never cause verification errors in functioning builds
@@ -221,7 +291,7 @@ namespace avmplus
 				const int32_t i = cpool_int[index];
 #ifdef AVMPLUS_64BIT
 				value = core->intToAtom(i);
-				AvmAssert(AvmCore::isInteger(value));
+				AvmAssert(atomIsIntptr(value) && atomCanBeInt32(value));
 #else
 				// LIR relies on the return values from this being "sticky" so it can insert them inline.
 				// that's true for everything but int/uints that overflow, so special-case them.
@@ -257,7 +327,7 @@ namespace avmplus
 				const int32_t u = cpool_int[index];
 #ifdef AVMPLUS_64BIT
 				value = core->uintToAtom(u);
-				AvmAssert(AvmCore::isInteger(value));
+				AvmAssert(atomIsIntptr(value) && atomCanBeUint32(value));
 #else
 				// LIR relies on the return values from this being "sticky" so it can insert them inline.
 				// that's true for everything but int/uints that overflow, so special-case them.
@@ -295,7 +365,7 @@ namespace avmplus
 			case CONSTANT_Utf8:
 				if (index >= (maxcount = constantStringCount))
 					goto range_error;
-				value = cpool_string[index]->atom();
+				value = getString(index)->atom();
 				break;
 
 			case CONSTANT_True:
@@ -342,7 +412,7 @@ namespace avmplus
 					break;
 				case BUILTIN_int:
 				case BUILTIN_uint:
-					value = (0|kIntegerType);
+					value = (zeroIntAtom);
 					break;
 				case BUILTIN_string:
 					value = nullStringAtom;
@@ -367,7 +437,7 @@ illegal_default_error:
 		{
 			if (t)
 			{
-				toplevel->throwVerifyError(kIllegalDefaultValue, core->toErrorString(Multiname(t->ns, t->name)));
+				toplevel->throwVerifyError(kIllegalDefaultValue, core->toErrorString(Multiname(t->ns(), t->name())));
 			}
 			else
 			{
@@ -390,7 +460,7 @@ range_error:
 		// any checking here, we just fill in the Multiname object
 		// with the information we have parsed.
 
-		int index;
+		int32_t index;
 		CPoolKind kind = (CPoolKind) *(pos++);
         switch (kind)
         {
@@ -458,7 +528,6 @@ range_error:
 			index = AvmCore::readU30(pos);
 			AvmAssert(index != 0);
 			m.setNsset(getNamespaceSet(index));
-
 			m.setAttr(kind==CONSTANT_MultinameA);
 			break;
 		}
@@ -479,8 +548,7 @@ range_error:
 		case CONSTANT_TypeName:
 		{
 			index = AvmCore::readU30(pos);
-			Atom a = cpool_mn[index];
-			parseMultiname(atomToPos(a), m);
+			parseMultiname(_abcStart + cpool_mn_offsets[index], m);
 			index = AvmCore::readU30(pos);
 			AvmAssert(index==1);
 			m.setTypeParameter(AvmCore::readU30(pos));
@@ -497,15 +565,16 @@ range_error:
 
 	void PoolObject::resolveQName(uint32_t index, Multiname &m, const Toplevel* toplevel) const
 	{
-		if (index == 0 || index >= constantMnCount)
+		if (index == 0 || index >= cpool_mn_offsets.size())
 		{
 			if (toplevel)
-				toplevel->throwVerifyError(kCpoolIndexRangeError, core->toErrorString(index), core->toErrorString(constantMnCount));
+				toplevel->throwVerifyError(kCpoolIndexRangeError, core->toErrorString(index), core->toErrorString(cpool_mn_offsets.size()));
 			AvmAssert(!"unhandled verify error");
 		}
 
-		parseMultiname(cpool_mn[index], m);
-		if (!m.isQName())
+		parseMultiname(m, index);
+
+		if (!isBuiltin && !m.isQName())
 		{
 			if (toplevel)
 				toplevel->throwVerifyError(kCpoolEntryWrongTypeError, core->toErrorString(index));
@@ -513,7 +582,7 @@ range_error:
 		}
 	}
 
-	Traits* PoolObject::resolveTypeName(uint32 index, const Toplevel* toplevel, bool allowVoid/*=false*/) const
+	Traits* PoolObject::resolveTypeName(uint32_t index, const Toplevel* toplevel, bool allowVoid/*=false*/) const
 	{
 		// only save the type name for now.  verifier will resolve to traits
 		if (index == 0)
@@ -522,16 +591,16 @@ range_error:
 		}
 
 		// check contents is a multiname.  in the cpool, and type system, kObjectType means multiname.
-		if (index >= constantMnCount)
+		if (index >= cpool_mn_offsets.size())
 		{
 			if (toplevel)
-				toplevel->throwVerifyError(kCpoolIndexRangeError, core->toErrorString(index), core->toErrorString(constantMnCount));
+				toplevel->throwVerifyError(kCpoolIndexRangeError, core->toErrorString(index), core->toErrorString(cpool_mn_offsets.size()));
 			AvmAssert(!"unhandled verify error");
 		}
 
 		Multiname m;
-		parseMultiname(cpool_mn[index], m);
-
+		parseMultiname(m, index);
+		
 		Traits* t = getTraits(m, toplevel);
 		if(m.isParameterizedType())
 		{
@@ -581,12 +650,12 @@ range_error:
 				default:
 				{
 					Stringp fullname = VectorClass::makeVectorClassName(core, param_traits);
-					r = getTraits(Multiname(base->ns, fullname), toplevel);
+					r = param_traits->pool->getTraits(Multiname(base->ns(), fullname), toplevel);
 
 					if (!r)
 					{
-						r = core->traits.vectorobj_itraits->newParameterizedITraits(fullname, base->ns);
-						core->traits.vector_itraits->pool->domain->addNamedTrait(fullname, base->ns, r);
+						r = core->traits.vectorobj_itraits->newParameterizedITraits(fullname, base->ns());
+						param_traits->pool->domain->addNamedTrait(fullname, base->ns(), r);
 					}
 					break;
 				}
@@ -610,19 +679,22 @@ range_error:
 		return f;
 	}
 	
-#ifdef AVMPLUS_WORD_CODE
+#ifdef VMCFG_PRECOMP_NAMES
 	void PoolObject::initPrecomputedMultinames()
 	{
-		if (this->word_code.cpool_mn == NULL)
-			this->word_code.cpool_mn = new (sizeof(PrecomputedMultinames) + (this->constantMnCount - 1)*sizeof(Multiname)) PrecomputedMultinames(core->GetGC(), this);
-	}
+		if (this->precompNames == NULL)
+        {
+            size_t const s = sizeof(PrecomputedMultinames) - sizeof(Multiname) + this->cpool_mn_offsets.size() * sizeof(Multiname);
+			this->precompNames = new (s) PrecomputedMultinames(core->GetGC(), this);
+        }
+    }
 
 	PrecomputedMultinames::PrecomputedMultinames(MMgc::GC* gc, PoolObject* pool)
 		: MMgc::GCRoot(gc)
 		, nNames (0)
 	{
-		nNames = pool->constantMnCount;
-		for ( uint32 i=1 ; i < nNames ; i++ ) {
+		nNames = pool->cpool_mn_offsets.size();
+		for (uint32_t i=1; i < nNames; i++) {
 			Multiname mn;
 			pool->parseMultiname(mn, i);
 			mn.IncrementRef();
@@ -631,7 +703,7 @@ range_error:
 	}
 	
 	PrecomputedMultinames::~PrecomputedMultinames() {
-		for ( uint32 i=1 ; i < nNames ; i++ ) 
+		for (uint32_t i=1; i < nNames; i++) 
 			multinames[i].DecrementRef();
 	}
 #endif
@@ -649,14 +721,14 @@ range_error:
 			}
 			else
 			{
-#ifdef AVMPLUS_WORD_CODE
+#ifdef VMCFG_PRECOMP_NAMES
 				// PrecomputedMultinames may not be inited yet, but we'll need them eventually,
 				// so go ahead and init them now
 				this->initPrecomputedMultinames();
-				const Multiname& mn = this->word_code.cpool_mn->multinames[-index];
+				const Multiname& mn = this->precompNames->multinames[-index];
 #else
 				Multiname mn;
-				this->parseMultiname(this->cpool_mn[-index], mn);
+				this->parseMultiname(mn, -index);
 #endif
 				name = Multiname::format(core, mn.getNamespace(), mn.getName());
 			}

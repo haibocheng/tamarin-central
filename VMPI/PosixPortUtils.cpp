@@ -37,12 +37,17 @@
 
 #include "avmplus.h"
 
+#include <stdlib.h>
 #include <sys/time.h>
 #include <math.h> 
 
 #ifdef AVMPLUS_UNIX
 	#include <time.h>
 #endif // AVMPLUS_UNIX
+
+#ifdef AVMPLUS_MAC
+	#include <malloc/malloc.h>
+#endif //AVMPLUS_MAC
 
 #include <sys/mman.h>
 
@@ -134,8 +139,17 @@ void VMPI_free(void* ptr)
 	free(ptr);
 }
 
+size_t VMPI_size(void *ptr)
+{
+#ifdef AVMPLUS_MAC
+	return malloc_size(ptr);
+#else
+	(void)ptr;
+	return 0;
+#endif
+}
 
-typedef int (*LoggingFunction)(const char*);
+typedef void (*LoggingFunction)(const char*);
 
 LoggingFunction logFunc = NULL;
 
@@ -146,7 +160,17 @@ void RedirectLogOutput(LoggingFunction func)
 
 void VMPI_log(const char* message)
 {
-	logFunc ? logFunc(message) : printf("%s",message);
+	if(logFunc)
+		logFunc(message);
+	else
+		printf("%s",message);
+}
+
+bool VMPI_isMemoryProfilingEnabled()
+{
+	//read the mmgc profiling option switch
+	const char *env = getenv("MMGC_PROFILE");
+	return (env && (VMPI_strncmp(env, "1", 1) == 0));
 }
 
 /**
@@ -163,10 +187,11 @@ void VMPI_setPageProtection(void *address,
 							bool executableFlag,
 							bool writeableFlag)
 {
+  int bitmask = sysconf(_SC_PAGESIZE) - 1;
   // mprotect requires that the addresses be aligned on page boundaries
   void *endAddress = (void*) ((char*)address + size);
-  void *beginPage = (void*) ((size_t)address & ~0xFFF);
-  void *endPage   = (void*) (((size_t)endAddress + 0xFFF) & ~0xFFF);
+  void *beginPage = (void*) ((size_t)address & ~bitmask);
+  void *endPage   = (void*) (((size_t)endAddress + bitmask) & ~bitmask);
   size_t sizePaged = (size_t)endPage - (size_t)beginPage;
   
   int flags = PROT_READ;
@@ -179,4 +204,10 @@ void VMPI_setPageProtection(void *address,
   int retval = mprotect((maddr_ptr)beginPage, (unsigned int)sizePaged, flags);
   AvmAssert(retval == 0);
   (void)retval;
+}
+
+
+const char *VMPI_getenv(const char *name)
+{
+	return getenv(name);
 }

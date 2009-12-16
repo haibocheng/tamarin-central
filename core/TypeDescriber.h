@@ -64,6 +64,8 @@ namespace avmplus
 			HIDE_OBJECT				= 0x0400
 		};
 		ScriptObject* describeType(Atom value, uint32_t flags);
+		Stringp getQualifiedClassName(Atom value);
+		Stringp getQualifiedSuperclassName(Atom value);
 
 	private:
 		enum StringId
@@ -107,6 +109,7 @@ namespace avmplus
 
 	private:
 	
+		Traits* chooseTraits(Atom value, uint32_t flags);
 		ScriptObject* new_object();
 		ArrayObject* new_array();
 		Traitsp getTraits(Atom value);
@@ -118,6 +121,7 @@ namespace avmplus
 		Stringp poolstr(PoolObject* pool, uint32_t index);
 		void setpropmulti(ScriptObject* o, const KVPair* kv, uint32_t count);
 		Stringp str(StringId i);
+		static void addBindings(AvmCore* core, MultinameHashtable* bindings, TraitsBindingsp tb, uint32_t flags);
 		
 	private:
 		Toplevel* m_toplevel;

@@ -43,18 +43,66 @@
 // VMPI.h includes avmfeatures.h, which detects platforms and sets up most MMGC_ names.
 #include "VMPI.h"
 
-// Memory profiling settings
+#if defined MMGC_MEMORY_INFO && defined MMGC_64BIT
+    #error "MMGC_MEMORY_INFO not supported on 64-bit (see bugzilla 468501)"
+#endif
 
 #ifdef DEBUG
-    #define MMGC_MEMORY_INFO
+    #define MMGC_DELETE_DEBUGGING
+    #ifndef MMGC_64BIT				// see bugzilla 468501
+        #define MMGC_MEMORY_INFO
+    #endif
 #endif
 
-#if defined DEBUG && defined AVMPLUS_MAC && !(defined MMGC_PPC && defined MMGC_64BIT)
-    #define MMGC_MEMORY_PROFILER
+#if defined MMGC_MEMORY_INFO && defined MMGC_MEMORY_PROFILER
+    #define MMGC_RC_HISTORY
 #endif
 
-#if defined AVMPLUS_WIN32 && !defined AVMPLUS_ARM // note, does not require DEBUG
-    #define MMGC_MEMORY_PROFILER
+#if defined DEBUGGER || defined MMGC_MEMORY_PROFILER || defined MMGC_MEMORY_INFO
+    #ifndef MMGC_HOOKS
+        #define MMGC_HOOKS
+    #endif
+#endif
+
+// Policy profiler settings (for MMgc development mostly).
+//
+// On MacOS X desktop MMGC_POLICY_PROFILING incurs a 5% execution overhead on the
+// benchmark test/performance/mmgc/gcbench.as.
+//
+// Enabling this and MMGC_MEMORY_INFO at the same time is probably not a good idea.
+//
+// If AVMSHELL_BUILD is enabled then the output can be enabled/disabled with the -gcbehavior
+// switch in the shell; the output is directed to whatever channel is used by GCLog.
+//
+// If AVMSHELL_BUILD is disabled then the output of policy info is unconditional and is
+// directed to a file gcbehavior.txt in the working directory.
+
+#ifdef AVMSHELL_BUILD
+    #define MMGC_POLICY_PROFILING
+#endif
+
+#ifdef MMGC_POLICY_PROFILING
+	// Really for the specially interested!  These switches incur measurable overhead,
+	// so be careful when benchmarking.
+
+	// Profile the pointer density of scanned memory
+    //#define MMGC_POINTINESS_PROFILING
+
+	// Profile reference count traffic.  This feature adds about 8% execution time overhead
+	// to the overhead already added by MMGC_POLICY_PROFILING, on the gcbench benchmark,
+	// measured on MacOS X desktop.
+	//#define MMGC_REFCOUNT_PROFILING
+
+	// Profile mark stack depth
+	//#define MMGC_MARKSTACK_DEPTH
+#endif
+
+#ifdef MMGC_REFCOUNT_PROFILING
+	#define REFCOUNT_PROFILING_ONLY(x) x
+	#define REFCOUNT_PROFILING_ARG(x) , x
+#else
+	#define REFCOUNT_PROFILING_ONLY(x)
+	#define REFCOUNT_PROFILING_ARG(x)
 #endif
 
 #include "GCDebug.h"
@@ -62,7 +110,7 @@
 
 /*
  * If _GCHeapLock is defined, a spin lock is used for thread safety
- * on all public API's (Alloc, Free, ExpandHeap)
+ * on all public API's (Alloc, Free)
  *
  * Warning:
  * We may use GCHeap for allocation on other threads, hence the
@@ -71,25 +119,32 @@
  */
 
 #ifdef MMGC_LOCKING
-#define MMGC_LOCK(_x) GCAcquireSpinlock _lock(_x)
+#define MMGC_LOCK(_x) MMgc::GCAcquireSpinlock _lock(&_x)
 #include "GCSpinLock.h"
 #else
 #define MMGC_LOCK(_x) 
 #endif
+
+// This keeps a graph of the edges the marker finds which are printed out in Sweep
+// for all objects added with GC::AddToBlacklist
+//#define MMGC_HEAP_GRAPH
 
 namespace MMgc
 {
 	class GC;
 	class RCObject;
 	class GCWeakRef;
+	class GCFinalizedObject;
 	class GCObject;
-	class GCHashtable;
 	class Cleaner;
 	class GCAlloc;
 	class GCHeap;
 }
 
+#define CAPACITY(T)  (uint32_t(GCHeap::kBlockSize) / uint32_t(sizeof(T)))
+
 #include "GCTypes.h"
+#include "AllocationMacros.h"
 #include "OOM.h"
 #include "GCStack.h"
 #include "GCThreads.h"
@@ -99,14 +154,24 @@ namespace MMgc
 #include "GCThreadLocal.h"
 #include "FixedAlloc.h"
 #include "FixedMalloc.h"
+#include "GCGlobalNew.h"
+#include "BasicList.h"
 #include "GCHeap.h"
 #include "GCAlloc.h"
 #include "GCLargeAlloc.h"
-#include "GCGlobalNew.h"
+#include "ZCT.h"
+#include "HeapGraph.h"
 #include "GC.h"
 #include "GCObject.h"
 #include "GCWeakRef.h"
 #include "WriteBarrier.h"
+
+#include "FixedAlloc-inlines.h"
+#include "FixedMalloc-inlines.h"
+#include "GCAlloc-inlines.h"
+#include "GCLargeAlloc-inlines.h"
+#include "ZCT-inlines.h"
+#include "GC-inlines.h"
 
 // remove these when the player stops using it
 #define MMGC_DRC

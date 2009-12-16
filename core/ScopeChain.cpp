@@ -37,33 +37,26 @@
 
 
 #include "avmplus.h"
-
-// FIXME the following is required because FrameState has dependencies on the jitters
-#if defined FEATURE_NANOJIT
-    #include "CodegenLIR.h"
-#endif
-
-#include "FrameState.h"
+#include "FrameState.h" // FIXME required because FrameState has dependencies on the jitters
 
 namespace avmplus
 {
-	/*static*/ ScopeTypeChain* ScopeTypeChain::create(MMgc::GC* gc, const ScopeTypeChain* outer, const FrameState* state, Traits* append, Traits* extra)
+	/* static */ const ScopeTypeChain* ScopeTypeChain::create(MMgc::GC* gc, Traits* traits, const ScopeTypeChain* outer, const Value* values, int32_t nValues, Traits* append, Traits* extra)
 	{
-		const int stateScopeDepth = (state ? state->scopeDepth : 0);
-		const int capture = stateScopeDepth + (append ? 1 : 0);
-		const int extraEntries = extra ? 1 : 0;
-		const int outerSize = (outer ? outer->size : 0);
-		const int pad = capture + extraEntries;
+		const int32_t capture = nValues + (append ? 1 : 0);
+		const int32_t extraEntries = extra ? 1 : 0;
+		const int32_t outerSize = (outer ? outer->size : 0);
+		const int32_t pad = capture + extraEntries;
 		const size_t padSize = sizeof(uintptr_t) * (((pad > 0) ? (pad - 1) : 0) + outerSize);
-		ScopeTypeChain* nscope = new(gc, padSize) ScopeTypeChain(outerSize + capture, outerSize + capture + extraEntries);
-		int j = 0;
-		for (int i = 0; i < outerSize; i++)
+		ScopeTypeChain* nscope = new(gc, padSize) ScopeTypeChain(outerSize + capture, outerSize + capture + extraEntries, traits);
+		int32_t j = 0;
+		for (int32_t i = 0; i < outerSize; i++)
 		{
 			nscope->_scopes[j++] = outer->_scopes[i];
 		}
-		for (int i = 0; i < stateScopeDepth; i++)
+		for (int32_t i = 0; i < nValues; i++)
 		{
-			const Value& v = state->scopeValue(i);
+			const Value& v = values[i];
 			nscope->setScopeAt(j++, v.traits, v.isWith);
 		}
 		if (append)
@@ -75,23 +68,55 @@ namespace avmplus
 			nscope->setScopeAt(j++, extra, false);
 		}
 		AvmAssert(j == nscope->fullsize);
-		AVMPLUS_TRAITS_MEMTRACK_ONLY( tmt_add_inst( TMT_scopetypechain, nscope); )
 		return nscope;
 	}
-
-#ifdef AVMPLUS_TRAITS_MEMTRACK
-	ScopeTypeChain::~ScopeTypeChain()
+	
+	/*static*/ const ScopeTypeChain* ScopeTypeChain::create(MMgc::GC* gc, Traits* traits, const ScopeTypeChain* outer, const FrameState* state, Traits* append, Traits* extra)
 	{
-		AVMPLUS_TRAITS_MEMTRACK_ONLY( tmt_sub_inst( TMT_scopetypechain, this); )
+		if (state && state->scopeDepth > 0)
+			return ScopeTypeChain::create(gc, traits, outer, &state->scopeValue(0), state->scopeDepth, append, extra);
+		else
+			return ScopeTypeChain::create(gc, traits, outer, 0, 0, append, extra);
+			
 	}
+
+#ifdef VMCFG_AOT
+    /*static*/ const ScopeTypeChain* ScopeTypeChain::create(MMgc::GC* gc, Traits* traits, const ScopeTypeChain* outer, Traits* const* stateTraits, uint32_t nStateTraits, uint32_t nStateWithTraits, Traits* append, Traits* extra)
+    {
+        MMgc::GC::AllocaAutoPtr valuesPtr;
+		Value *values = (Value *)VMPI_alloca_gc(gc, valuesPtr, sizeof(Value)*nStateTraits);
+		int32_t firstWith = nStateTraits - nStateWithTraits;
+		for (int32_t i = 0; i < nStateTraits; i++)
+		{
+			values[i].traits = stateTraits[i];
+			values[i].isWith = i >= firstWith;
+		}
+		return ScopeTypeChain::create(gc, traits, outer, values, nStateTraits, append, extra);
+    }
 #endif
+
+	const ScopeTypeChain* ScopeTypeChain::cloneWithNewTraits(MMgc::GC* gc, Traits* p_traits) const
+	{
+		if (p_traits == this->traits())
+			return this;
+			
+		const size_t padSize = sizeof(uintptr_t) * (this->fullsize ? this->fullsize-1 : 0);
+		ScopeTypeChain* nscope = new(gc, padSize) ScopeTypeChain(this->size, this->fullsize, p_traits);
+		for (int32_t i=0; i < this->fullsize; i ++)
+		{
+			nscope->_scopes[i] = this->_scopes[i];
+		}
+		return nscope;
+	}
 
 	#if VMCFG_METHOD_NAMES
 	Stringp ScopeTypeChain::format(AvmCore* core) const
 	{
 		Stringp r = core->kEmptyString;
-		r = r->appendLatin1("STC:[");
-		for (int i = 0; i < fullsize; i++)
+		r = r->appendLatin1("STC:[traits=");
+		r = r->append(_traits->format(core));
+		r = r->appendLatin1(",");
+		for (int32_t i = 0; i < fullsize; i++)
 		{
 			if (i > 0)
 				r = r->appendLatin1(",");
@@ -105,28 +130,38 @@ namespace avmplus
 	}
 	#endif
 
-	/*static*/ ScopeChain* ScopeChain::create(MMgc::GC* gc, const ScopeTypeChain* scopeTraits, const ScopeChain* outer, Namespacep dxns)
+	/*static*/ ScopeChain* ScopeChain::create(MMgc::GC* gc, VTable* vtable, AbcEnv* abcEnv, const ScopeTypeChain* scopeTraits, const ScopeChain* outer, Namespacep dxns)
 	{
-		const int scopeTraitsSize = scopeTraits->size;
-		const int outerSize = outer ? outer->_scopeTraits->size : 0;
+		AvmAssert(vtable->traits == scopeTraits->traits());
+		const int32_t scopeTraitsSize = scopeTraits->size;
+		const int32_t outerSize = outer ? outer->_scopeTraits->size : 0;
 		const size_t padSize = scopeTraitsSize > 0 ? sizeof(Atom) * (scopeTraitsSize-1) : 0;
-		ScopeChain* nscope = new(gc, padSize) ScopeChain(scopeTraits, dxns);
-		for (int i=0; i < outerSize; i ++)
+		ScopeChain* nscope = new(gc, padSize) ScopeChain(vtable, abcEnv, scopeTraits, dxns);
+		for (int32_t i=0; i < outerSize; i ++)
 		{
 			nscope->setScope(gc, i, outer->_scopes[i]);
 		}
-		AVMPLUS_TRAITS_MEMTRACK_ONLY( tmt_add_inst( TMT_scopechain, nscope); )
 		return nscope;
 	}
 
-#ifdef AVMPLUS_TRAITS_MEMTRACK
-	ScopeChain::~ScopeChain()
+	ScopeChain* ScopeChain::cloneWithNewVTable(MMgc::GC* gc, VTable* p_vtable, AbcEnv* p_abcEnv, const ScopeTypeChain* p_scopeTraits)
 	{
-		AVMPLUS_TRAITS_MEMTRACK_ONLY( tmt_sub_inst( TMT_scopechain, this); )
+		if (p_vtable == this->vtable() && p_abcEnv == this->abcEnv())
+			return this;
+		
+		const ScopeTypeChain* nstc = p_scopeTraits ? p_scopeTraits : _scopeTraits->cloneWithNewTraits(gc, p_vtable->traits);
+		AvmAssert(nstc->traits() == p_vtable->traits);
+		const int32_t scopeTraitsSize = nstc->size;
+		const size_t padSize = scopeTraitsSize > 0 ? sizeof(Atom) * (scopeTraitsSize-1) : 0;
+		ScopeChain* nscope = new(gc, padSize) ScopeChain(p_vtable, p_abcEnv, nstc, _defaultXmlNamespace);
+		for (int32_t i=0; i < nstc->size; i ++)
+		{
+			nscope->setScope(gc, i, this->_scopes[i]);
+		}
+		return nscope;
 	}
-#endif
 
-	void ScopeChain::setScope(MMgc::GC* gc, int i, Atom value)
+	void ScopeChain::setScope(MMgc::GC* gc, int32_t i, Atom value)
 	{
 		AvmAssert(i >= 0 && i < _scopeTraits->size);
 		//scopes[i] = value;
@@ -142,7 +177,7 @@ namespace avmplus
 		r = r->appendLatin1("),");
 		r = r->append(_scopeTraits->format(core));
 		r = r->appendLatin1(",V:[");
-		for (int i = 0; i < _scopeTraits->size; i++)
+		for (int32_t i = 0; i < _scopeTraits->size; i++)
 		{
 			if (i > 0)
 				r = r->appendLatin1(",");

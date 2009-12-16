@@ -40,36 +40,13 @@
 
 namespace avmplus
 {
-	Multiname::Multiname(NamespaceSetp nsset)
-	{
-		this->flags = 0;
-		setNsset(nsset);
-		this->name = NULL;
-	}
-
-	Multiname::Multiname()
-	{
-		this->flags = 0;
-		this->name = NULL;
-		this->ns = NULL;
-	}
-
-	Multiname::Multiname(Namespacep ns, Stringp name, bool qualified)
-	{
-		this->flags = 0;
-		setNamespace(ns);
-		setName(name);
-		if (qualified)
-			setQName();
-	}
-
-	Namespacep Multiname::getNamespace(int i) const
+	Namespacep Multiname::getNamespace(int32_t i) const
 	{
 		AvmAssert(!isRtns() && !isAnyNamespace());
 		if (flags&NSSET)
 		{
 			AvmAssert(i >= 0 && i < namespaceCount());
-			return nsset ? nsset->namespaces[i] : NULL;
+			return nsset ? nsset->nsAt(i) : NULL;
 		}
 		else
 		{
@@ -82,11 +59,7 @@ namespace avmplus
 	{
 		if (flags & NSSET)
 		{
-			if( !nsset ) return false;
-			for (int i=0; i < nsset->size; i++)
-				if (nsset->namespaces[i] == ns)
-					return true;
-			return false;
+            return nsset && nsset->contains(ns);
 		}
 		else
 		{
@@ -133,6 +106,7 @@ namespace avmplus
 		Stringp u2 = qname->getNamespace()->getURI();
         uint8 type2 = (uint8)(qname->getNamespace()->getType());
 		//Stringp s2 = core->string(u2);
+		
 		for (int i = 0; i < this->namespaceCount(); i++)
 		{
 			// We'd like to just compare namespace objects but we need
@@ -151,7 +125,7 @@ namespace avmplus
 	/* static */ 
 	Stringp Multiname::format(AvmCore *core, Namespacep ns, Stringp name, bool attr, bool hideNonPublicNamespaces)
 	{
-		if (ns == core->publicNamespace ||
+		if (ns->isPublic() ||
 			(hideNonPublicNamespaces && // backwards compatibility
 			ns->getType() != Namespace::NS_Public))
 		{
@@ -159,14 +133,15 @@ namespace avmplus
 		}
 		else
 		{
+			Stringp uri = ns->getURI();
 			if (attr)
 			{
-				return core->concatStrings(core->newConstantStringLatin1("@"), core->concatStrings(ns->getURI(),
+				return core->concatStrings(core->newConstantStringLatin1("@"), core->concatStrings(uri,
 					core->concatStrings(core->newConstantStringLatin1("::"), name)));
 			}
 			else
 			{
-				return core->concatStrings(ns->getURI(),
+				return core->concatStrings(uri,
 					core->concatStrings(core->newConstantStringLatin1("::"), name));
 			}
 		}
@@ -209,7 +184,7 @@ namespace avmplus
 
 				for (int i=0,n=namespaceCount(); i < n; i++) 
 				{			
-					if (getNamespace(i)==core->publicNamespace)
+					if (getNamespace(i)->isPublic())
 						s = core->concatStrings(s, core->newConstantStringLatin1("public"));
 					else
 						s = core->concatStrings(s, getNamespace(i)->getURI());
@@ -227,4 +202,52 @@ namespace avmplus
 		}
 	}
 //#endif
+
+	// NOTE NOTE NOTE
+	// Write barrier note: the container for a HeapMultiname is *not* 'this'; 
+	// HeapMultiname figures as a field in eg QNameObject and XMLListObject.
+	// You *must* call FindBeginningFast(this) to get the right container.
+	
+	void HeapMultiname::setMultiname(const Multiname& that)
+	{
+		MMgc::GC* gc = this->gc();
+		const void *container = gc->FindBeginningFast(this);
+		WBRC(gc, container, &name.name, that.name);
+		
+		bool const this_nsset = name.isNsset() != 0;
+		bool const that_nsset = that.isNsset() != 0;
+
+		if (this_nsset != that_nsset)
+		{
+			// gc->rc or vice versa... we have to explicitly null out
+			// any existing value (before setting a new one) because WB/WBRC
+			// assume any existing value is a GCObject/RCObject respectively.
+			if (this_nsset)
+				WB_NULL(&name.ns);
+			else
+				WBRC_NULL(&name.ns);
+		}
+
+		if (that_nsset) 
+		{
+			WB(gc, container, &name.nsset, that.nsset);
+		} 
+		else 
+		{
+			WBRC(gc, container, &name.ns, that.ns);
+		}
+
+		name.flags = that.flags;
+		name.next_index = that.next_index;
+	}
+
+	HeapMultiname::~HeapMultiname()
+	{
+		// Our embedded Multiname will zero itself, but we should call WBRC to 
+		// adjust the refcounts correctly...
+		WBRC_NULL(&name.name);
+		if (!name.isNsset())
+			WBRC_NULL(&name.ns);
+	}
+	
 }

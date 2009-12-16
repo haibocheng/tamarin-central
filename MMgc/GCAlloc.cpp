@@ -60,6 +60,10 @@ namespace MMgc
 		m_numBlocks = 0;
 		m_finalized = false;
 
+#ifdef MMGC_MEMORY_PROFILER
+		m_totalAskSize = 0;
+#endif
+
 		// The number of items per block is kBlockSize minus
 		// the # of pointers at the base of each page.
 
@@ -104,25 +108,29 @@ namespace MMgc
 		}
 	}
 
-	GCAlloc::GCBlock* GCAlloc::CreateChunk()
+	GCAlloc::GCBlock* GCAlloc::CreateChunk(int flags)
 	{
 		// Get space in the bitmap.  Do this before allocating the actual block,
 		// since we might call GC::AllocBlock for more bitmap space and thus
 		// cause some incremental marking.
 		uint32_t* bits = NULL;
 
-		if(!m_bitsInPage)
+		if(!m_bitsInPage) {
+			// Note, bits will leak if AllocBlock aborts due to OOM, but that isn't much of a problem
 			bits = m_gc->GetBits(m_numBitmapBytes, m_sizeClassIndex);
+		}
 
 		// Allocate a new block
-		m_maxAlloc += m_itemsPerBlock;
-		m_numBlocks++;
 
-		int numBlocks = kBlockSize/GCHeap::kBlockSize;
-		GCBlock* b = (GCBlock*) m_gc->AllocBlock(numBlocks, GC::kGCAllocPage);
+		GCAssert(uint32_t(kBlockSize) == GCHeap::kBlockSize);
+		GCBlock* b = (GCBlock*) m_gc->AllocBlock(1, GC::kGCAllocPage, /*zero*/true,  (flags&GC::kCanFail) != 0);
 
 		if (b) 
 		{
+			m_maxAlloc += m_itemsPerBlock;
+			m_numBlocks++;
+
+			b->firstFree = 0;
 			b->gc = m_gc;
 			b->alloc = this;
 			b->size = m_itemSize;
@@ -131,8 +139,13 @@ namespace MMgc
 				b->finalizeState = m_gc->finalizedValue;
 			else 
 				b->finalizeState = !m_gc->finalizedValue;
-
-			b->bits = m_bitsInPage ? (uint32_t*)((char*)b + sizeof(GCBlock)) : bits;
+			
+			union {
+				char* b_8;
+				uint32_t* b_32;
+			};
+			b_8 = (char*)b + sizeof(GCBlock);
+			b->bits = m_bitsInPage ? b_32 : bits;
 
 			// Link the block at the end of the list
 			b->prev = m_lastBlock;
@@ -161,6 +174,10 @@ namespace MMgc
 			b->nextItem = b->items;
 			b->numItems = 0;
 		}
+		else {
+			if (bits)
+				m_gc->FreeBits(bits, m_sizeClassIndex);
+		}
 
 		return b;
 	}
@@ -173,15 +190,15 @@ namespace MMgc
 
 		// Unlink the block from the list
 		if (b == m_firstBlock) {
-			m_firstBlock = b->next;
+			m_firstBlock = Next(b);
 		} else {
-			b->prev->next = b->next;
+			b->prev->next = Next(b);
 		}
 		
 		if (b == m_lastBlock) {
 			m_lastBlock = b->prev;
 		} else {
-			b->next->prev = b->prev;
+			Next(b)->prev = b->prev;
 		}
 
 		if(b->nextFree || b->prevFree || b == m_firstFree) {
@@ -206,35 +223,45 @@ namespace MMgc
 		m_gc->FreeBlock(b, 1);
 	}
 
+#if defined DEBUG || defined MMGC_MEMORY_PROFILER
 	void* GCAlloc::Alloc(size_t size, int flags)
+#else
+	void* GCAlloc::Alloc(int flags)
+#endif
 	{
-		(void)size;
 		GCAssertMsg(((size_t)m_itemSize >= size), "allocator itemsize too small");
-start:
-		if (m_firstFree == NULL && m_needsSweeping == NULL) {
-			if (CreateChunk() == NULL) {
+
+		// Allocation must be signalled before we allocate because no GC work must be allowed to
+		// come between an allocation and an initialization - if it does, we may crash, as 
+		// GCFinalizedObject subclasses may not have a valid vtable, but the GC depends on them
+		// having it.  In principle we could signal allocation late but only set the object
+		// flags after signaling, but we might still cause trouble for the profiler, which also
+		// depends on non-interruptibility.
+
+		m_gc->SignalAllocWork(m_itemSize);
+		
+		GCBlock* b = m_firstFree;
+	start:
+		if (b == NULL) {
+			if (m_needsSweeping && !m_gc->collecting) {
+				Sweep(m_needsSweeping);
+				b = m_firstFree;
+				goto start;
+			}
+			
+			bool canFail = (flags & GC::kCanFail) != 0;
+			CreateChunk(canFail);
+			b = m_firstFree;
+			if (b == NULL) {
+				GCAssert(canFail);
 				return NULL;
 			}
 		}
-
-		GCBlock* b = m_firstFree ? m_firstFree : m_needsSweeping;
-
-		// lazy sweeping
-		if(b->needsSweeping) {
-			if(m_gc->collecting) {
-				CreateChunk();
-				b = m_firstFree;
-			}
-			else if(Sweep(b)) {
-				goto start;
-			}
-		}
-
+		
 		GCAssert(!b->needsSweeping);
 		GCAssert(b == m_firstFree);
-
 		GCAssert(b && !b->IsFull());
-
+		
 		void *item;
 		if(b->firstFree) {
 			item = b->firstFree;
@@ -248,7 +275,7 @@ start:
 		} else {
 			item = b->nextItem;
 			if(((uintptr_t)((char*)item + b->size) & 0xfff) != 0) {
-				b->nextItem = (char*)item +  b->size;
+				b->nextItem = (char*)item + b->size;
 			} else {
 				b->nextItem = NULL;
 			}
@@ -262,12 +289,10 @@ start:
 
 		// this assumes what we assert
 		GCAssert((unsigned long)GC::kFinalize == (unsigned long)GCAlloc::kFinalize);
-		int index = GetIndex(b, item);
 		
+		int index = GetIndex(b, item);
 		GCAssert(index >= 0);
-
-		ClearBits(b, index, 0xf);
-		SetBit(b, index, flags & kFinalize);
+		Clear4BitsAndSet(b, index, flags & kFinalize);
 
 		b->numItems++;
 #ifdef MMGC_MEMORY_INFO
@@ -275,7 +300,10 @@ start:
 #endif
 
 		// If we're out of free items, be sure to remove ourselves from the
-		// list of blocks with free items.  
+		// list of blocks with free items.  TODO Minor optimization: when we
+		// carve an item off the end of the block, we don't need to check here
+		// unless we just set b->nextItem to NULL.
+
 		if (b->IsFull()) {
 			m_firstFree = b->nextFree;
 			b->nextFree = NULL;
@@ -288,7 +316,7 @@ start:
 		// prevent mid-collection (ie destructor) allocations on un-swept pages from
 		// getting swept.  If the page is finalized and doesn't need sweeping we don't want
 		// to set the mark otherwise it will be marked when we start the next marking phase
-		// and write barrier's won't fire (since its black)
+		// and write barriers won't fire (since its black)
 		if(m_gc->collecting)
 		{ 
 			if((b->finalizeState != m_gc->finalizedValue) || b->needsSweeping)
@@ -297,6 +325,20 @@ start:
 
 		GCAssert((uintptr_t(item) & ~0xfff) == (uintptr_t) b);
 		GCAssert((uintptr_t(item) & 7) == 0);
+
+#ifdef MMGC_HOOKS
+		GCHeap* heap = GCHeap::GetGCHeap();
+		if(heap->HooksEnabled())
+		{
+			size_t userSize = m_itemSize - DebugSize();
+#ifdef MMGC_MEMORY_PROFILER
+			m_totalAskSize += size;
+			heap->AllocHook(GetUserPointer(item), size, userSize);
+#else
+			heap->AllocHook(GetUserPointer(item), 0, userSize);
+#endif
+		}
+#endif
 
 		return item;
 	}
@@ -307,6 +349,21 @@ start:
 		GCBlock *b = GetBlock(item);
 		GCAlloc *a = b->alloc;
 	
+#ifdef MMGC_HOOKS
+		GCHeap* heap = GCHeap::GetGCHeap();
+		if(heap->HooksEnabled())
+		{
+			const void* p = GetUserPointer(item);
+			size_t userSize = GC::Size(p);
+#ifdef MMGC_MEMORY_PROFILER
+			if(heap->GetProfiler())
+				a->m_totalAskSize -= heap->GetProfiler()->GetAskSize(p);
+#endif
+			heap->FinalizeHook(p, userSize);
+			heap->FreeHook(p, userSize, 0xca);
+		}
+#endif
+
 #ifdef _DEBUG		
 		// check that its not already been freed
 		void *free = b->firstFree;
@@ -320,15 +377,15 @@ start:
 		if(GetBit(b, index, kHasWeakRef)) {
 			b->gc->ClearWeakRef(GetUserPointer(item));
 		}
-		
 
 		bool wasFull = b->IsFull();
 
 		if(b->needsSweeping) {
-			bool gone = a->Sweep(b);
-			if(gone) {
-				GCAssertMsg(false, "How can a page I'm about to free an item on be empty?");
-			}
+#ifdef _DEBUG
+			bool gone =
+#endif
+				a->Sweep(b);
+			GCAssertMsg(!gone, "How can a page I'm about to free an item on be empty?");
 			wasFull = false;
 		}
 
@@ -355,7 +412,7 @@ start:
 		for (GCBlock* b = m_firstBlock; b != NULL; b = next)
 		{
 			// we can unlink block below
-			next = b->next;
+			next = Next(b);
 
 			GCAssert(!b->needsSweeping);
 
@@ -397,21 +454,30 @@ start:
 
 					void* item = (char*)b->items + m_itemSize*((i*8)+j);
 
+#ifdef MMGC_HOOKS
 					if(m_gc->heap->HooksEnabled())
+					{
+					#ifdef MMGC_MEMORY_PROFILER
+						if(m_gc->heap->GetProfiler())
+							m_totalAskSize -= m_gc->heap->GetProfiler()->GetAskSize(GetUserPointer(item));
+					#endif
+
  						m_gc->heap->FinalizeHook(GetUserPointer(item), m_itemSize - DebugSize());
-  
+					}
+#endif
+
 					if(!(marks & (kFinalize|kHasWeakRef)))
 						continue;
         
 					if (marks & kFinalize)
 					{     
-						GCFinalizable *obj = (GCFinalizedObject*)GetUserPointer(item);
+						GCFinalizedObject *obj = (GCFinalizedObject*)GetUserPointer(item);
 						GCAssert(*(intptr_t*)obj != 0);
-						obj->~GCFinalizable();
-						bits[i] &= ~(kFinalize<<(j*4));
+						bits[i] &= ~(kFinalize<<(j*4));		// Clear bits first so we won't get second finalization if finalizer longjmps out
+						obj->~GCFinalizedObject();
 
 #if defined(_DEBUG)
-						if(b->alloc->IsRCObject()) {
+						if(b->alloc->ContainsRCObjects()) {
 							m_gc->RCObjectZeroCheck((RCObject*)obj);
 						}
 #endif
@@ -436,6 +502,8 @@ start:
 				putOnFreeList = false;
 			} else if(numMarkedItems == b->numItems) {
 				// nothing changed on this page, clear marks
+				// note there will be at least one free item on the page (otherwise it
+				// would not have been scanned) so the page just stays on the freelist
 				ClearMarks(b);
 			} else if(!b->needsSweeping) {
 				// free'ing some items but not all
@@ -468,7 +536,7 @@ start:
 			for(uint32_t j=0; j<subCount;j++,marks>>=4)
 			{
 				int mq = marks & kFreelist;
-				if(mq == kMark)
+				if(mq == kMark || mq == kQueued)	// Sweeping is lazy; don't sweep objects on the mark stack
 				{
 					// live item, clear bits
 					bits[i] &= ~(kFreelist<<(j*4));
@@ -480,10 +548,10 @@ start:
 
 				// garbage, freelist it
 				void *item = (char*)b->items + m_itemSize*(i*8+j);
-
+#ifdef MMGC_HOOKS
 				if(m_gc->heap->HooksEnabled())
 					m_gc->heap->FreeHook(GetUserPointer(item), b->size - DebugSize(), 0xba);
-
+#endif
 				b->FreeItem(item, (i*8+j));
 			}
 		}
@@ -540,24 +608,13 @@ start:
 
 	void GCAlloc::ClearMarks()
 	{
-		GCBlock *block = m_firstBlock;
-start:
-		while (block) {
-			GCBlock *next = block->next;
-
-			if(block->needsSweeping) {
-				if(Sweep(block)) {
-					UnlinkChunk(block);
-					FreeChunk(block);
-					block = next;
-					goto start;
-				}
-			}
+		for ( GCBlock *block=m_firstBlock, *next ; block ; block=next ) {
+			next = Next(block);
+			
+			if (block->needsSweeping && Sweep(block)) 
+				continue;
 
 			ClearMarks(block);
-
-			// Advance to next block
-			block = next;
 		}
 	}	
 
@@ -567,7 +624,7 @@ start:
 		GCBlock *b = m_firstBlock;
 
 		while (b) {
-			GCBlock *next = b->next;
+			GCBlock *next = Next(b);
 			GCAssertMsg(!b->needsSweeping, "All needsSweeping should have been swept at this point.");
 
 			// TODO: MMX version for IA32
@@ -593,7 +650,6 @@ start:
 			b = next;
 		}
 	}	
-#endif
 
 	/*static*/
 	int GCAlloc::ConservativeGetMark(const void *item, bool bogusPointerReturnValue)
@@ -622,7 +678,26 @@ start:
 
 		return GetMark(item);
 	}
-
+	
+	void GCAlloc::CheckFreelist()
+	{	
+		GCBlock *b = m_firstFree;
+		while(b)
+		{
+			void *freelist = b->firstFree;
+			while(freelist)
+			{			
+				// b->firstFree should be either 0 end of free list or a pointer into b, otherwise, someone
+				// wrote to freed memory and hosed our freelist
+				GCAssert(freelist == 0 || ((uintptr_t) freelist >= (uintptr_t) b->items && (uintptr_t) freelist < (uintptr_t) b + GCHeap::kBlockSize));
+				freelist = *((void**)freelist);
+			}
+			b = b->nextFree;
+		}
+	}
+	
+#endif // _DEBUG
+	
 	// allows us to avoid division in GetItemIndex, kudos to Tinic
 	void GCAlloc::ComputeMultiplyShift(uint16_t d, uint16_t &muli, uint16_t &shft) 
 	{
@@ -637,7 +712,7 @@ start:
 		muli = (uint16_t) m;
 	}
 
-	void GCAlloc::GCBlock::FreeItem(const void *item, int index)
+	REALLY_INLINE void GCAlloc::GCBlock::FreeItem(const void *item, int index)
 	{
 #ifdef MMGC_MEMORY_INFO
 		GCAssert(alloc->m_numAlloc != 0);
@@ -659,28 +734,42 @@ start:
 #endif
 		numItems--;
 
+		GCAssert(!GetBit(this, index, kQueued));
 		SetBit(this, index, kFreelist);
 
 #ifndef _DEBUG
 		// memset rest of item not including free list pointer, in _DEBUG
 		// we poison the memory (and clear in Alloc)
 		// FIXME: can we do something faster with MMX here?
-		if(!alloc->IsRCObject())
+		//
+		// BTW, experiments show that clearing on alloc instead of on free 
+		// benefits microbenchmark that do massive amounts of double-boxing,
+		// but nothing else enough to worry about it.  (The trick is that
+		// no clearing on alloc is needed when carving objects off the end
+		// of a block, whereas every object is cleared on free even if the
+		// page is subsequently emptied out and returned to the block manager.
+		// Massively boxing programs have alloc/free patterns that are biased
+		// toward non-RC objects carved off the ends of blocks.)
+		if(!alloc->ContainsRCObjects())
 			VMPI_memset((char*)item, 0, size);
 #endif
 		// Add this item to the free list
 		*((void**)item) = oldFree;	
 	}
 	
-	size_t GCAlloc::GetBytesInUse()
+	void GCAlloc::GetUsageInfo(size_t& totalAskSize, size_t& totalAllocated)	
 	{
-		size_t bytes=0;
+		totalAskSize = totalAllocated = 0;
+
 		GCBlock *b=m_firstBlock;
 		while (b) {
-			bytes += b->numItems * m_itemSize;
-			b = b->next;
+			totalAllocated += b->numItems * m_itemSize;
+			b = Next(b);
 		}		
-		return bytes;
+	
+#ifdef MMGC_MEMORY_PROFILER
+		totalAskSize = m_totalAskSize;
+#endif
 	}
 
 #ifdef MMGC_MEMORY_INFO

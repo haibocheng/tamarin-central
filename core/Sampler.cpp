@@ -44,13 +44,97 @@ namespace avmplus
 {
 	using namespace MMgc;
 
-	// store this in a thread local to capture FixedAlloc alloc traffic
-	GCThreadLocal<avmplus::Sampler*> tls_sampler;
+	template<class T>
+	static void inline read(uint8_t*& p, T& u)
+	{
+		// weirdly, declaring a naked union here causes the ARM gcc compiler
+		// to issue bogus "unused" warnings for p8 and pT. Declaring it as
+		// a type and using that doesn't. yay, buggy compilers.
+		union Foo {
+			const uint8_t* p8;
+			const T* pT;
+		};
+		Foo foo;
+		foo.p8 = p;
+		u = *foo.pT;
+		p += sizeof(T);
+
+	}
+
+	template<class T>
+	static void inline write(uint8_t*& p, T u)
+	{
+		// weirdly, declaring a naked union here causes the ARM gcc compiler
+		// to issue bogus "unused" warnings for p8 and pT. Declaring it as
+		// a type and using that doesn't. yay, buggy compilers.
+		union Foo {
+			uint8_t* p8;
+			T* pT;
+		};
+		Foo foo;
+		foo.p8 = p;
+		*foo.pT = u;
+		p += sizeof(T);
+	}
+	
+	// aligns to an 8-byte boundary -- apparently assumes input is at least 4-byte aligned.
+	static void inline align(uint8_t*& p)
+	{
+		AvmAssert((uintptr_t(p) & 3) == 0);
+		if (uintptr_t(p) & 4)
+		{
+#ifdef DEBUG
+			union {
+				uint8_t* p8;
+				int32_t* p32;
+			};
+			p8 = p;
+			*p32 = 0xaaaaaaaa;
+#endif
+			p += sizeof(int32_t);
+		}
+	}
+
+	// A sampler is tied to a particular GC/core pair.  As each GC/core pair
+	// can be moved from one thread to another in a timesliced fashion in some
+	// applications we do not use a thread-local variable to hold the sampler,
+	// but attach it directly to the GC, which we pick up from the EnterFrame.
+
+	void AttachSampler(avmplus::Sampler* sampler)
+	{
+		GCHeap* heap = GCHeap::GetGCHeap();		// May be NULL during OOM shutdown
+		if (heap)
+		{
+			EnterFrame* ef = heap->GetEnterFrame();
+			if (ef)
+			{
+				GC* gc = ef->GetActiveGC();
+				if (gc)
+					gc->SetAttachedSampler(sampler);
+			}
+		}
+	}
+	
+	avmplus::Sampler* GetSampler()
+	{
+		GCHeap* heap = GCHeap::GetGCHeap();		// May be NULL during OOM shutdown
+		if (heap)
+		{
+			EnterFrame* ef = heap->GetEnterFrame();
+			if (ef)
+			{
+				GC* gc = ef->GetActiveGC();
+				if (gc)
+					return (avmplus::Sampler*)gc->GetAttachedSampler();
+			}
+		}
+		return NULL;
+	}
 
 	/* static */
 	void recordAllocationSample(const void* item, size_t size)
 	{
-		avmplus::Sampler* sampler = tls_sampler;
+		avmplus::Sampler* sampler = GetSampler();
 		if (sampler && sampler->sampling())
 			sampler->recordAllocationSample(item, size);
 	}
@@ -58,7 +142,7 @@ namespace avmplus
 	/* static */
 	void recordDeallocationSample(const void* item, size_t size)
 	{
-		avmplus::Sampler* sampler = tls_sampler;
+		avmplus::Sampler* sampler = GetSampler();
 		if( sampler /*&& sampler->sampling*/ )
 			sampler->recordDeallocationSample(item, size);
 	}
@@ -75,7 +159,7 @@ namespace avmplus
 		lastAllocSample(NULL),
 		callback(NULL),
 		timerHandle(0),
-		uids(1024, GCHashtable::OPTION_MALLOC),
+		uids(1024),
 		ptrSamples(NULL),
 		takeSample(0),
 		numSamples(0), 
@@ -86,16 +170,14 @@ namespace avmplus
 		autoStartSampling(false),
 		_sampling(true)
 	{
-		_core->GetGC()->GetGCHeap()->EnableHooks();
- 		tls_sampler = this;
+		GCHeap::GetGCHeap()->EnableHooks();
+ 		AttachSampler(this);
 	}
 
 	Sampler::~Sampler()
 	{
 		stopSampling();
- 		Sampler* tls = tls_sampler;
- 		if (tls == this)
- 			tls_sampler = NULL;
+		AttachSampler(NULL);
 	}
 
 	void Sampler::init(bool sampling, bool autoStart)
@@ -136,7 +218,18 @@ namespace avmplus
 			runningCallback = true;
 			pauseSampling();
 			Atom args[1] = { nullObjectAtom };
-			Atom ret = callback->call(0, args);
+			Atom ret = AtomConstants::falseAtom;
+			TRY(core, kCatchAction_Ignore)
+			{
+				ret = callback->call(0, args);
+			}
+			CATCH(Exception* pExceptionToIgnore)
+			{
+				(void) pExceptionToIgnore;
+			}
+			END_CATCH
+			END_TRY
+			
 			if( ret == falseAtom)
 				stopSampling();
 			else
@@ -170,15 +263,22 @@ namespace avmplus
 			write(p, depth);
 			while(csn)
 			{
-				write(p, csn->info());
-				write(p, csn->fakename());
-				// FIXME: can filename can be stored in the AbstractInfo?
-				write(p, csn->filename());
-				write(p, csn->linenum());
-#ifdef AVMPLUS_64BIT
-				AvmAssert(sizeof(StackTrace::Element) == sizeof(MethodInfo *) + sizeof(Stringp) + sizeof(Stringp) + sizeof(int32_t) + sizeof(int32_t));
-				write(p, (int) 0); // structure padding
-#endif
+				VMPI_memset(p, 0, sizeof(StackTrace::Element));
+				StackTrace::Element *e = (StackTrace::Element*)p;
+				e->m_info = csn->isAS3Sample() ? csn->info() : (MethodInfo*) StackTrace::Element::EXTERNAL_CALL_FRAME;
+				e->m_linenum = csn->linenum();
+				if(csn->isAS3Sample())
+				{
+					e->u.m_fakename = csn->fakename();
+					// FIXME: can filename can be stored in the AbstractInfo?
+					e->u.m_filename = csn->filename();
+				} 
+				else 
+				{
+					e->m_functionId = csn->functionId();
+				}
+				// advance p over the current stack element
+				p += sizeof(StackTrace::Element);
 				csn = csn->next();
 				depth--;
 			}
@@ -220,8 +320,23 @@ namespace avmplus
 			if(s.sampleType == Sampler::NEW_OBJECT_SAMPLE || s.sampleType == Sampler::NEW_AUX_SAMPLE)
 			{
 				read(p, s.ptr);
-				read(p, s.typeOrVTable);
+				read(p, s.sot);
 				read(p, s.alloc_size);
+				
+				if (s.ptr != NULL && sotGetKind(s.sot) != kSOT_Empty && !GC::IsFinalized(s.ptr))
+				{
+					// s.ptr HAS to be a ScriptObject (that inherits from RCObject),
+					// but it seems that its destructor has already been called, because
+					// it was cleared by calling "delete" during Marking or Collection.
+					// In that cases the collector will just set its finalized flag 
+					// to false and let it be a zombie (simple GCObject) until
+					// it isn't referenced anymore. The zombie might be deleted 
+					// in another sweep session, meaning that the Sampler can 
+					// run and crash when trying to make the Sample object for the zombie object.
+					// The Sampler will eventually be notified that the zombie is deleted.
+					s.ptr = NULL;
+				}
+				
 			}
 			else 
 			{
@@ -230,13 +345,13 @@ namespace avmplus
 		}
 	}
 
-	uint64 Sampler::recordAllocationSample(const void* item, uint64 size, bool callback_ok)
+	uint64 Sampler::recordAllocationSample(const void* item, uint64 size, bool callback_ok, bool forceWrite)
 	{
 		AvmAssertMsg(sampling(), "How did we get here if sampling is disabled?");
 		if(!samplingNow)
 			return 0;
 
-		if(!samplingAllAllocs)
+		if(!(forceWrite || samplingAllAllocs))
 			return 0;
 
 		if(!sampleSpaceCheck(callback_ok))
@@ -250,7 +365,7 @@ namespace avmplus
 		uids.add(item, (void*)uid);
 		write(currentSample, uid);
 		write(currentSample, item);
-		write(currentSample, (uintptr)0);
+		write(currentSample, sotEmpty());
 		write(currentSample, size);
 
 		AvmAssertMsg((uintptr)currentSample % 4 == 0, "Alignment should have occurred at end of raw sample.\n");
@@ -259,7 +374,7 @@ namespace avmplus
 		return uid; 
 	}
 
-	uint64 Sampler::recordAllocationInfo(AvmPlusScriptableObject *obj, uintptr typeOrVTable)
+	uint64 Sampler::recordAllocationInfo(AvmPlusScriptableObject *obj, SamplerObjectType sot)
 	{
 		AvmAssertMsg(sampling(), "How did we get here if sampling is disabled?");
 		if(!samplingNow)
@@ -269,19 +384,23 @@ namespace avmplus
 		{
 			// Turn on momentarily to record the alloc for this object.
 			samplingAllAllocs = true;
-			recordAllocationSample(obj, 0);
+			uint64 uid = recordAllocationSample(obj, 0);
 			samplingAllAllocs = false;
+			if( !uid )
+			{
+				// allocation must have failed because the buffer was full
+				return 0;
+			}
 		}
 
 		byte* old_sample = lastAllocSample;
 		Sample s;
 		readSample(old_sample, s);
 		old_sample = lastAllocSample;
-
-		if(typeOrVTable < 7 && core->codeContext() && core->codeContext()->domainEnv()) {
-			// and in toplevel
-			typeOrVTable |= (uintptr)core->codeContext()->domainEnv()->toplevel();
-		}
+        
+        DomainEnv* domainEnv = core->codeContext() ? core->codeContext()->domainEnv() : NULL;
+        Toplevel* toplevel = domainEnv ? domainEnv->toplevel() : NULL;
+        sot = sotSetToplevel(sot, toplevel);
 
 		AvmAssertMsg(s.sampleType == NEW_AUX_SAMPLE, "Sample stream corrupt - can only add info to an AUX sample.\n");
 		AvmAssertMsg(s.ptr == (void*)obj, "Sample stream corrupt - last sample is not for same object.\n");
@@ -298,7 +417,7 @@ namespace avmplus
 
 		write(currentSample, s.ptr);
 
-		write(currentSample, typeOrVTable);
+		write(currentSample, sot);
 		write(currentSample, s.alloc_size);
 
 		AvmAssertMsg((uintptr)currentSample % 4 == 0, "Alignment should have occurred at end of raw sample.\n");
@@ -355,9 +474,9 @@ namespace avmplus
 	{
 		//samples->free();
 		currentSample = samples;
-		GCHashtable* t = ptrSamples;
-		ptrSamples = new MMgc::GCHashtable(4096, GCHashtable::OPTION_MALLOC);
-		delete t;
+		GCHashtable_VMPI* t = ptrSamples;
+		ptrSamples = mmfx_new( MMgc::GCHashtable_VMPI(4096) );
+		mmfx_delete( t );
 		numSamples = 0;
 	}
 
@@ -368,10 +487,10 @@ namespace avmplus
 
 		if (!currentSample)
 		{
-			int megs=16;
+			int megs = (callback != NULL) ? 16 : 256;
 			while(!currentSample && megs > 0) {
 				samples_size = megs*1024*1024;
-				currentSample = samples = new byte[samples_size];
+				currentSample = samples = mmfx_new_array(byte, samples_size);
 				megs >>= 1;
 			}
 			if(!currentSample) {
@@ -384,7 +503,7 @@ namespace avmplus
 		
 		if( !ptrSamples ) 
 		{
-			ptrSamples = new MMgc::GCHashtable(1024, GCHashtable::OPTION_MALLOC);
+		    ptrSamples = mmfx_new( MMgc::GCHashtable_VMPI(1024) );
 		}
 
 		samplingNow = true;
@@ -415,7 +534,7 @@ namespace avmplus
 			return;
 
 		if( samples )
-			delete [] samples;
+			mmfx_delete_array(samples);
 		samples = 0;
 		samples_size = 0;
 
@@ -425,7 +544,7 @@ namespace avmplus
 		}
 
 		if( ptrSamples ) {
-			delete ptrSamples;
+			mmfx_delete(ptrSamples);
 			ptrSamples = 0;
 		}
 
@@ -489,6 +608,9 @@ namespace avmplus
 	{
 		uint32 num;
 		byte *p = getSamples(num);
+
+		MMgc::GC * const gc = core->gc;
+
 		for(uint32 i=0; i < num ; i++)
 		{
 			Sample s;
@@ -497,12 +619,35 @@ namespace avmplus
 				// keep all weak refs and type's live, in postsweep we'll erase our weak refs
 				// to objects that were finalized.  we can't nuke them here b/c pushing the
 				// types could cause currently unmarked things to become live
-				if (s.typeOrVTable > 7 && !GC::GetMark((void*)s.typeOrVTable))
+				void *ptr = sotGetGCPointer(s.sot);
+				if (ptr != NULL && !GC::GetMark(ptr))
 				{
-					GCWorkItem item((void*)s.typeOrVTable, (uint32)GC::Size((void*)s.typeOrVTable), true);
-					core->gc->PushWorkItem(item);
+					GCWorkItem item(ptr, (uint32)GC::Size(ptr), true);
+					// NOTE that PushWorkItem_MayFail can fail due to mark stack overflow in tight memory situations.
+					// This failure is visible as GC::GetMarkStackOverflow() being true.  The GC compensates
+					// for that but it seems hard to compensate for it here.  The most credible workaround
+					// is likely to test that flag at the end of presweep and disable the sampler if it is set.
+					gc->PushWorkItem_MayFail(item);
 				}
 			}
+#ifdef _DEBUG
+#define NULL_OR_MARKED(_x) GCAssert(_x == NULL || GC::GetMark(_x))
+			if(s.sampleType != DELETED_OBJECT_SAMPLE)
+			{
+				StackTrace::Element *e = (StackTrace::Element*)s.stack.trace;
+				for(uint32_t i=0; i < s.stack.depth; i++, e++)
+				{
+					NULL_OR_MARKED(e->fakename());
+					NULL_OR_MARKED(e->filename());
+				}
+			}
+#endif
+		}
+
+		if (gc->GetMarkStackOverflow())
+		{
+			// see the comment above
+			stopSampling();
 		}
 	}
 

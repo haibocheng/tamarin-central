@@ -396,7 +396,6 @@ namespace avmplus
 	}
 	
 	static inline bool defined(Atom atom) { return (atom != undefinedAtom); }
-	static inline bool isInteger(Atom atom) { return ((atom&7) == kIntegerType); }
 
     /**
      * ArraySort implements actionscript Array.sort().
@@ -538,7 +537,7 @@ namespace avmplus
 		if ((len > 0) && (len < (0x10000000)))
 		{
 
-			index = new uint32[len];
+			index = mmfx_new_array(uint32, len);
 			atoms = new (core->GetGC()) AtomArray(len);
 			atoms->setLength(len);
 		}
@@ -574,7 +573,9 @@ namespace avmplus
 					ScriptObject* obj = AvmCore::atomToScriptObject (a);
 
 					Stringp name = fields[0].name;
-					Multiname mname(core->publicNamespace, name);
+
+					// NOTE we want to sort the public members of the caller's version
+					Multiname mname(core->findPublicNamespace(), name);
 					
 					// An undefined prop just becomes undefined in our sort
 					Atom x = toplevel->getproperty(obj->atom(), &mname, obj->vtable);
@@ -727,7 +728,7 @@ namespace avmplus
 
 	ArraySort::~ArraySort()
 	{
-		delete [] index;
+		mmfx_delete_array(index);
 		if(atoms) {
 			atoms->clear();
 			core->GetGC()->Free(atoms);
@@ -964,9 +965,10 @@ namespace avmplus
 		Atom atmk = get(k);
 		// Integer checks makes an int array sort about 3x faster.
 		// A double array sort is 5% slower because of this overhead
-		if (((atmj & 7) == kIntegerType) && ((atmk & 7) == kIntegerType))
+		if (atomIsBothIntptr(atmj, atmk))
 		{
-			return ((int)atmj - (int)atmk);
+            // yes, this code is wrong, but fixing requires a version-check to preserve buggy behavior
+            return ((int)atmj - (int)atmk);
 		}
 
 		double x = AvmCore::number(atmj);
@@ -986,7 +988,7 @@ namespace avmplus
 
 	ScriptObject* ArraySort::toFieldObject(Atom atom) const
 	{
-		if ((atom&7) != kObjectType)
+		if (atomKind(atom) != kObjectType)
 		{
 			#if 0
 			/* cn: ifdefed out, not sure what the intent was here, but calling code in FieldCompare
@@ -1032,7 +1034,8 @@ namespace avmplus
 		for (uint32 i = 0; i < numFields; i++)
 		{
 			Stringp name = fields[i].name;
-			Multiname mname(core->publicNamespace, name);
+			// NOTE compare the names of the caller's version
+			Multiname mname(core->findPublicNamespace(), name);
 			
 			opt = fields[i].options; // override the group defaults with the current field
 
@@ -1439,15 +1442,16 @@ namespace avmplus
 		ScriptObject *d = AvmCore::atomToScriptObject(thisAtom);
 		uint32 len = getLengthHelper(toplevel, d);
 
-		// If thisObject is null, the call function will substitute the global object 
-		Atom args[4] = { thisObject, nullObjectAtom, nullObjectAtom, thisAtom };
-
 		AvmCore* core = toplevel->core();
 		for (uint32 i = 0; i < len; i++)
 		{
-			args[1] = d->getUintProperty (i); // element
-			args[2] = core->uintToAtom (i); // index
-
+			// If thisObject is null, the call function will substitute the global object.
+			// args are modified in place by callee
+			Atom args[4] = { thisObject,
+				d->getUintProperty(i),	// element
+				core->uintToAtom(i),	// index
+				thisAtom
+			};
 			Atom result = callback->call(3, args);
 			if (result != trueAtom)
 				return false;
@@ -1471,20 +1475,20 @@ namespace avmplus
 		ScriptObject *d = AvmCore::atomToScriptObject(thisAtom);
 		uint32 len = getLengthHelper(toplevel, d);
 
-		// If thisObject is null, the call function will substitute the global object 
-		Atom args[4] = { thisObject, nullObjectAtom, nullObjectAtom, thisAtom };
-
 		AvmCore* core = toplevel->core();
 		for (uint32 i = 0; i < len; i++)
 		{
-			args[1] = d->getUintProperty (i); // element
-			args[2] = core->uintToAtom (i); // index
-
+			// If thisObject is null, the call function will substitute the global object 
+			// args are modified in place by callee
+			Atom args[4] = {
+				thisObject,
+				d->getUintProperty(i), // element
+				core->uintToAtom(i), // index
+				thisAtom
+			};
 			Atom result = callback->call(3, args);
 			if (result == trueAtom)
-			{
-				r->push (args + 1, 1);
-			}
+				r->push(args + 1, 1);
 		}
 
 		return r;
@@ -1503,15 +1507,16 @@ namespace avmplus
 		ScriptObject *d = AvmCore::atomToScriptObject(thisAtom);
 		uint32 len = getLengthHelper(toplevel, d);
 
-		// If thisObject is null, the call function will substitute the global object 
-		Atom args[4] = { thisObject, nullObjectAtom, nullObjectAtom, thisAtom };
-
 		AvmCore* core = toplevel->core();
 		for (uint32 i = 0; i < len; i++)
 		{
-			args[1] = d->getUintProperty (i); // element
-			args[2] = core->uintToAtom (i); // index
-
+			// If thisObject is null, the call function will substitute the global object 
+			// args are modified in place by callee
+			Atom args[4] = { thisObject,
+				d->getUintProperty(i),	// element
+				core->uintToAtom(i),	// index
+				thisAtom
+			};
 			callback->call(3, args);
 		}
 	}
@@ -1529,15 +1534,17 @@ namespace avmplus
 		ScriptObject *d = AvmCore::atomToScriptObject(thisAtom);
 		uint32 len = getLengthHelper(toplevel, d);
 
-		// If thisObject is null, the call function will substitute the global object 
-		Atom args[4] = { thisObject, nullObjectAtom, nullObjectAtom, thisAtom };
-
 		AvmCore* core = toplevel->core();
 		for (uint32 i = 0; i < len; i++)
 		{
-			args[1] = d->getUintProperty (i); // element
-			args[2] = core->uintToAtom (i); // index
-
+			// If thisObject is null, the call function will substitute the global object 
+			// args are modified in place by callee
+			Atom args[4] = {
+				thisObject,
+				d->getUintProperty(i),	// element
+				core->uintToAtom(i),	// index
+				thisAtom
+			};
 			Atom result = callback->call(3, args);
 			if (result == trueAtom)
 				return true;
@@ -1556,18 +1563,19 @@ namespace avmplus
 		ScriptObject *d = AvmCore::atomToScriptObject(thisAtom);
 		uint32 len = getLengthHelper(toplevel, d);
 
-		// If thisObject is null, the call function will substitute the global object 
-		Atom args[4] = { thisObject, nullObjectAtom, nullObjectAtom, thisAtom };
-
 		AvmCore* core = toplevel->core();
 		for (uint32 i = 0; i < len; i++)
 		{
-			args[1] = d->getUintProperty (i); // element
-			args[2] = core->uintToAtom (i); // index
-
+			// If thisObject is null, the call function will substitute the global object 
+			// args are modified in place by callee
+			Atom args[4] = {
+				thisObject,
+				d->getUintProperty(i),	// element
+				core->uintToAtom(i),	// index
+				thisAtom
+			};
 			Atom result = callback->call(3, args);
-
-			r->push (&result, 1);
+			r->push(&result, 1);
 		}
 
 		return r;
@@ -1576,7 +1584,8 @@ namespace avmplus
 	/*static*/ uint32_t ArrayClass::getLengthHelper(Toplevel* toplevel, ScriptObject* d)
 	{
 		AvmCore* core = toplevel->core();
-		Multiname mname(core->publicNamespace, core->klength);
+		// NOTE we can pick any public::length, so pick the default versioned one 
+		Multiname mname(core->getAnyPublicNamespace(), core->klength);
 		Atom lenAtm = toplevel->getproperty(d->atom(), &mname, d->vtable);
 		return AvmCore::toUInt32(lenAtm);
 	}
@@ -1584,7 +1593,8 @@ namespace avmplus
 	/*static*/ void ArrayClass::setLengthHelper(Toplevel* toplevel, ScriptObject* d, uint32 newLen)
 	{
 		AvmCore* core = toplevel->core();
-		Multiname mname(core->publicNamespace, core->klength);
+		// NOTE we can pick any public::length, so pick the default versioned one 
+		Multiname mname(core->getAnyPublicNamespace(), core->klength);
 		Atom lenAtm = core->uintToAtom(newLen);
 		toplevel->setproperty(d->atom(), &mname, lenAtm, d->vtable);
 	}

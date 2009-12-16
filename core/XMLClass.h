@@ -83,20 +83,19 @@ namespace avmplus
 
 		// Support for built-in "xml" namespace
 		DRCWB(Stringp) kXml;
-		DRCWB(Namespace*) nsXML;
 
 		// notification types 
-		ATOM_WB kAttrAdded;
-		ATOM_WB kAttrRemoved;
-		ATOM_WB kAttrChanged;
-		ATOM_WB kNodeAdded;
-		ATOM_WB kNodeRemoved;
-		ATOM_WB kNodeChanged;
-		ATOM_WB kNamespaceAdded;
-		ATOM_WB kNamespaceRemoved;
-		ATOM_WB kNamespaceSet;
-		ATOM_WB kNameSet;
-		ATOM_WB kTextSet;
+		DRCWB(Stringp) kAttrAdded;
+		DRCWB(Stringp) kAttrRemoved;
+		DRCWB(Stringp) kAttrChanged;
+		DRCWB(Stringp) kNodeAdded;
+		DRCWB(Stringp) kNodeRemoved;
+		DRCWB(Stringp) kNodeChanged;
+		DRCWB(Stringp) kNamespaceAdded;
+		DRCWB(Stringp) kNamespaceRemoved;
+		DRCWB(Stringp) kNamespaceSet;
+		DRCWB(Stringp) kNameSet;
+		DRCWB(Stringp) kTextSet;
 
 		// static props/funcs off the XML object
 		// XML.ignoreComments
@@ -124,6 +123,8 @@ namespace avmplus
 		int get_prettyIndent();
 
 		bool okToPrettyPrint() { return (get_prettyPrinting() && (m_prettyIndent >= 0)); }
+        
+		DECLARE_SLOTS_XMLClass;
 	};
 
 	/**
@@ -146,6 +147,8 @@ namespace avmplus
 
 		ATOM_WB kUri;
 		ATOM_WB kLocalName;
+        
+		DECLARE_SLOTS_QNameClass;
 	};
 }
 

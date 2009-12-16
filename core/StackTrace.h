@@ -83,13 +83,20 @@ namespace avmplus
 	class CallStackNode
 	{
 	public:
-
+		
+		// Note that the framep you hand to CallStackNode 
+		// varies depending on whether the Method
+		// in question is jitted or interped: if jitted, framep points
+		// to a series of 8-byte native values. if interped, framep
+		// points to a series of Atom. 
+		
 		void init(MethodEnv*				env
-					, Atom*					framep
+					, FramePtr				framep
 					, Traits**				frameTraits
 					, intptr_t volatile*	eip
-				    , bool                  boxed
 				);
+
+		void init(MethodInfo* methodInfo);
 
 		void init(AvmCore* core, Stringp name);
 
@@ -98,27 +105,35 @@ namespace avmplus
 		 * the CallStackNode representing the previous call stack
 		 * must be specified.  The source file and line number
 		 * will be unset, initially.
-		 * @param info the currently executing method
-		 * @param next the CallStackNode representing the previous
-		 *             call stack
-		 * @param  ap  the arguments pointer.  This is an Atom* if
-		 *             'boxed' is true, and an uint32_t* otherwise.
 		 */
 		inline explicit CallStackNode(MethodEnv*				env
-										, Atom*					framep
+										, FramePtr				framep
 										, Traits**				frameTraits
 										, intptr_t volatile*	eip
-									    , bool                  boxed = false
 								)
 		{
-			init(env, framep, frameTraits, eip, boxed);
+			init(env, framep, frameTraits, eip);
 		}
+		
+		// ctor used for external script profiling
+		inline explicit CallStackNode(AvmCore* core, uint64_t functionId, int32_t lineno)
+		{
+			init(core, functionId, lineno);
+		}
+        
+		void init(AvmCore* core, uint64_t functionId, int32_t lineno);
 
 		// ctor used only for Sampling (no MethodEnv)
 		inline explicit CallStackNode(AvmCore* core, const char* name)
 		{
 			Sampler* sampler = core ? core->get_sampler() : NULL;
 			init(core, sampler ? sampler->getFakeFunctionName(name) : NULL);
+		}
+		
+		// ctor used only for MethodInfo::verify (no MethodEnv, but has MethodInfo)
+		inline explicit CallStackNode(MethodInfo* info)
+		{
+			init(info);
 		}
 
 		// dummy ctor we can use to construct an uninitalized version -- useful for the thunks, which
@@ -140,25 +155,26 @@ namespace avmplus
 		
 		inline void sampleCheck() { if (m_core) m_core->sampleCheck(); }
 
-		void** FASTCALL scopeBase(); // with JIT, array members are (ScriptObject*); with interpreter, they are (Atom).
-
+		inline void setNext(CallStackNode* next) { m_next = next; }
 		inline CallStackNode* next() const { return m_next; }
 		// WARNING, env() can return null if there are fake Sampler-only frames. You must always check for null.
 		inline MethodEnv* env() const { return m_env; }
 		// WARNING, info() can return null if there are fake Sampler-only frames. You must always check for null.
-		inline MethodInfo* info() const { return m_env ? m_env->method : NULL; }
+		inline MethodInfo* info() const { return m_info; }
 		inline Stringp fakename() const { return m_fakename; }
 		inline int32_t depth() const { return m_depth; }
 
 		inline intptr_t volatile* eip() const { return m_eip; }
 		inline Stringp filename() const { return m_filename; }
-		inline Atom* framep() const { return m_framep; }
+		inline FramePtr framep() const { return m_framep; }
 		inline Traits** traits() const { return m_traits; }
 		inline int32_t linenum() const { return m_linenum; }
-		inline bool boxed() const { return m_boxed; }
 
 		inline void set_filename(Stringp s) { m_filename = s; }
 		inline void set_linenum(int32_t i) { m_linenum = i; }
+		
+		inline uint64_t functionId() const { return m_functionId; }
+		inline bool isAS3Sample() const { return m_functionId == 0; }
 
 		// Placement new and delete because the interpreter allocates CallStackNode
 		// instances inside other data structures (think alloca storage that has been
@@ -170,18 +186,28 @@ namespace avmplus
 		inline void* operator new(size_t, void* storage) { return storage; }
 		inline void operator delete(void*) {}
 
+        // enumerateScopeChainAtoms will list the active scopechain by repeatedly calling the addScope of the interface.
+        class IScopeChainEnumerator
+        {
+        public:
+            virtual ~IScopeChainEnumerator() { }
+            virtual void addScope(Atom scope) = 0;
+        };
+        void enumerateScopeChainAtoms(IScopeChainEnumerator& scb);
+
 	// ------------------------ DATA SECTION BEGIN
+	private:	uint64_t			m_functionId;	// int used to uniquely identify function calls in external scripting languages
 	private:	AvmCore*			m_core;
 	private:	MethodEnv*			m_env;			// will be NULL if the element is from a fake CallStackNode
+	private:	MethodInfo*			m_info;
 	private:	CallStackNode*		m_next;
 	private:	Stringp				m_fakename;		// NULL unless we are a fake CallStackNode
-	private:	int32_t				m_depth;
 	private:	intptr_t volatile*	m_eip;			// ptr to where the current pc is stored
 	private:	Stringp				m_filename;		// in the form "C:\path\to\package\root;package/package;filename"
-	private:	Atom*				m_framep;		// pointer to top of AS registers
-	private:	Traits**			m_traits;		// array of traits for AS registers
+	private:	FramePtr			m_framep;		// pointer to top of AS registers
+	private:	Traits**			m_traits;		// array of traits for AS registers and scopechain
 	private:	int32_t				m_linenum;
-	private:	bool				m_boxed;
+	private:	int32_t				m_depth;
 	// ------------------------ DATA SECTION END
 	};
 
@@ -204,31 +230,55 @@ namespace avmplus
 
 		struct Element
 		{
-			MethodInfo*			m_info;			// will be null for fake CallStackNode
-			Stringp				m_name;			// same as m_info->name (except for fake CallStackNode)
-			Stringp				m_filename;		// in the form "C:\path\to\package\root;package/package;filename"
-		    int32_t				m_linenum;
-		#ifdef AVMPLUS_64BIT
+			enum { EXTERNAL_CALL_FRAME = 1 }; // used for CallStackNodes for external scripting languages 
+
+  			MethodInfo*			m_info;			// will be null for fake CallStackNode
+			int32_t				m_linenum;
+		#ifdef VMCFG_64BIT
 			int32_t				m_pad;
 		#endif
+			union
+			{
+				struct
+				{
+					Stringp		m_fakename;		// needed just for fake CallStackNodes, null otherwise
+					Stringp		m_filename;		// in the form "C:\path\to\package\root;package/package;filename"
+                               }u;
+				uint64_t        m_functionId;
+			};
 
 			inline void set(const CallStackNode& csn) 
-			{ 
-				m_info		= csn.info();		// will be NULL if the element is from a fake CallStackNode
-				m_name		= csn.fakename();
-				if (!m_name && csn.info())
-					m_name = csn.info()->getMethodName();
-				m_filename	= csn.filename();
+			{
+				if (csn.functionId() != 0) 
+				{
+					m_info 		= (MethodInfo*) EXTERNAL_CALL_FRAME;
+				#ifdef VMCFG_64BIT
+                                       u.m_fakename    = NULL;         // let's keep the stack nice and clean
+				#endif
+					m_functionId = csn.functionId();
+				} 
+				else 
+				{
+					m_info		= csn.info();		// will be NULL if the element is from a fake CallStackNode
+                                       u.m_fakename    = csn.fakename();
+                                       u.m_filename    = csn.filename();
+				}
 				m_linenum	= csn.linenum();
-			#ifdef AVMPLUS_64BIT
+			#ifdef VMCFG_64BIT
 				m_pad		= 0;	// let's keep the stack nice and clean
 			#endif
 			}
+			inline bool isAS3Sample() const { return m_info != (MethodInfo*) EXTERNAL_CALL_FRAME; }
 			// WARNING, info() can return null if there are fake Sampler-only frames. You must always check for null.
-			inline MethodInfo* info() const { return m_info; }
-			inline Stringp infoname() const { return m_name; }
-			inline Stringp filename() const { return m_filename; }
+			inline MethodInfo* info() const { return isAS3Sample() ? m_info : NULL; }
+			#ifdef _DEBUG
+			// used in Sampler::presweep to check if the fake name is null or marked
+                       inline Stringp fakename() const { return isAS3Sample() ? u.m_fakename : NULL; }
+			#endif
+                       inline Stringp name() const     { return isAS3Sample() ? ((!u.m_fakename && m_info) ? m_info->getMethodName() : u.m_fakename) : NULL; }
+                       inline Stringp filename() const { return isAS3Sample() ? u.m_filename : NULL; }
 			inline int32_t linenum() const { return m_linenum; }
+			inline uint64_t functionId() const { return isAS3Sample() ? 0 : m_functionId; }
 		};
 		bool equals(StackTrace::Element* e, int depth);
 		static uintptr_t hashCode(StackTrace::Element* e, int depth);

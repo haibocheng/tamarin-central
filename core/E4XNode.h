@@ -118,13 +118,13 @@ namespace avmplus
 		DRCWB(Namespace*)		m_ns;
 				
 		/** callback on changes to children, attribute, name or namespace */
-		DRCWB(ScriptObject*)	m_notification;
+		DRCWB(FunctionObject*)	m_notification;
 
 		friend class E4XNode;
 		friend class ElementE4XNode;
 
 	public:
-		E4XNodeAux (Stringp s, Namespace *ns, ScriptObject* notify=0);
+		E4XNodeAux(Stringp s, Namespace* ns, FunctionObject* notify = NULL);
 	};
 
 	///////////////////////////////////////////////////
@@ -139,9 +139,8 @@ namespace avmplus
 	class E4XNode : public MMgc::GCObject
 	{
 	protected:
-	
 		/** Either null or an E4XNode, valid for all node types */
-		E4XNode * m_parent; 
+		DWB(E4XNode*) m_parent; 
 
 		// If this is a simple name with no namespace or notification function, 
 		// we just have a string pointer.  Otherwise, we're a E4XNodeAux value
@@ -152,19 +151,20 @@ namespace avmplus
 		#define AUXBIT 0x1
 
 	public:
-		E4XNode (E4XNode *parent) : m_parent(parent), m_nameOrAux(0) { }
+		E4XNode(E4XNode* parent) : m_parent(parent), m_nameOrAux(0) { }
+
 		// we have virtual functions, so we probably need a virtual dtor
 		virtual ~E4XNode() {}
 
-		bool getQName (AvmCore *core, Multiname *mn) const;
+		bool getQName (Multiname *mn, Namespacep publicNS) const;
 		void setQName (AvmCore *core, Stringp name, Namespace *ns = 0);
-		void setQName (AvmCore *core, Multiname *mn);
+		void setQName (AvmCore *core, const Multiname *mn);
 
 		virtual Stringp getValue() const = 0;
 		virtual void setValue (String *s) = 0;
 
-		E4XNode *getParent() const { return m_parent; };
-		void setParent (E4XNode *n) { WB(MMgc::GC::GetGC(this), this, &m_parent, n); }
+		E4XNode* getParent() const { return m_parent; };
+		void setParent(E4XNode* n) { m_parent = n; }
 
 		// Not used as bit fields (only one bit at a time can be set) but
 		// used for fast multi-type compares.
@@ -197,14 +197,16 @@ namespace avmplus
 		virtual void removeChild (uint32 /*i*/) {};
 		virtual void convertToAtomArray() {};
 
+ 		bool hasSimpleContent() const;
+ 		bool hasComplexContent() const;
+ 		int32 childIndex() const;
+ 		String* nodeKind(Toplevel* toplevel) const;
+ 
 		virtual void addAttribute (E4XNode *x);
 
 		// Should this silently fail or assert?
-		virtual void setNotification(AvmCore* /*core*/, ScriptObject* /*f*/) { return; }
-		virtual ScriptObject* getNotification() const { return 0; }
-
-		// used to determine child number in notifications
-		virtual uint32 childIndex()  const { return 0; };
+		virtual void setNotification(AvmCore* /*core*/, FunctionObject* /*f*/, Namespacep /*publicNS*/) { return; }
+		virtual FunctionObject* getNotification() const { return NULL; }
 
 		// The following routines are E4X support routines
 		
@@ -221,19 +223,20 @@ namespace avmplus
 		// Corresponds to [[Length]] in the docs
 		virtual uint32 _length() const { return 0; };
 
-		Atom _equals (AvmCore *core, E4XNode *value) const;
+		bool _equals(Toplevel* toplevel, AvmCore *core, E4XNode *value) const;
 
 		void _deleteByIndex (uint32 entry);
-		E4XNode *_deepCopy (AvmCore *core, Toplevel *toplevel) const;
+		E4XNode *_deepCopy (AvmCore *core, Toplevel *toplevel, Namespacep publicNS) const;
 		virtual void _insert (AvmCore *core, Toplevel *toplevel, uint32 entry, Atom value);
 		virtual E4XNode* _replace (AvmCore *core, Toplevel *toplevel, uint32 entry, Atom value, Atom pastValue = 0);
-		virtual void _addInScopeNamespace (AvmCore *core, Namespace *ns);
+		virtual void _addInScopeNamespace (AvmCore *core, Namespace *ns, Namespacep publicNS);
 		virtual void _append (E4XNode* /*childNode*/) { AvmAssert(0); };
 		// Extract a namespace from a tag name, and return the new tag name in tagName
 		Namespace *FindNamespace(AvmCore *core, Toplevel *toplevel, Stringp& tagName, bool bAttribute);
 		int FindMatchingNamespace(AvmCore *core, Namespace *ns);
 
 		void BuildInScopeNamespaceList(AvmCore *core, AtomArray *list) const;
+		void dispose();
 
 		MMgc::GC *gc() const { return MMgc::GC::GetGC(this); }
 	};
@@ -322,7 +325,7 @@ namespace avmplus
 
 		uint32 numAttributes() const { return (m_attributes ? m_attributes->getLength() : 0); };
 		AtomArray *getAttributes() const { return m_attributes; };
-		E4XNode *getAttribute(uint32 index) const { return (E4XNode *)AvmCore::atomToGCObject(m_attributes->getAt(index)); };
+		E4XNode *getAttribute(uint32 index) const { return (E4XNode *)AvmCore::atomToGenericObject(m_attributes->getAt(index)); };
 		void addAttribute (E4XNode *x);
 
 		uint32 numNamespaces() const { return (m_namespaces ? m_namespaces->getLength() : 0); };
@@ -340,11 +343,8 @@ namespace avmplus
 		Stringp getValue() const { return 0; };
 		void setValue (String *s) { (void)s; AvmAssert(s == 0); }
 
-		void setNotification(AvmCore *core, ScriptObject* f);
-		ScriptObject* getNotification() const;
-
-		// used to determine child number in notifications
-		uint32 childIndex()  const;
+		void setNotification(AvmCore* core, FunctionObject* f, Namespacep publicNS);
+		FunctionObject* getNotification() const;
 
 		// E4X support routines below
 		uint32 _length() const { return numChildren(); };
@@ -352,11 +352,11 @@ namespace avmplus
 
 		void _append (E4XNode *childNode);
 
-		void _addInScopeNamespace (AvmCore *core, Namespace *ns);
+		void _addInScopeNamespace (AvmCore *core, Namespace *ns, Namespacep publicNS);
 		void _insert (AvmCore *core, Toplevel *toplevel, uint32 entry, Atom value);
 		E4XNode* _replace (AvmCore *core, Toplevel *toplevel, uint32 entry, Atom value, Atom pastValue = 0);
 
-		void CopyAttributesAndNamespaces(AvmCore *core, Toplevel *toplevel, XMLTag& tag);
+		void CopyAttributesAndNamespaces(AvmCore *core, Toplevel *toplevel, XMLTag& tag, Namespacep publicNS);
 	};
 }
 #endif /* __avmplus_E4XNode__ */

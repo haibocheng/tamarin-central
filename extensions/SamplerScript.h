@@ -48,9 +48,11 @@ namespace avmplus
 		TraceClass(VTable* cvtable);
 
 		int getLevel(int target);
-		void setLevel(int lvl, int target);
-		void setListener(ScriptObject* f);
-		ScriptObject* getListener();
+		Atom setLevel(int lvl, int target);
+		Atom setListener(FunctionObject* f);
+		FunctionObject* getListener();
+        
+        DECLARE_SLOTS_TraceClass;
     };
 
 	class SamplerScript
@@ -77,10 +79,12 @@ namespace avmplus
 
 #ifdef DEBUGGER
 	private:		
-		static ClassClosure* getType(ScriptObject* self, Atom typeOrVTable, const void *obj);
+		static ClassClosure* getType(Toplevel* toplevel, SamplerObjectType sot, const void *obj);
 		
 		friend class SampleIterator;
 		static ScriptObject* makeSample(ScriptObject* self, const Sample& sample);
+		static bool set_stack(ScriptObject* self, const Sample& sample, SampleObject* sam);
+		static SampleObject* new_sam(ScriptObject* self, const Sample& sample, int clsid);
 #endif
 	};
 
@@ -90,20 +94,21 @@ namespace avmplus
 		SampleClass(VTable *vtable);
 		ScriptObject *createInstance(VTable *ivtable, ScriptObject *delegate);
 		
-		int typeOffset, stackOffset, timeOffset, idOffset, sizeOffset;
-		int nameOffset, fileOffset, lineOffset;
+		DECLARE_SLOTS_SampleClass;
 	};
-	typedef SampleClass DeleteObjectSampleClass;
 
 	class SampleObject : public ScriptObject
 	{
+		friend class SamplerScript;
 	public:
 		SampleObject(VTable *vtable, ScriptObject *delegate);
+        
+		DECLARE_SLOTS_SampleObject;
 	};
-	typedef SampleObject DeleteObjectSampleObject;
 
 	class NewObjectSampleObject : public SampleObject
 	{
+		friend class SamplerScript;
 	public:
 		NewObjectSampleObject(VTable *vtable, ScriptObject *delegate);
 		Atom get_object();
@@ -113,6 +118,8 @@ namespace avmplus
 	private:
 		DRCWB(AvmPlusScriptableObject*) obj;
 		uint64 size;
+        
+		DECLARE_SLOTS_NewObjectSampleObject;
 	};
 
 	class NewObjectSampleClass : public SampleClass
@@ -120,6 +127,44 @@ namespace avmplus
 	public:
 		NewObjectSampleClass(VTable *vtable);
 		ScriptObject *createInstance(VTable *ivtable, ScriptObject *delegate);
+		
+		DECLARE_SLOTS_NewObjectSampleClass;
+	};
+
+	class DeleteObjectSampleObject : public SampleObject
+	{
+		friend class SamplerScript;
+	public:
+		DeleteObjectSampleObject(VTable *vtable, ScriptObject *delegate);
+
+		DECLARE_SLOTS_DeleteObjectSampleObject;
+	};
+
+	class DeleteObjectSampleClass : public SampleClass
+	{
+	public:
+		DeleteObjectSampleClass(VTable *vtable);
+		ScriptObject *createInstance(VTable *ivtable, ScriptObject *delegate);
+		
+		DECLARE_SLOTS_DeleteObjectSampleClass;
+	};
+
+	class StackFrameObject : public ScriptObject
+	{
+		friend class SamplerScript;
+	public:
+		StackFrameObject(VTable *vtable, ScriptObject *delegate) : ScriptObject(vtable, delegate) {}
+		
+		DECLARE_SLOTS_StackFrameObject;
+	};
+
+	class StackFrameClass : public ClassClosure
+	{
+	public:
+		StackFrameClass(VTable *vtable) : ClassClosure(vtable) { }
+		ScriptObject *createInstance(VTable *ivtable, ScriptObject *delegate);
+		
+		DECLARE_SLOTS_StackFrameClass;
 	};
 }
 #endif // __avmplus_SamplerScript__

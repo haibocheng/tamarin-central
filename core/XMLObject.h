@@ -121,14 +121,14 @@ namespace avmplus
 		}
 
 	protected:
-		E4XNode *m_node;
+		DWB(E4XNode*) m_node;
 
 		friend class XMLClass;
 
 	public:
 
-		E4XNode *getNode() const { return m_node; }
-		void setNode(E4XNode* node) { WB(MMgc::GC::GetGC(this), this, &m_node, node); }
+		E4XNode* getNode() const { return m_node; }
+		void setNode(E4XNode* node) { m_node = node; }
 
 		// Functions that override object version
 		// Delete (deleteProperty)
@@ -185,8 +185,8 @@ namespace avmplus
 		Atom AS3_insertChildBefore (Atom child1, Atom child2);
 
 		// non-E4X extensions
-		ScriptObject* AS3_notification();
-		void AS3_setNotification(ScriptObject* f);
+		FunctionObject* AS3_notification();
+		Atom AS3_setNotification(FunctionObject* f); // AS3 declaration sez this returns an Atom
 
 		Atom AS3_localName ();
 		Atom AS3_name ();
@@ -229,8 +229,8 @@ namespace avmplus
 		inline Atom insertChildBefore (Atom child1, Atom child2) { return AS3_insertChildBefore (child1, child2); }
 
 		// non-E4X extensions
-		inline ScriptObject* notification() { return AS3_notification(); }
-		inline void setNotification(ScriptObject* f) { return AS3_setNotification(f); }
+		inline FunctionObject* notification() { return AS3_notification(); }
+		inline void setNotification(FunctionObject* f) { AS3_setNotification(f); }
 
 		inline Atom localName () { return AS3_localName (); }
 		inline Atom name () { return AS3_name (); }
@@ -257,10 +257,10 @@ namespace avmplus
 		Namespace *GenerateUniquePrefix (Namespace *ns, const AtomArray *namespaces) const;
 
 		static bool notifyNeeded(E4XNode* target);
-		void issueNotifications(AvmCore* core, Toplevel* top, E4XNode* initialTarget, Atom target, Atom type, Atom value, Atom detail=undefinedAtom);
+		void issueNotifications(AvmCore* core, Toplevel* top, E4XNode* initialTarget, Atom target, Stringp type, Atom value, Atom detail=undefinedAtom);
 
-		void childChanges(Atom type, Atom value, E4XNode* prior=0);
-		void nonChildChanges(Atom type, Atom value, Atom detail=undefinedAtom);
+		void childChanges(Stringp type, Atom value, E4XNode* prior=0);
+		void nonChildChanges(Stringp type, Atom value, Atom detail=undefinedAtom);
 
 		// accessors to node functions
 		int getClass() const; 
@@ -276,12 +276,11 @@ namespace avmplus
 		XMLListObject* filter (Atom propertyName, Atom value);
 		void _filter (XMLListObject* , const Multiname &m, Atom value);
 #endif
+		void dispose();
 
 	public:
 		XMLObject(XMLClass *type, Stringp s=NULL, Namespace *defaultNamespace=NULL);
 		XMLObject(XMLClass *type, E4XNode *node);
-
-		~XMLObject();
 
 #ifdef AVMPLUS_VERBOSE
 	public:
@@ -293,7 +292,9 @@ namespace avmplus
 		 * (strips @ from strings and marks multiname as attribute)
 		 */
 		void CoerceE4XMultiname(const Multiname *m, Multiname &out) const;
-		bool NodeNameEquals(Stringp odeName, Stringp parentName, Namespace *ns);
+		bool NodeNameEquals(Stringp nodeName, int32_t nodeNameStart, Stringp parentName, Namespace *ns);
+		Namespacep publicNS;
+		DECLARE_SLOTS_XMLObject;
 	};
 
 	/**
@@ -320,6 +321,7 @@ namespace avmplus
 		QNameObject(QNameClass *type, Atom name, bool bAttribute=false);
 		QNameObject(QNameClass *type, Namespace *nameSpace, Atom name, bool bAttribute=false);
 
+		Atom getURI() const;
 		Stringp get_localName() const;
 		Atom get_uri() const;
 
@@ -332,8 +334,10 @@ namespace avmplus
 
 		void getMultiname(Multiname& name) const
 		{
-			name = m_mn.getMultiname();
+			name = m_mn;
 		}
+		
+		DECLARE_SLOTS_QNameObject;
 	};
 }
 #endif /* __avmplus_XMLObject__ */

@@ -39,6 +39,18 @@
 #include "avmplus.h"
 #include "BuiltinNatives.h"
 
+#if defined FEATURE_NANOJIT
+#include "../nanojit/nanojit.h"
+#endif
+
+#ifdef VMCFG_AOT
+#include "AOTCompiler.h"
+#endif
+
+#ifdef VMCFG_NANOJIT
+#include "CodegenLIR.h"
+#endif
+
 //GCC only allows intrinsics if sse2 is enabled
 #if (defined(_MSC_VER) || (defined(__GNUC__) && defined(__SSE2__))) && (defined(AVMPLUS_IA32) || defined(AVMPLUS_AMD64))
     #include <emmintrin.h>
@@ -51,7 +63,7 @@ namespace avmplus
 	void AvmCore::setCacheSizes(const CacheSizes& cs)
 	{
 		#ifdef AVMPLUS_VERBOSE
-		if (verbose())
+		if (isVerbose(VB_traits))
 		{
 			console << "setCacheSize: bindings " << cs.bindings << " metadata " << cs.metadata << '\n';
 		}
@@ -64,29 +76,92 @@ namespace avmplus
  		m_msCache->resize(cs.methods);
 	}
 
-#ifdef AVMPLUS_TRAITS_MEMTRACK
-	extern AvmCore* g_tmcore;
-#endif
-
-	const bool AvmCore::verbose_default = false;
-	const bool AvmCore::verbose_addrs_default = false;
+	const uint32_t AvmCore::verbose_default = 0; // all off
 	const bool AvmCore::methodNames_default = true;
 	const bool AvmCore::oldVectorMethodNames_default = true;
 	const bool AvmCore::verifyall_default = false;
 	const bool AvmCore::show_stats_default = false;
 	const bool AvmCore::tree_opt_default = false;
-	const bool AvmCore::verbose_live_default = false;;
-	const bool AvmCore::verbose_exits_default = false;
 	const Runmode AvmCore::runmode_default = RM_mixed;
 	const bool AvmCore::cseopt_default = true;
-	const bool AvmCore::bbgraph_default = false;
 	const bool AvmCore::sse2_default = true;
+    const bool AvmCore::fixed_esp_default = false;
 	const bool AvmCore::interrupts_default = false;
+	const bool AvmCore::jitordie_default = false;
+
+#ifdef AVMPLUS_VERBOSE
+	#if defined FEATURE_NANOJIT
+		const uint32_t AvmCore::DEFAULT_VERBOSE_ON = ((uint32_t)~0 & ~(nanojit::LC_FragProfile<<16));
+	#else
+		const uint32_t AvmCore::DEFAULT_VERBOSE_ON = ((uint32_t)~0);
+	#endif
+
+    static bool substrMatches(const char* pattern, const char* p, const char* e)
+    {
+        ptrdiff_t const patlen = VMPI_strlen(pattern);
+        return (e-p) >= patlen && !VMPI_strncmp(p, pattern, patlen);
+    }
+
+    /*static*/ uint32_t AvmCore::parseVerboseFlags(const char* p)
+    {
+        uint32_t r = 0;
+
+        for (;;) 
+        {
+            const char* e = p;
+            // stop on null or end-of-line... use >=32 to catch those plus other unlikely/uninteresting cases
+            while (*e >= 32 && *e != ',') 
+                e++;
+
+            if (substrMatches("parse", p, e))
+                r |= VB_parse;
+            else if (substrMatches("verify", p, e))
+                r |= VB_verify;
+            else if (substrMatches("interp", p, e))
+                r |= VB_interp;
+            else if (substrMatches("traits", p, e))
+                r |= VB_traits;
+            else if (substrMatches("builtins", p, e))
+                r |= VB_builtins;
+            else if (substrMatches("memstats", p, e)) 
+                MMgc::GCHeap::GetGCHeap()->Config().gcstats = true;
+            else if (substrMatches("sweep", p, e)) 
+                MMgc::GCHeap::GetGCHeap()->Config().autoGCStats = true;
+            else if (substrMatches("occupancy", p, e)) 
+                MMgc::GCHeap::GetGCHeap()->Config().verbose = true;
+#if defined FEATURE_NANOJIT
+            else if (substrMatches("jit", p, e))
+                r |= VB_jit | ((nanojit::LC_Activation | nanojit::LC_Liveness | nanojit::LC_ReadLIR 
+                                                | nanojit::LC_AfterSF    | nanojit::LC_RegAlloc | nanojit::LC_Assembly
+                                                ) << 16); // stuff LC_Bits into the upper 16bits
+#endif /* FEATURE_NANOJIT */
+            if (*e < 32)
+                break;
+            p = e+1;
+        }
+
+        return r;
+    }
+#endif
+
+	// a single string with characters 0x00...0x7f (inclusive)
+	static const char* const k_cachedChars = 
+		"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F"
+		"\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F"
+		"\x20\x21\x22\x23\x24\x25\x26\x27\x28\x29\x2A\x2B\x2C\x2D\x2E\x2F"
+		"\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x3A\x3B\x3C\x3D\x3E\x3F"
+		"\x40\x41\x42\x43\x44\x45\x46\x47\x48\x49\x4A\x4B\x4C\x4D\x4E\x4F"
+		"\x50\x51\x52\x53\x54\x55\x56\x57\x58\x59\x5A\x5B\x5C\x5D\x5E\x5F"
+		"\x60\x61\x62\x63\x64\x65\x66\x67\x68\x69\x6A\x6B\x6C\x6D\x6E\x6F"
+		"\x70\x71\x72\x73\x74\x75\x76\x77\x78\x79\x7A\x7B\x7C\x7D\x7E\x7F";
 
 	AvmCore::AvmCore(GC* g) 
 		: GCRoot(g) 
 		, console(NULL) 
-		, gc(g) 
+		, gc(g)
+#ifdef _DEBUG
+		, codeContextThread(VMPI_currentThread())
+#endif
 #ifdef DEBUGGER
 		, _debugger(NULL)
 		, _profiler(NULL)
@@ -97,18 +172,19 @@ namespace avmplus
 #ifdef AVMPLUS_VERIFYALL
 		, verifyQueue(g, 0)
 #endif
+		, livePools(NULL)
 		, m_tbCache(new (g) QCache(CacheSizes::DEFAULT_BINDINGS, g))
  		, m_tmCache(new (g) QCache(CacheSizes::DEFAULT_METADATA, g))
  		, m_msCache(new (g) QCache(CacheSizes::DEFAULT_METHODS, g))	
-#ifdef AVMPLUS_WORD_CODE
+		, currentMethodFrame(NULL)
+#ifdef VMCFG_LOOKUP_CACHE
 		, lookup_cache_timestamp(1)
+#endif
+#ifdef VMCFG_NANOJIT
+		, m_flushBindingCachesNextSweep(false)
 #endif
 		, gcInterface(g)
     {
-#ifdef AVMPLUS_TRAITS_MEMTRACK
-		AvmAssert(g_tmcore == NULL);
-		g_tmcore = this;
-#endif
 		// sanity check for all our types
 		MMGC_STATIC_ASSERT(sizeof(int8) == 1);
 		MMGC_STATIC_ASSERT(sizeof(uint8) == 1);		
@@ -129,40 +205,24 @@ namespace avmplus
 #endif	
 			
 		// set default mode flags
-#ifdef AVMPLUS_VERBOSE
-		config.verbose = verbose_default;
-		config.verbose_addrs = verbose_addrs_default;
-#endif
+		config.verbose_vb = verbose_default;
 
-#if VMCFG_METHOD_NAMES
 		// default to recording method names, if possible. 
 		// (subclass might change this in its ctor if it wants to conserve memory.)
 		config.methodNames = methodNames_default;
 		config.oldVectorMethodNames = oldVectorMethodNames_default;
-#endif
 
-#ifdef AVMPLUS_VERIFYALL
 	   	config.verifyall = verifyall_default;
-#endif
-
-#ifdef FEATURE_NANOJIT
 		config.show_stats = show_stats_default;
 		config.tree_opt = tree_opt_default;
-		config.verbose_live = verbose_live_default;
-		config.verbose_exits = verbose_exits_default;
 
 		// jit flag forces use of jit-compiler instead of interpreter
 		config.runmode = runmode_default;
 		config.cseopt = cseopt_default;
+		config.jitordie = jitordie_default;
 
-	#ifdef AVMPLUS_VERBOSE
-		config.bbgraph = bbgraph_default;
-	#endif
-
-	#if defined(AVMPLUS_IA32) || defined(AVMPLUS_AMD64)
 		config.sse2 = sse2_default;
-	#endif
-#endif // FEATURE_NANOJIT
+        config.fixed_esp = fixed_esp_default;
 
 #ifdef VTUNE
 		VTuneStatus = CheckVTuneStatus();
@@ -181,13 +241,12 @@ namespace avmplus
 
 		minstack           = 0;
 
+#ifdef DEBUGGER
 		callStack          = NULL;
+#endif
 
-		interrupted        = false;
+		interrupted     = NotInterrupted;
 
-		codeContextAtom    = CONTEXT_NONE;
-		dxnsAddr		   = NULL;
-		
 		strings			= NULL;
 		numStrings		= 0;
 		namespaces		= NULL;
@@ -197,16 +256,15 @@ namespace avmplus
 		nsCount			= 0;
 
 		numStrings = 1024; // power of 2
-		strings = new DRC(Stringp)[numStrings];
-		VMPI_memset(strings, 0, numStrings*sizeof(Stringp));
+		strings = mmfx_new_array(DRC(Stringp), numStrings);
+		VMPI_memset(strings, 0, numStrings*sizeof(DRC(Stringp)));
 
 		numNamespaces = 1024;  // power of 2
-		namespaces = new DRC(Namespacep)[numNamespaces];
-		VMPI_memset(namespaces, 0, numNamespaces*sizeof(Namespacep));
+		namespaces = mmfx_new_array(DRC(Namespacep), numNamespaces);
+		VMPI_memset(namespaces, 0, numNamespaces*sizeof(DRC(Namespacep)));
 
 		console.setCore(this);
 		
-        kEmptyString = internConstantStringLatin1("");
 		kconstructor = internConstantStringLatin1("constructor");
         kundefined = internConstantStringLatin1("undefined");
         knull = internConstantStringLatin1("null");
@@ -239,25 +297,31 @@ namespace avmplus
 
 		for (int i = 0; i < 128; i++)
 		{
-			char singleChar = (char)i;
+			AvmAssert(k_cachedChars[i] == i);
 			// call String::createLatin1() with an explicit length of 1; required
 			// when singleChar==0, because in that case we need a string
 			// which is a single character with value 0
-			cachedChars[i] = internString(String::createLatin1(this, &singleChar, 1));
+			cachedChars[i] = internString(String::createLatin1(this, &k_cachedChars[i], 1));
 		}
 
 		booleanStrings[0] = kfalse;
         booleanStrings[1] = ktrue;
 
+		// init kEmptyString last, so that StringObject can use it as a sentinel for 
+		// determining if all the cached strings are valid.
+        kEmptyString = internConstantStringLatin1("");
+
 		// create public namespace 
 		publicNamespace = internNamespace(newNamespace(kEmptyString));
 
-		#ifdef AVMPLUS_WITH_JNI
+#ifdef AVMPLUS_WITH_JNI
 		java = NULL;
 		#endif
 #ifdef SUPERWORD_PROFILING
 		WordcodeTranslator::swprofStart();
 #endif
+
+		_emptySupertypeList = Traits::allocSupertypeList(gc, 0);
 	}
 
 	AvmCore::~AvmCore()
@@ -266,8 +330,17 @@ namespace avmplus
 		delete _sampler;
 		_sampler = NULL;
 #endif
+
+		m_tbCache->flush(); 
+		m_tmCache->flush(); 
+		m_msCache->flush(); 
+
+		m_tbCache = NULL;
+		m_tmCache = NULL;
+		m_msCache = NULL;
+		
 		// Free the numbers and strings tables
-		delete [] strings;
+		mmfx_delete_array(strings);
 		if (gc) 
 		{
 			gc->SetGCContextVariable(GC::GCV_AVMCORE, NULL);
@@ -275,13 +348,9 @@ namespace avmplus
 
 		strings = NULL;
 
-		delete [] namespaces;
+		mmfx_delete_array(namespaces);
 		namespaces = NULL;
 
-#ifdef AVMPLUS_TRAITS_MEMTRACK
-		AvmAssert(g_tmcore == this);
-		g_tmcore = NULL;
-#endif
 #ifdef SUPERWORD_PROFILING
 		WordcodeTranslator::swprofStop();
 #endif
@@ -289,18 +358,41 @@ namespace avmplus
 		delete _profiler;
 		_profiler = NULL;
 #endif
+		LivePoolNode* node = livePools;
+		while (node)
+		{
+			LivePoolNode* next = node->next;
+			delete node;
+			node = next;
+		} 
+		livePools = NULL;
 	}
 
-	void AvmCore::initBuiltinPool()
+	void AvmCore::initBuiltinPool(
+#ifdef DEBUGGER
+								  int tracelevel
+#endif
+	)
 	{
 		#ifdef DEBUGGER
-		_debugger = createDebugger();
+		_debugger = createDebugger(tracelevel);
 		_profiler = createProfiler();
 		#endif
 	
 		builtinDomain = new (GetGC()) Domain(this, NULL);
 		
+#ifdef VMCFG_AOT
+        NativeInitializer ninit(this,
+								&builtin_aotInfo,
+								avmplus::NativeID::builtin_abc_method_count,
+								avmplus::NativeID::builtin_abc_class_count);
+        ninit.fillInClasses(avmplus::NativeID::builtin_classEntries);
+        ninit.fillInMethods(avmplus::NativeID::builtin_methodEntries);
+        builtinPool = ninit.parseBuiltinABC(builtinDomain);
+#else
 		builtinPool = AVM_INIT_BUILTIN_ABC(builtin, this);
+#endif
+		AvmAssert(builtinPool->isBuiltin);
 
 		// whack the the non-interruptable bit on all builtin functions
 		for(int i=0, size=builtinPool->methodCount(); i<size; i++)
@@ -309,19 +401,81 @@ namespace avmplus
 		for(int i=0, size=builtinPool->classCount(); i<size; i++)
 			builtinPool->getClassTraits(i)->init->makeNonInterruptible();
 
-		for(int i=0, size=builtinPool->scripts.size(); i<size; i++)
-			builtinPool->scripts[i]->makeNonInterruptible();
+		for(int i=0, size=builtinPool->scriptCount(); i<size; i++)
+			builtinPool->getScriptTraits(i)->init->makeNonInterruptible();
 
 #ifdef DEBUGGER
 		// sampling can begin now, requires builtinPool
 		if (_debugger)
 		{
-			_sampler = new Sampler(this);
+			_sampler = createSampler();
+			AvmAssert(_sampler != NULL);
 			_sampler->initSampling();
 		}
 #endif
 	}
+
+#ifdef DEBUGGER	
+	Debugger* AvmCore::createDebugger(int /*tracelevel*/)
+	{
+		return NULL;
+	}
+
+	Profiler* AvmCore::createProfiler()
+	{
+		return NULL;
+	}
+
+	Sampler* AvmCore::createSampler()
+	{
+		return (new Sampler(this));
+	}
+#endif
+
+	/*virtual*/ void AvmCore::setStackBase() 
+	{
+		// nothing
+	}
 	
+	/*static*/ void AvmCore::readOperands(const byte* &pc, unsigned int& imm32, int& imm24, unsigned int& imm32b, int& imm8 )
+	{
+		AbcOpcode opcode = (AbcOpcode)*pc++;
+		int op_count = opcodeInfo[opcode].operandCount;
+
+		imm8 = pc[0];
+		if( opcode == OP_pushbyte || opcode == OP_debug )
+		{
+			// these two operands have a byte as their first operand, which is not encoded
+			// with the variable length encoding scheme for bigger numbers, because it will
+			// never be larger than a byte.
+			--op_count;
+			pc++;
+		}
+
+		if( op_count > 0 )
+		{
+			if( opcode >= OP_ifnlt && opcode <= OP_lookupswitch )
+			{
+				imm24 = AvmCore::readS24(pc);
+				pc += 3;
+			}
+			else
+			{
+				imm32 = AvmCore::readU30(pc);
+			}
+
+			if( opcode == OP_debug )
+			{
+				--op_count; //OP_debug has a third operand of a byte
+				pc++;
+			}
+			if( op_count > 1 )
+			{
+				imm32b = AvmCore::readU30(pc);
+			}
+		}
+	}
+
 	Toplevel* AvmCore::initTopLevel()
 	{
 		Toplevel* toplevel = NULL;
@@ -329,17 +483,46 @@ namespace avmplus
 		return toplevel;
 	}
 
-	static ScriptEnv* initScript(AvmCore* core, Toplevel* toplevel, AbcEnv* abcEnv, MethodInfo* script)
+	static void initScriptActivationTraits(AvmCore* core, Toplevel* toplevel, MethodInfo* method)
 	{
-		Traits* scriptTraits = script->declaringTraits();
+#ifdef VMCFG_AOT
+		PoolObject* pool = method->pool();
+		const AOTInfo* aotInfo = pool->aotInfo;
+		if (method->needActivation()) {
+			Traits* activationTraits = method->activationTraits();
+			AvmAssert(activationTraits != NULL);
+			AvmAssert(method->method_id() < aotInfo->nActivationTraits);
+			aotInfo->activationTraits[method->method_id()] = activationTraits;
+			if (aotInfo->activationTraitsInitFunctions[method->method_id()] != NULL) {
+				NativeMethodInfo compiledMethodInfo;
+				compiledMethodInfo.thunker = aotThunker;
+				compiledMethodInfo.handler.function = aotInfo->activationTraitsInitFunctions[method->method_id()];
+				activationTraits->init = new (core->gc) MethodInfo(MethodInfo::kInitMethodStub, activationTraits, &compiledMethodInfo);
+			}
+			method->resolveActivation(toplevel);
+		}
+		method->declaringTraits()->initActivationTraits(toplevel);
+#else
+		(void)core;
+		(void)toplevel;
+		(void)method;
+#endif
+	}
+	
+	static ScriptEnv* initScript(AvmCore* core, Toplevel* toplevel, AbcEnv* abcEnv, Traits* scriptTraits)
+	{
 		// [ed] 3/24/06 why do we really care if a script is dynamic or not?
 		//AvmAssert(scriptTraits->needsHashtable);
 
-		ScopeChain* scriptScope = ScopeChain::create(core->GetGC(), scriptTraits->scope(), NULL, core->newNamespace(core->kEmptyString));
-		VTable* scriptVTable = core->newVTable(scriptTraits, toplevel->object_ivtable, scriptScope, abcEnv, toplevel);
-		ScriptEnv* scriptEnv = new (core->GetGC()) ScriptEnv(scriptTraits->init, scriptVTable);
+		bool wasResolved = scriptTraits->isResolved();
+		VTable* scriptVTable = core->newVTable(scriptTraits, toplevel->object_ivtable, toplevel);
+		AvmAssert(scriptTraits->isResolved());
+		if (!wasResolved)
+			scriptTraits->init_declaringScopes(ScopeTypeChain::createEmpty(core->GetGC(), scriptTraits));
+		ScriptEnv* scriptEnv = new (core->GetGC()) ScriptEnv(scriptTraits->init, scriptVTable, abcEnv);
 		scriptVTable->init = scriptEnv;
 		core->exportDefs(scriptTraits, scriptEnv);
+		initScriptActivationTraits(core, toplevel, scriptTraits->init);
 		return scriptEnv;
 	}
 	
@@ -351,7 +534,7 @@ namespace avmplus
 		AvmAssert(pool != NULL);
 
 		// get the main entry point and its global traits
-		if (pool->scriptCount == 0)
+		if (pool->scriptCount() == 0)
 		{
 			toplevel->verifyErrorClass()->throwError(kMissingEntryPointError);
 		}
@@ -374,25 +557,26 @@ namespace avmplus
 			domainEnv->setToplevel(toplevel);
 			
 			main = toplevel->mainEntryPoint();
+			initScriptActivationTraits(this, toplevel, main->method);
 		}
 		else
 		{
 			// some code relies on the final script being initialized first, so we
 			// must continue that behavior
-			main = initScript(this, toplevel, abcEnv, pool->scripts[pool->scriptCount-1]);
+			main = initScript(this, toplevel, abcEnv, pool->getScriptTraits(pool->scriptCount()-1));
 		}
 
 		// skip the final one, it's already been done
-		for (int i=0, n=pool->scriptCount-1; i < n; i++)
+		for (int i=0, n=pool->scriptCount()-1; i < n; i++)
 		{
-			initScript(this, toplevel, abcEnv, pool->scripts[i]);
+			initScript(this, toplevel, abcEnv, pool->getScriptTraits(i));
 		}
 
 #ifdef AVMPLUS_VERIFYALL
 		if (config.verifyall) {
-			for (int i=0, n=pool->scriptCount; i < n; i++)
-				enqTraits(pool->scripts[i]->declaringTraits());
-			verifyEarly(toplevel);
+			for (int i=0, n=pool->scriptCount(); i < n; i++)
+				enqTraits(pool->getScriptTraits(i));
+			verifyEarly(toplevel, abcEnv);
 		}
 #endif
 
@@ -439,14 +623,13 @@ namespace avmplus
 		DomainEnv* domainEnv = abcEnv->domainEnv();
 
 		// iterate thru each of the definitions exported by this script
-		int i=0;
-		TraitsBindingsp tb = scriptTraits->getTraitsBindings();
-		while((i=tb->next(i)) != 0)
+		StTraitsBindingsIterator iter(scriptTraits->getTraitsBindings());
+		while (iter.next())
 		{
 			// don't need to check for DELETED because we never remove trait bindings
-			AvmAssert(tb->keyAt(i) != NULL);
-			Stringp name = tb->keyAt(i);
-			Namespacep ns = tb->nsAt(i);
+			Stringp name = iter.key();
+			if (!name) continue;
+			Namespacep ns = iter.ns();
 				
 			// not already in the table then export it 
 			// otherwise we keep the first one that was encountered.
@@ -457,7 +640,7 @@ namespace avmplus
 					// add ns/name to global table
 					// ISSUE should we filter out Object traits and/or private members?
 					#ifdef AVMPLUS_VERBOSE
-					if (scriptTraits->pool->verbose)
+					if (scriptTraits->pool->isVerbose(VB_parse))
 						console << "exporting " << ns << "::" << name << "\n";
 					#endif
 					domainEnv->addNamedScript(name, ns, scriptEnv);
@@ -471,7 +654,7 @@ namespace avmplus
 				}
 			}
 		}
-#ifdef AVMPLUS_WORD_CODE
+#ifdef VMCFG_LOOKUP_CACHE
 		// Adding scripts to a domain always invalidates the lookup cache.
 		invalidateLookupCache();
 #endif
@@ -482,7 +665,7 @@ namespace avmplus
 										  Toplevel* toplevel,
 										  Domain* domain,
 										  const NativeInitializer* ninit,
-										  const List<Stringp>* include_versions)
+										  uint32_t api)
 	{
 		// parse constants and attributes.
 		PoolObject* pool = AbcParser::decodeAbc(this,
@@ -490,7 +673,7 @@ namespace avmplus
 												toplevel,
 												domain,
 												ninit,
-												include_versions);
+												api);
 
         #ifdef DEBUGGER
 		if (_debugger) 
@@ -507,7 +690,8 @@ namespace avmplus
 										 DomainEnv* domainEnv,
 										 Toplevel* &toplevel,
 										 const NativeInitializer* ninit,
-										 CodeContext *codeContext)
+										 CodeContext *codeContext,
+										 uint32_t api)
     {
 		Domain* domain = domainEnv ? domainEnv->domain() : builtinDomain;
 		
@@ -516,7 +700,8 @@ namespace avmplus
 								start,
 								toplevel,
 								domain,
-								ninit);
+								ninit,
+								api);
 		return handleActionPool(pool, domainEnv, toplevel, codeContext);
 	}
 	
@@ -526,10 +711,11 @@ namespace avmplus
 									 DomainEnv* domainEnv,
 									 Toplevel* &toplevel,
 									 const NativeInitializer* ninit,
-									 CodeContext *codeContext)
+									 CodeContext *codeContext,
+									 uint32_t api)
 	{
 		ScriptBuffer buffer = avmplus::compileProgram(this, toplevel, code, filename);
-		return handleActionBlock(buffer, 0, domainEnv, toplevel, ninit, codeContext);
+		return handleActionBlock(buffer, 0, domainEnv, toplevel, ninit, codeContext, api);
 	}
 #endif // VMCFG_EVAL
 
@@ -586,8 +772,8 @@ return the result of the comparison ToPrimitive(x) == y.
 		if (isNull(lhs)) lhs = 0;
 		if (isNull(rhs)) rhs = 0;
 
-		int ltype = (int)(lhs & 7);
-        int rtype = (int)(rhs & 7);
+		int ltype = (int)atomKind(lhs);
+        int rtype = (int)atomKind(rhs);
 
 		// See E4X 11.5.1, pg 53.  
 		if ((ltype == kObjectType) && (isXMLList(lhs)))
@@ -607,7 +793,7 @@ return the result of the comparison ToPrimitive(x) == y.
 				if (lhs == rhs) return trueAtom;
 				return (*atomToString(lhs) == *atomToString(rhs)) ? trueAtom : falseAtom;
             case kBooleanType:
-			case kIntegerType:
+			case kIntptrType:
 				return lhs == rhs ? trueAtom : falseAtom;
 			case kNamespaceType:
 				// E4X 11.5.1, pg 53
@@ -628,14 +814,14 @@ return the result of the comparison ToPrimitive(x) == y.
 					}	
 					else
 					{
-						return x->getNode()->_equals(this, y->getNode());
+						return x->getNode()->_equals(x->toplevel(), this, y->getNode()) ? trueAtom : falseAtom;
 					}
 				}
 				else if (isQName(lhs) && isQName(rhs))
 				{
 					QNameObject *qn1 = atomToQName (lhs);
 					QNameObject *qn2 = atomToQName (rhs);
-					return (((qn1->get_uri() == qn2->get_uri()) && (qn1->get_localName() == qn2->get_localName()))? trueAtom : falseAtom);
+					return (((qn1->getURI() == qn2->getURI()) && (qn1->get_localName() == qn2->get_localName()))? trueAtom : falseAtom);
 				}
 				else
 				{
@@ -651,10 +837,10 @@ return the result of the comparison ToPrimitive(x) == y.
 		{
 			if (isNullOrUndefined(lhs) && isNullOrUndefined(rhs))
 				return trueAtom;
-            if (ltype == kIntegerType && rtype == kDoubleType)
-				return ((double)(lhs>>3)) == atomToDouble(rhs) ? trueAtom : falseAtom;
-            if (ltype == kDoubleType && rtype == kIntegerType)
-                return atomToDouble(lhs) == ((double)(rhs>>3)) ? trueAtom : falseAtom;
+            if (ltype == kIntptrType && rtype == kDoubleType)
+				return ((double)atomGetIntptr(lhs)) == atomToDouble(rhs) ? trueAtom : falseAtom;
+            if (ltype == kDoubleType && rtype == kIntptrType)
+                return atomToDouble(lhs) == ((double)atomGetIntptr(rhs)) ? trueAtom : falseAtom;
 
 			// 16. If Type(x) is Number and Type(y) is String,
 			// return the result of the comparison x == ToNumber(y).
@@ -677,11 +863,11 @@ return the result of the comparison ToPrimitive(x) == y.
 
 			// 18. If Type(x) is Boolean, return the result of the comparison ToNumber(x) == y.
             if (ltype == kBooleanType)
-                return equals((lhs&~7)|kIntegerType, rhs);  // equal(toInteger(lhs), rhs)
+                return equals((lhs&~7)|kIntptrType, rhs);  // equal(toInteger(lhs), rhs)
 			
 			// 19. If Type(y) is Boolean, return the result of the comparison x == ToNumber(y).
             if (rtype == kBooleanType)
-                return equals(lhs, (rhs&~7)|kIntegerType);  // equal(lhs, toInteger(rhs))
+                return equals(lhs, (rhs&~7)|kIntptrType);  // equal(lhs, toInteger(rhs))
 
 			// 20. If Type(x) is either String or Number and Type(y) is Object,
 			// return the result of the comparison x == ToPrimitive(y).
@@ -706,7 +892,7 @@ return the result of the comparison ToPrimitive(x) == y.
     Atom AvmCore::compare(Atom lhs, Atom rhs)
     {
         // fixme - toprimitive must take number hint, so "7" becomes 7
-		if ((lhs&7)==kIntegerType && (rhs&7)==kIntegerType)
+		if (atomIsBothIntptr(lhs, rhs))
 		{
 			// fast path for integers
 			return lhs < rhs ? trueAtom : falseAtom;
@@ -718,7 +904,8 @@ return the result of the comparison ToPrimitive(x) == y.
 		if (isString(lhs) && isString(rhs))
         {
             // string compare. todo optimize!
-			return *string(lhs) < *string(rhs) ? trueAtom : falseAtom;
+			// we already know they are strings, call atomToString() rather than string()
+			return *atomToString(lhs) < *atomToString(rhs) ? trueAtom : falseAtom;
         }
 
 		// numeric compare
@@ -734,8 +921,8 @@ return the result of the comparison ToPrimitive(x) == y.
 		if (isNull(lhs)) return isNull(rhs) ? trueAtom : falseAtom;
 		if (isNull(rhs)) return falseAtom; // We already know that lhs is not null
 
-        int ltype = lhs & 7;
-        int rtype = rhs & 7;
+        int ltype = atomKind(lhs);
+        int rtype = atomKind(rhs);
         if (ltype == rtype)
         {
             // same type
@@ -746,7 +933,7 @@ return the result of the comparison ToPrimitive(x) == y.
             case kStringType:
                 return (lhs==rhs || *string(lhs) == *string(rhs)) ? trueAtom : falseAtom;
             case kBooleanType:
-            case kIntegerType:
+            case kIntptrType:
             case kNamespaceType:
 				return lhs == rhs ? trueAtom : falseAtom;
             case kObjectType:
@@ -767,8 +954,8 @@ return the result of the comparison ToPrimitive(x) == y.
             }
         }
 		// Sometimes ints can hide in double atoms (neg zero for one)
-		else if (((ltype == kIntegerType) && (rtype == kDoubleType)) || 
-			((rtype == kIntegerType) && (ltype == kDoubleType)))
+		else if (((ltype == kIntptrType) && (rtype == kDoubleType)) || 
+			((rtype == kIntptrType) && (ltype == kDoubleType)))
 		{
 			return number(lhs) == number(rhs) ? trueAtom : falseAtom;
 		}
@@ -942,9 +1129,9 @@ return the result of the comparison ToPrimitive(x) == y.
 		}
 
 		int index = mapTable[2*lo+1];
-		int id = mapTable[2*lo];
+		int ident = mapTable[2*lo];
 
-		if (id == errorID) {
+		if (ident == errorID) {
 			return newStringUTF8(errorTable[index]);
 		} else {
 			return NULL;
@@ -1110,12 +1297,14 @@ return the result of the comparison ToPrimitive(x) == y.
 		{
 			s = kEmptyString;
 		}
-
-		if (t->ns != NULL && t->ns != publicNamespace)
-			s = concatStrings(s, concatStrings(toErrorString(t->ns), newConstantStringLatin1("."))); 
-
-		if (t->name)
-			s = concatStrings(s, t->name);
+		
+		Namespacep ns = t->ns();
+		if (ns != NULL && !ns->getURI()->isEmpty())
+			s = concatStrings(s, concatStrings(toErrorString(ns), newConstantStringLatin1("."))); 
+		
+		Stringp n = t->name();
+		if (n)
+			s = concatStrings(s, n);
 		else
 			s = concatStrings(s, newConstantStringLatin1("(null)"));
 		return s;
@@ -1180,12 +1369,11 @@ return the result of the comparison ToPrimitive(x) == y.
     {
 		if (!AvmCore::isNullOrUndefined(atom))
 		{
-			switch (atom&7)
+			switch (atomKind(atom))
 			{
-			case kIntegerType:
+			case kIntptrType:
 				{
-					Atom i = atom>>3;
-					return (urshift(i|-i,28)&~7) | kBooleanType;
+					return atomGetIntptr(atom) ? trueAtom : falseAtom;
 				}
 			case kBooleanType:
 				return atom;
@@ -1212,9 +1400,10 @@ return the result of the comparison ToPrimitive(x) == y.
     {
 		if (!AvmCore::isNullOrUndefined(atom))
 		{
-			switch (atom&7)
+			switch (atomKind(atom))
 			{
-			case kIntegerType:
+			case kIntptrType:
+                return atomGetIntptr(atom) != 0;
 			case kBooleanType:
 				return (atom & ~7) != 0;
 			case kObjectType:
@@ -1254,7 +1443,7 @@ return the result of the comparison ToPrimitive(x) == y.
 		if (!isNull(atom))
 		{
 			double value;
-			switch (atom&7)
+			switch (atomKind(atom))
 			{
 			case kSpecialType:
 				return kNaN;
@@ -1264,9 +1453,9 @@ return the result of the comparison ToPrimitive(x) == y.
 			default:
 				AvmAssert(false);
 			case kBooleanType:
-				return (atom&~7) | kIntegerType;
+				return (atom&~7) | kIntptrType;
 			case kDoubleType:
-			case kIntegerType:
+			case kIntptrType:
 				return atom;
 			case kNamespaceType:
 				// return ToNumber(namespace->uri)
@@ -1280,7 +1469,7 @@ return the result of the comparison ToPrimitive(x) == y.
 		}
 		else
 		{
-			return 0 | kIntegerType;
+			return zeroIntAtom;
 		}
     }
 	
@@ -1290,9 +1479,9 @@ return the result of the comparison ToPrimitive(x) == y.
 		{
 			const int kind = atomKind(atom);
 
-			// kIntegerType is by far the most common
-			if (kind == kIntegerType)
-				return (double) atomInt(atom);
+			// kIntptrType is by far the most common
+			if (kind == kIntptrType)
+				return (double) atomGetIntptr(atom);
 
 			// kDoubleType is next most common
 			if (kind == kDoubleType)
@@ -1327,7 +1516,7 @@ return the result of the comparison ToPrimitive(x) == y.
     {
 		if (!isNull(atom))
 		{
-			switch (atom&7)
+			switch (atomKind(atom))
 			{
 			case kBooleanType:
 				return booleanStrings[atom>>3];
@@ -1339,8 +1528,8 @@ return the result of the comparison ToPrimitive(x) == y.
 				return kundefined;
 			case kObjectType:
 				return intern(atomToScriptObject(atom)->toString());
-			case kIntegerType:
-				return internInt((int)(atom>>3));
+			case kIntptrType:
+				return internInt((int32_t)atomGetIntptr(atom));
 			case kDoubleType:
 			default: // number
 				return internDouble(atomToDouble(atom));
@@ -1364,7 +1553,7 @@ return the result of the comparison ToPrimitive(x) == y.
 		int i = findNamespace(ns);
 		if (namespaces[i] == NULL)
 		{
-			// first time we've seen this namespace.  intern int
+			// first time we've seen this namespace.  intern it
 			nsCount++;
 			namespaces[i] = ns;
 			return ns;
@@ -1378,7 +1567,7 @@ return the result of the comparison ToPrimitive(x) == y.
 	/* static */
 	void AvmCore::formatMultiname(PrintWriter& out, uint32 index, PoolObject* pool)
 	{
-		if (index > 0 && index <= pool->constantMnCount)
+		if (index > 0 && index <= pool->cpool_mn_offsets.size())
 		{
 			Multiname name;
 			pool->parseMultiname(name, index);
@@ -1400,9 +1589,11 @@ return the result of the comparison ToPrimitive(x) == y.
 			{
 				buffer << opcodeInfo[opcode].name;
 				uint32 index = readU30(pc);
-				String *s = format(pool->cpool_string[index]->atom());
-				if (index < pool->cpool_string.size())
+				if (index < pool->constantStringCount)
+				{
+					String *s = format(pool->getString(index)->atom());
 					buffer << " " << s;
+				}
 				break;
 			}
 			case OP_pushbyte:
@@ -1428,8 +1619,14 @@ return the result of the comparison ToPrimitive(x) == y.
 			{
 				buffer << opcodeInfo[opcode].name;
 				uint32 index = readU30(pc);
-				if (index < pool->cpool_double.size())
+				if (index > 0 && index < pool->cpool_double.size())
+				{
 					buffer << " " << *pool->cpool_double[index];
+				}
+				else
+				{
+					buffer << " invalid_index=" << index;
+				}
 				break;
 			}
 			case OP_pushnamespace:
@@ -1573,8 +1770,8 @@ return the result of the comparison ToPrimitive(x) == y.
 			buffer << "undefined";
 		else if (isBoolean(a))
 			buffer << (boolean(a) ? "true" : "false");
-		else if (isInteger(a))
-			buffer << integer(a);
+		else if (atomIsIntptr(a))
+			buffer << (double)atomGetIntptr(a);
 		else
 			buffer << "[unknown: " << bits << "]";
 	}
@@ -1588,8 +1785,8 @@ return the result of the comparison ToPrimitive(x) == y.
 			case WOP_pushstring: {
 				buffer << wopAttrs[opcode].name;
 				uint32 index = (uint32)*pc++;
-				if (index < pool->cpool_string.size())
-					buffer << " " << format(pool->cpool_string[index]->atom());
+				if (index < pool->constantStringCount)
+					buffer << " " << format(pool->getString(index)->atom());
 				else
 					buffer << " OUT OF RANGE: " << index;
 				break;
@@ -1860,7 +2057,7 @@ return the result of the comparison ToPrimitive(x) == y.
         // not be JITted based on memory, configuration, or heuristics.
 
 		ExceptionHandlerTable* exceptions;
-        if (info->implGPR() == avmplus::interpGPR || info->implFPR() == avmplus::interpFPR)
+        if (info->isInterpreted())
             exceptions = info->word_code_exceptions();
         else
 			exceptions = info->abc_exceptions();
@@ -1882,7 +2079,7 @@ return the result of the comparison ToPrimitive(x) == y.
 				if (istype(atom, handler->traits)) 
 				{
 					#ifdef AVMPLUS_VERBOSE
-					if (config.verbose)
+					if (isVerbose((uint32_t)~0)) // any verbose flag enabled we emit this...
 					{
 						console << "enter " << info << " catch " << handler->traits << '\n';
 					}
@@ -1901,19 +2098,21 @@ return the result of the comparison ToPrimitive(x) == y.
 	void AvmCore::increment_d(Atom *ap, int delta)
 	{
 		AvmAssert(isNumber(*ap));
-		if (isInteger(*ap))
-			*ap = intToAtom(delta+((sint32)((sintptr)*ap>>3)));
+		if (atomIsIntptr(*ap))
+			*ap = intToAtom(delta + int32_t(atomGetIntptr(*ap)));
 		else
 			*ap = doubleToAtom(atomToDouble(*ap)+delta);
 	}
 
 	void AvmCore::increment_i(Atom *ap, int delta)
 	{
-		switch (*ap & 7)
+		switch (atomKind(*ap))
 		{
 		case kBooleanType:
-		case kIntegerType:
 			*ap = intToAtom(delta+(sint32((sintptr)*ap>>3)));
+            return;
+		case kIntptrType:
+			*ap = intToAtom(delta + int32_t(atomGetIntptr(*ap)));
 			return;
 		case kDoubleType:
 			*ap = intToAtom((int)((sint32)atomToDouble(*ap)+delta));
@@ -1924,54 +2123,52 @@ return the result of the comparison ToPrimitive(x) == y.
 		}
 	}
 
+	// check for the easy cases with bitmasks
+	/*static*/ const int AvmCore::k_atomDoesNotNeedCoerce_Masks[8] = 
+	{
+		(1<<BUILTIN_null),																	// kUnusedAtomTag -- recycle for null checking
+		(1<<BUILTIN_object),																// kObjectType
+		(1<<BUILTIN_string) | (1<<BUILTIN_object),											// kStringType
+		(1<<BUILTIN_namespace) | (1<<BUILTIN_object),										// kNamespaceType
+		(1<<BUILTIN_void),																	// kSpecialType
+		(1<<BUILTIN_boolean) | (1<<BUILTIN_object),											// kBooleanType
+		(1<<BUILTIN_number) | (1<<BUILTIN_object),											// kIntptrType
+		(1<<BUILTIN_number) | (1<<BUILTIN_object)											// kDoubleType
+	};
+		
     /*static*/ bool AvmCore::istype(Atom atom, Traits* itraits)
     {
 		if (!itraits)
 			return true;
 		
 		const int bt = itraits->builtinType;
+
+		// conceptually, this is atomDoesNotNeedCoerce() inlined, so we don't have to 
+		// re-grab bt and kind
 		
 		// cheat and use "kUnusedAtomTag" for all null values (streamlines the test)
 		AvmAssert(atomKind(atom) != kUnusedAtomTag);
 		const int kind = isNull(atom) ? kUnusedAtomTag : atomKind(atom);
 
-		// check for the easy cases with bitmasks
-		static const int kBTMasks[8] = 
-		{
-			(1<<BUILTIN_null),								// kUnusedAtomTag -- recycle for null checking
-			(1<<BUILTIN_object),							// kObjectType
-			(1<<BUILTIN_string) | (1<<BUILTIN_object),		// kStringType
-			(1<<BUILTIN_namespace) | (1<<BUILTIN_object),	// kNamespaceType
-			(1<<BUILTIN_void),								// kSpecialType
-			(1<<BUILTIN_boolean) | (1<<BUILTIN_object),		// kBooleanType
-			(1<<BUILTIN_number) | (1<<BUILTIN_object),		// kIntegerType
-			(1<<BUILTIN_number) | (1<<BUILTIN_object)		// kDoubleType
-		};
-		
-		if ((1<<bt) & kBTMasks[kind])
+		if ((1<<bt) & k_atomDoesNotNeedCoerce_Masks[kind])
 			return true;
-		
+
 		// repeated if-else is better than switch here
 		if (kind == kObjectType)
 		{
-			return atomToScriptObject(atom)->traits()->containsInterface(itraits);
+			return atomToScriptObject(atom)->traits()->subtypeof(itraits);
 		}
-
-		if (kind == kIntegerType)
+		
+		if (kind == kIntptrType)
 		{
 			// ISSUE need special support for number value ranges
 			if (bt == BUILTIN_uint)
 			{
-				return atomInt(atom) >= 0;
+                return atomCanBeUint32(atom);
 			}
 			if (bt == BUILTIN_int)
 			{
-			#ifdef AVMPLUS_64BIT
-				// this might be a uint
-				return ((int64_t)atomInt(atom) == (int32_t)atomInt(atom));
-			#else
-				return true;
-			#endif
+                return atomCanBeInt32(atom);
 			}
 		}
 
@@ -2007,7 +2204,7 @@ return the result of the comparison ToPrimitive(x) == y.
     {
 		if (!isNull(atom))
 		{
-			switch (atom&7)
+			switch (atomKind(atom))
 			{
 			case kNamespaceType:
 				return atomToNamespace(atom)->getURI();
@@ -2019,16 +2216,8 @@ return the result of the comparison ToPrimitive(x) == y.
 				return kundefined;
 			case kBooleanType:
 				return booleanStrings[atom>>3];
-			case kIntegerType: {
-#ifdef AVMPLUS_64BIT
-				intptr_t val = (intptr_t)(atom>>3);
-				if (val > 0x7fffffff)
-					return uintToString((uint32_t)val);
-				else
-					return intToString((int32_t)val);
-#else
-				return intToString (int(sint32(atom)>>3));
-#endif
+			case kIntptrType: {
+				return MathUtils::convertIntegerToStringRadix(this, atomGetIntptr(atom), 10, MathUtils::kTreatAsSigned);
 			}
 			case kDoubleType:
 			default: // number
@@ -2484,7 +2673,7 @@ return the result of the comparison ToPrimitive(x) == y.
 	{
 		if (!isNull(a))
 		{
-			switch (a&7)
+			switch (atomKind(a))
 			{
 			case kStringType:
 				return EscapeElementValue (string(a), true);
@@ -2509,7 +2698,7 @@ return the result of the comparison ToPrimitive(x) == y.
 				break;
 			case kSpecialType:
 				return kundefined;
-			case kIntegerType:
+			case kIntptrType:
 			case kBooleanType:
 			case kDoubleType:
 			default:
@@ -2564,6 +2753,9 @@ return the result of the comparison ToPrimitive(x) == y.
 			case '&':
 				output << "&amp;";
 				break;
+			case 0x0000:
+				output << "&#x0;"; // extension of ECMA-357
+				break;
 			default:
 				output << (s[i]);
 			}
@@ -2571,7 +2763,7 @@ return the result of the comparison ToPrimitive(x) == y.
 			i++;
 		}
 
-		return newStringUTF8(output.c_str());
+		return newStringUTF8(output.c_str(), output.length());
 	}
 
 	Stringp AvmCore::EscapeAttributeValue(Atom v)
@@ -2602,12 +2794,15 @@ return the result of the comparison ToPrimitive(x) == y.
 			case 0x0009:
 				output << "&#x9;";
 				break;
+			case 0x0000:
+				output << "&#x0;"; // extension of ECMA-357
+				break;
 			default:
 				output << (s[i]);
 			}
 		}
 
-		return newStringUTF8(output.c_str());
+		return newStringUTF8(output.c_str(), output.length());
 	}
 
 	/*static*/ XMLObject* AvmCore::atomToXMLObject(Atom atm) 
@@ -2634,11 +2829,11 @@ return the result of the comparison ToPrimitive(x) == y.
 	{
 		if (!isNull(arg))
 		{
-			switch (arg&7)
+			switch (atomKind(arg))
 			{
 			default:
 			case kObjectType:
-				if (isXML(arg) || isXMLList(arg))
+				if (isXMLorXMLList(arg))
 				{
 					return kxml;
 				}
@@ -2647,15 +2842,15 @@ return the result of the comparison ToPrimitive(x) == y.
 					return kfunction; // No special type code for functions, but we need to
 									//  special case to return 'function' here.
 				}
-				else
-				{
-					return kobject;
-				}
+				// else fall thru and return kobject
+
+			case kNamespaceType:
+				return kobject;
 
 			case kBooleanType:
 				return kboolean;
 
-			case kIntegerType:
+			case kIntptrType:
 			case kDoubleType:
 				return knumber;
 
@@ -2665,8 +2860,6 @@ return the result of the comparison ToPrimitive(x) == y.
 			case kStringType:
 				return kstring;
 
-			case kNamespaceType:
-				return kobject;
 			}
 		}
 		else
@@ -2681,8 +2874,43 @@ return the result of the comparison ToPrimitive(x) == y.
 		return new (GetGC()) Toplevel(abcEnv);
 	}
 
+	void AvmCore::addLivePool(PoolObject* pool)
+	{
+		LivePoolNode* node = new LivePoolNode(GetGC());
+		node->next = livePools;
+		node->pool = pool->GetWeakRef();
+		livePools = node;
+	}
+	
 	void AvmCore::presweep()
 	{
+		LivePoolNode** prev = &livePools;
+		LivePoolNode* node = livePools;
+		while (node)
+		{
+		  PoolObject* pool = (PoolObject*)(void*)(node->pool->get());
+			if (pool)
+			{
+				// pool is still alive -- if about to get collected, dynamicize the strings
+				// and remove it from the active list
+				if (!GetGC()->GetMark(pool))
+				{
+					pool->dynamicizeStrings();
+					*prev = node->next;
+					delete node;
+					node = *prev;
+					continue;
+				}
+			}
+			else
+			{
+				// pool is dead -- should have already removed it?
+				AvmAssert(0);
+			} 
+			prev = &node->next;
+			node = node->next;
+		} 
+	
         // clear out the string table
 		{
 			for (int i=0, n=numStrings; i < n; i++)
@@ -2723,12 +2951,21 @@ return the result of the comparison ToPrimitive(x) == y.
 
 	void AvmCore::postsweep()
 	{
+#ifdef VMCFG_NANOJIT
+        if (m_flushBindingCachesNextSweep)
+        {
+            for (LivePoolNode* node = livePools; node != NULL; node = node->next)
+            {
+                PoolObject* pool = (PoolObject*)(void*)(node->pool->get());
+                if (pool && pool->codeMgr)
+                    pool->codeMgr->flushBindingCaches();
+            }
+            m_flushBindingCachesNextSweep = false;
+        }
+#endif	
 #ifdef DEBUGGER
 		if (_sampler)
 			_sampler->postsweep();
-#endif
-#ifdef AVMPLUS_TRAITS_MEMTRACK
-		tmt_report();
 #endif
 	}
 
@@ -2754,7 +2991,7 @@ return the result of the comparison ToPrimitive(x) == y.
 		Stringp k;
 		if (!deletedCount)
 		{
-			while ((k=strings[i]) != NULL && k->Compare(*s) != 0) {
+			while ((k=strings[i]) != NULL && !k->equals(s)) {
 				i = (i + (n++)) & bitMask; // quadratic probe
 			}
 		}
@@ -2765,26 +3002,76 @@ return the result of the comparison ToPrimitive(x) == y.
 			{
 				if (k == AVMPLUS_STRING_DELETED)
 				{
-					if (iFirstDeletedSlot == -1)
+					if (iFirstDeletedSlot < 0)
 					{
 						iFirstDeletedSlot = i;
 					}
 				}
-				else if (k->Compare(*s) == 0)
+				else if (k->equals(s))
 				{
-					return i;
+					break;
 				}
 				i = (i + (n++)) & bitMask; // quadratic probe
 			}
 
-			if ((k == NULL) && (iFirstDeletedSlot != -1))
-				return iFirstDeletedSlot;
-
+			if ((k == NULL) && (iFirstDeletedSlot >= 0))
+				i = iFirstDeletedSlot;
 		}
         return i;
     }
 
-    int AvmCore::findString(const wchar *s, int len)
+    int AvmCore::findStringLatin1(const char* s, int len)
+    {
+        int m = numStrings;
+		// 80% load factor
+		if (5*(stringCount+deletedCount+1) > 4*m) {
+			if (2*stringCount > m) // 50%
+			    rehashStrings(m = m << 1);
+			else
+				rehashStrings(m);
+		}
+
+        // compute the hash function
+		int hashCode = String::hashCodeLatin1(s, len);
+
+		int bitMask = m - 1;
+
+        // find the slot to use
+        int i = (hashCode&0x7FFFFFFF) & bitMask;
+        int n = 7;
+		Stringp k;
+		if (!deletedCount)
+		{
+			while ((k=strings[i]) != NULL && !k->equalsLatin1(s,len)) {
+				i = (i + (n++)) & bitMask; // quadratic probe
+			}
+		}
+		else
+		{
+			int iFirstDeletedSlot = -1;
+			while ((k=strings[i]) != NULL)
+			{
+				if (k == AVMPLUS_STRING_DELETED)
+				{
+					if (iFirstDeletedSlot < 0)
+					{
+						iFirstDeletedSlot = i;
+					}
+				}
+				else if (k->equalsLatin1(s, len))
+				{
+					break;
+				}
+				i = (i + (n++)) & bitMask; // quadratic probe
+			}
+
+			if ((k == NULL) && (iFirstDeletedSlot >= 0))
+				i = iFirstDeletedSlot;
+		}
+        return i;
+    }
+
+    int AvmCore::findStringUTF16(const wchar* s, int len)
     {
         int m = numStrings;
 		// 80% load factor
@@ -2817,20 +3104,20 @@ return the result of the comparison ToPrimitive(x) == y.
 			{
 				if (k == AVMPLUS_STRING_DELETED)
 				{
-					if (iFirstDeletedSlot == -1)
+					if (iFirstDeletedSlot < 0)
 					{
 						iFirstDeletedSlot = i;
 					}
 				}
 				else if (k->equalsUTF16(s, len))
 				{
-					return i;
+					break;
 				}
 				i = (i + (n++)) & bitMask; // quadratic probe
 			}
 
-			if ((k == NULL) && (iFirstDeletedSlot != -1))
-				return iFirstDeletedSlot;
+			if ((k == NULL) && (iFirstDeletedSlot >= 0))
+				i = iFirstDeletedSlot;
 
 		}
         return i;
@@ -2841,16 +3128,16 @@ return the result of the comparison ToPrimitive(x) == y.
 	 * uri.  We assume uri's are already interned, so interning a namespace
 	 * is quick because uri's can be compared quickly.
 	 */
-	int AvmCore::findNamespace(Namespacep ns)
+	int AvmCore::findNamespace(Namespacep ns, bool canRehash)
 	{
         int m = numNamespaces;
 		// 80% load factor
-        if (nsCount*5 >= 4*m) {
+        if (canRehash && nsCount*5 >= 4*m) {
             rehashNamespaces(m = m << 1);
 		}
 
         // compute the hash function
-		int hashCode = (int)(((uintptr)ns->getURI())>>3);
+		int hashCode = (int)(((uintptr)ns->getURI())>>3);  // FIXME possibly hash api mask too
 
 		int bitMask = m - 1;
 
@@ -2858,16 +3145,63 @@ return the result of the comparison ToPrimitive(x) == y.
         int i = (hashCode&0x7FFFFFFF) & bitMask;
         int n = 7;
 		Namespacep k;
-        while ((k=namespaces[i]) != NULL && k->m_uri != ns->m_uri ) {
-            i = (i + (n++)) & bitMask; // quadratic probe
+		while ((k=namespaces[i]) != NULL && (k->m_uri != ns->m_uri || k->m_api != ns->m_api)) {
+			i = (i + (n++)) & bitMask; // quadratic probe
 		}
         return i;
+	}
+	
+	Namespacep AvmCore::gotNamespace(Stringp uri, int32_t api)
+	{
+		int m = numNamespaces;
+
+		// compute the hash function
+		int hashCode = (int)(((uintptr)uri)>>3);  // FIXME possibly hash api mask too
+
+		int bitMask = m - 1;
+
+		// find the slot to use
+		int i = (hashCode&0x7FFFFFFF) & bitMask;
+		int n = 7;
+		Namespacep k;
+		while ((k=namespaces[i]) != NULL && 
+			   (k->getURI() != uri || 
+				k->m_api != api)) {
+			i = (i + (n++)) & bitMask; // quadratic probe
+		}
+		return namespaces[i];
 	}
 	
 	// note, this assumes Latin-1, not UTF8.
 	Stringp AvmCore::internStringLatin1(const char* s, int len)
 	{
-		return internString(newStringLatin1(s, len));
+		if (len < 0) len = String::Length(s);
+        int i = findStringLatin1(s, len);
+		Stringp other;
+        if ((other=strings[i]) <= AVMPLUS_STRING_DELETED)
+        {
+			if (other == AVMPLUS_STRING_DELETED)
+			{
+				deletedCount--;
+				AvmAssert(deletedCount >= 0);
+			}
+            
+#ifdef DEBUGGER			
+			DRC(Stringp) *oldStrings = strings;
+#endif
+
+			other = newStringLatin1(s, len);
+			
+#ifdef DEBUGGER
+			// re-find if String ctor caused rehash
+			if(strings != oldStrings)
+				i = findStringLatin1(s, len);
+#endif
+			strings[i] = other;
+			stringCount++;
+			other->setInterned();
+		}
+		return other;
 	}
 
 	// note, this assumes Latin-1, not UTF8.
@@ -2896,9 +3230,8 @@ return the result of the comparison ToPrimitive(x) == y.
 				AvmAssert(deletedCount >= 0);
 			}
 			stringCount++;
-			// do not intern kDependent string - may block large master string
-			// from being freed
-			o = o->getIndependentString();
+			// Prevent dependent strings from keeping a huge master in memory
+			o->fixDependentString();
 			o->setInterned();
 			strings[i] = o;
 			return o;
@@ -2951,7 +3284,7 @@ return the result of the comparison ToPrimitive(x) == y.
 		
 		UnicodeUtils::Utf8ToUtf16((const uint8*)cs, len8, buffer, len16, true);
 		buffer[len16] = 0;
-		int i = findString(buffer, len16);
+		int i = findStringUTF16(buffer, len16);
 		Stringp other;
 		if ((other=strings[i]) > AVMPLUS_STRING_DELETED)
 		{		
@@ -2989,7 +3322,7 @@ return the result of the comparison ToPrimitive(x) == y.
 	Stringp AvmCore::internStringUTF16(const wchar* s, int len)
 	{
 		if (len < 0) len = String::Length(s);
-        int i = findString(s, len);
+        int i = findStringUTF16(s, len);
 		Stringp other;
         if ((other=strings[i]) <= AVMPLUS_STRING_DELETED)
         {
@@ -3008,7 +3341,7 @@ return the result of the comparison ToPrimitive(x) == y.
 #ifdef DEBUGGER
 			// re-find if String ctor caused rehash
 			if(strings != oldStrings)
-				i = findString(s, len);
+				i = findStringUTF16(s, len);
 #endif
 			strings[i] = other;
 			stringCount++;
@@ -3024,8 +3357,8 @@ return the result of the comparison ToPrimitive(x) == y.
 		DRC(Stringp) *oldStrings = strings;
 		int oldStringCount = numStrings;
 
-		strings = new DRC(Stringp)[newlen];
-		VMPI_memset(strings, 0, newlen*sizeof(Stringp));
+		strings = mmfx_new_array(DRC(Stringp), newlen);
+		VMPI_memset(strings, 0, newlen*sizeof(DRC(Stringp)));
 		numStrings = newlen;
 
 #ifdef _DEBUG // debug sanity checks
@@ -3077,7 +3410,7 @@ return the result of the comparison ToPrimitive(x) == y.
 #endif
 
 		// Clear oldStrings so it can be collected.
-		delete [] oldStrings;
+		mmfx_delete_array(oldStrings);
     }
 
 	void AvmCore::rehashNamespaces(int newlen)
@@ -3087,19 +3420,19 @@ return the result of the comparison ToPrimitive(x) == y.
 		DRC(Namespacep) *old = namespaces;
 		int oldCount = numNamespaces;
 
-		namespaces = new DRC(Namespacep)[newlen];
-		VMPI_memset(namespaces, 0, newlen*sizeof(Namespacep));
+		namespaces = mmfx_new_array(DRC(Namespacep), newlen);
+		VMPI_memset(namespaces, 0, newlen*sizeof(DRC(Namespacep)));
 		numNamespaces = newlen;
 		
         for (int i=0; i < oldCount; i++)
         {
 			Namespacep o = old[i];
             if (o != NULL)
-                namespaces[findNamespace(o)] = o;
+                namespaces[findNamespace(o, /*canRehash = */ false)] = o;
         }
 
 		// Clear old namespaces table so it can be collected.
-		delete [] old;
+		mmfx_delete_array(old);
     }
 		
 	ScriptBufferImpl* AvmCore::newScriptBuffer(size_t size)
@@ -3107,13 +3440,12 @@ return the result of the comparison ToPrimitive(x) == y.
 		return new (GetGC(), size) BasicScriptBufferImpl(size);
 	}
 	
-	VTable* AvmCore::newVTable(Traits* traits, VTable* base, ScopeChain* scope,
-		AbcEnv* abcEnv, Toplevel* toplevel)
+	VTable* AvmCore::newVTable(Traits* traits, VTable* base, Toplevel* toplevel)
 	{
 		traits->resolveSignatures(toplevel);
 		const uint32_t count = traits->getTraitsBindings()->methodCount;
 		size_t extraSize = sizeof(MethodEnv*)*(count > 0 ? count-1 : 0);
-		return new (GetGC(), extraSize) VTable(traits, base, scope, abcEnv, toplevel);
+		return new (GetGC(), extraSize) VTable(traits, base, toplevel);
 	}
 
 	RegExpObject* AvmCore::newRegExp(RegExpClass* regexpClass,
@@ -3129,21 +3461,20 @@ return the result of the comparison ToPrimitive(x) == y.
 		return new (GetGC(), vtable->getExtraSize()) ScriptObject(vtable, delegate);
 	}
 
-    Namespacep AvmCore::newNamespace(Atom prefix, Atom uri, Namespace::NamespaceType type)
+	Namespacep AvmCore::newNamespace(Atom prefix, Atom uri, Namespace::NamespaceType type)
 	{
 		// E4X - this is 13.2.3, step 3 - prefix IS specified
-
 		Atom p;
 		Stringp u;
-		if (isQName(uri) && !isNull(atomToQName(uri)->get_uri()))
+		if (isQName(uri) && !isNull(atomToQName(uri)->getURI()))
 		{
-			u = atomToString(atomToQName(uri)->get_uri());
+			u = atomToString(atomToQName(uri)->getURI());
 		}
 		else
 		{
-			u = internString(string (uri));
+			u = internString(string(uri));
 		}
-		if (u == kEmptyString)
+		if (u->isEmpty())
 		{
 			if (prefix == undefinedAtom)
 				p = kEmptyString->atom();
@@ -3166,73 +3497,86 @@ return the result of the comparison ToPrimitive(x) == y.
 		}
 		else
 		{
-			p = internString(string (prefix))->atom();
+			p = internString(string(prefix))->atom();
 		}
 
-        return new (GetGC()) Namespace(p, u, type);
+		Namespacep ns = new (GetGC()) Namespace(p, u, type);
+		// called from AS so need to get the api version off the call stack
+		if (ApiUtils::isVersionedNS(this, type, u)) 
+			ns->setAPI(this->getAPI(NULL));
+		return ns;
 	}
 
 	Namespacep AvmCore::newNamespace(Atom uri, Namespace::NamespaceType type)
 	{
 		// prefix and uri must be interned!
 		// E4X - this is 13.2.2, step 3 - "prefix not specified"
-
+		Atom p;
+		Stringp u;
 		if (isNamespace (uri))
 		{
-			Namespacep ns = atomToNamespace (uri);
-			return new (GetGC()) Namespace (ns->getPrefix(), ns->getURI(), type);
+			Namespacep ns = atomToNamespace(uri);
+			p = ns->getPrefix();
+			u = ns->getURI();
 		}
-		else if (isObject(uri) && isQName(uri) && !isNull(atomToQName(uri)->get_uri()))
+		else if (isObject(uri) && isQName(uri) && !isNull(atomToQName(uri)->getURI()))
 		{
-			return new (GetGC()) Namespace(undefinedAtom, atomToString(atomToQName(uri)->get_uri()), type);
+			p = undefinedAtom;
+			u = atomToString(atomToQName(uri)->getURI());
 		}
 		else
 		{
-			Stringp u = internString(string (uri));
-			Atom prefix = (u == kEmptyString) ? kEmptyString->atom() : undefinedAtom;
-			return new (GetGC()) Namespace (prefix, u, type);
+			u = string(uri);
+			p = u->isEmpty() ? kEmptyString->atom() : undefinedAtom;
+			u = internString(u);
 		}
+		Namespacep ns = new (GetGC()) Namespace(p, u, type);
+		// called from AS so need to get the api version off the call stack
+		if (ApiUtils::isVersionedNS(this, type, u)) 
+			ns->setAPI(this->getAPI(NULL));
+		return ns;
 	}
 
-	Namespacep AvmCore::newNamespace(Stringp uri, Namespace::NamespaceType type)
+	Namespacep AvmCore::newNamespace(Stringp uri, Namespace::NamespaceType type, int32_t api)
 	{
-		uri = internString(uri);
-		Atom prefix = (uri == kEmptyString) ? kEmptyString->atom() : undefinedAtom;
-		return new (GetGC()) Namespace(prefix, uri, type);
+		Atom prefix = uri->isEmpty() ? kEmptyString->atom() : undefinedAtom;
+		Namespacep ns = new (GetGC()) Namespace(prefix, uri, type);
+		if (ApiUtils::isVersionedNS(this, type, uri))
+			ns->setAPI(api);
+		return ns;
 	}
 
-	NamespaceSet* AvmCore::newNamespaceSet(int nsCount)
-	{
-		size_t extra = (nsCount >= 1 ? nsCount-1 : 0)*sizeof(Atom);
-		return new (GetGC(), extra) NamespaceSet(nsCount);
+	Namespacep AvmCore::newPublicNamespace(Stringp uri) 
+	{ 
+		return newNamespace(uri, Namespace::NS_Public, this->getAPI(NULL)); 
 	}
 
-	Atom AvmCore::uintToAtom(uint32 n)
+	Atom AvmCore::uintToAtom(uint32_t n)
 	{
 #ifdef AVMPLUS_64BIT
 		// We can always fit the value in an Atom
-		return (((Atom)n)<<3) | kIntegerType;
+		return (((Atom)n)<<3) | kIntptrType;
 #else
-		// As kIntegerType is signed, we can only represent a 28-bit uint in it
+		// As kIntptrType is signed, we can only represent a 28-bit uint in it
 		if (!(n&0xF0000000)) {
-			return uint32((n<<3) | kIntegerType);
+			return Atom((n<<3) | kIntptrType);
 		} else {
 			return allocDouble(n);
 		}
 #endif
 	}
 			
-	Atom AvmCore::intToAtom(int n)
+	Atom AvmCore::intToAtom(int32_t n)
 	{
 #ifdef AVMPLUS_64BIT
 		// We can always fit the value in an Atom
-		return (((Atom)n)<<3) | kIntegerType;
+		return (((Atom)n)<<3) | kIntptrType;
 #else
 		// handle integer values w/out allocation
-		int i29 = n << 3;
+		int32_t i29 = n << 3;
 		if ((i29>>3) == n)
 		{
-			return uint32(i29 | kIntegerType);
+			return Atom(i29 | kIntptrType);
 		}
 		else 
 		{
@@ -3241,7 +3585,16 @@ return the result of the comparison ToPrimitive(x) == y.
 #endif
 	}
 
+#ifdef AVMPLUS_64BIT
+	#define CAN_BE_INT_ATOM(intval,n) (((intval<<8)>>8) == n && !(intval == 0 && MathUtils::isNegZero(n)))
+#else
+	#define CAN_BE_INT_ATOM(intval,n) (((intval<<3)>>3) == n && !(intval == 0 && MathUtils::isNegZero(n)))
+#endif
+
+#define MAKE_INT_ATOM(intval) ((intptr_t(intval)<<3) | kIntptrType)
+
 #if defined(AVMPLUS_IA32) || defined(AVMPLUS_AMD64)
+
 	// ignore warning that inline asm disables global optimization in this function
 	#ifdef _MSC_VER
 	#pragma warning(disable: 4740) 
@@ -3251,26 +3604,22 @@ return the result of the comparison ToPrimitive(x) == y.
 		// handle integer values w/out allocation
 		// this logic rounds in the wrong direction for E3, but
 		// we never use a rounded value, only cleanly converted values.
-		#if defined(WIN32) || defined(__ICC) 
-		#ifdef AVMPLUS_AMD64
-		int32_t id = _mm_cvttsd_si32(_mm_set_sd(n));
-		if (id == n) {
-			// make sure its not -0
-			if (id == 0 && MathUtils::isNegZero(n)) {
-				return allocDouble(n);
-			} else {
-				return (intptr_t(id)<<3) | kIntegerType;
-			}
-		}
+#if defined(WIN32) || defined(__ICC) 
+	#ifdef AVMPLUS_AMD64
+
+		int32_t const intval = _mm_cvttsd_si32(_mm_set_sd(n));
+		if (CAN_BE_INT_ATOM(intval, n)) 
+			return MAKE_INT_ATOM(intval);
 		return allocDouble(n);
-		#else
+
+	#else // x86
 		int id3;
 		__asm {
 			movsd xmm0,n
 			cvttsd2si ecx,xmm0
-			shl ecx,3		// id<<3
+			shl ecx,3		// intval<<3
 			mov eax,ecx
-			sar ecx,3		// id>>3
+			sar ecx,3		// intval>>3
 			cvtsi2sd xmm1,ecx
 			ucomisd xmm0,xmm1
             jne d2a_alloc   // < or >
@@ -3280,49 +3629,39 @@ return the result of the comparison ToPrimitive(x) == y.
 
 		if (id3 != 0 || !MathUtils::isNegZero(n))
 		{
-			return id3 | kIntegerType;
+			return id3 | kIntptrType;
 		}
 		else
 		{
 			__asm d2a_alloc:
 			return allocDouble(n);
 		}
-		#endif
-		#elif defined(_MAC) && (defined(AVMPLUS_IA32) || defined(AVMPLUS_AMD64))
-		int id = _mm_cvttsd_si32(_mm_set_sd(n));
-		// MacTel is luckily always using SSE2, there
-		// are no intrinsics to check for unordered 
-		// mode here using any of the _mm_ucominXXX
-		// instructions
-		if (((id<<3)>>3) == n) {
-			// make sure its not -0
-			if (id == 0 && MathUtils::isNegZero(n)) {
-				return allocDouble(n);
-			} else {
-#ifdef AVMPLUS_64BIT
-				return (id<<3) | kIntegerType;
-#else
-				return uint32((id<<3) | kIntegerType);
-#endif
+	#endif
 
-			}
-		}
+#elif defined(_MAC)
+
+		// MacTel always has SSE2 available
+		int32_t const intval = _mm_cvttsd_si32(_mm_set_sd(n));
+		if (CAN_BE_INT_ATOM(intval, n)) 
+			return MAKE_INT_ATOM(intval);
+
 		return allocDouble(n);
-		#elif defined(SOLARIS)
+
+#elif defined(SOLARIS)
+
 		return AvmCore::doubleToAtom(n); // This needs to be optimized for solaris.
-		#elif defined(AVMPLUS_UNIX)
-		#ifdef __amd64__
-		int32_t id = _mm_cvttsd_si32(_mm_set_sd(n));
-		if (id == n) {
-			// make sure its not -0
-			if (id == 0 && MathUtils::isNegZero(n)) {
-				return allocDouble(n);
-			} else {
-				return (intptr_t(id)<<3) | kIntegerType;
-			}
-		}
+
+#elif defined(AVMPLUS_UNIX)
+
+	#ifdef AVMPLUS_AMD64
+
+		int32_t const intval = _mm_cvttsd_si32(_mm_set_sd(n));
+		if (CAN_BE_INT_ATOM(intval, n)) 
+			return MAKE_INT_ATOM(intval);
+
 		return allocDouble(n);
-		#else // __amd64__
+
+	#else // not AVMPLUS_AMD64
 		int id3;
 		asm("movups %1, %%xmm0;"
 			"cvttsd2si %%xmm0, %%ecx;"
@@ -3337,15 +3676,15 @@ return the result of the comparison ToPrimitive(x) == y.
 
 		if (id3 != 0 || !MathUtils::isNegZero(n))
 		{
-			return id3 | kIntegerType;
+			return id3 | kIntptrType;
 		}
 
 		asm("d2a_alloc:");
 		return allocDouble(n);
-		#endif // __amd64__
-		#endif // defined(AVMPLUS_UNIX)
+	#endif // AVMPLUS_AMD64
+#endif // defined(AVMPLUS_UNIX)
 	}
-#endif
+#endif // x86 or x64
 
 #ifndef AVMPLUS_SSE2_ALWAYS
 	Atom AvmCore::doubleToAtom(double n)
@@ -3355,43 +3694,29 @@ return the result of the comparison ToPrimitive(x) == y.
         // they are regular numeric values.
 
 		// handle integer values w/out allocation
-		#if defined(WIN32) && !defined(_ARM_)
+	#if defined(WIN32) && !defined(_ARM_)
 		#ifdef AVMPLUS_AMD64
-		int id = _mm_cvttsd_si32(_mm_set_sd(n));
+		int intval = _mm_cvttsd_si32(_mm_set_sd(n));
 		#else
 		// this logic rounds in the wrong direction for E3, but
 		// we never use a rounded value, only cleanly converted values.
-		int id;
+		int intval;
 		_asm {
 			fld [n];
-			fistp [id];
+			fistp [intval];
 		}
 		#endif
-		#elif defined(_MAC) && (defined (AVMPLUS_IA32) || defined(AVMPLUS_AMD64))
-		int id = _mm_cvttsd_si32(_mm_set_sd(n));
-		#else
-		int id = MathUtils::real2int(n);
-		#endif
+	#elif defined(_MAC) && (defined (AVMPLUS_IA32) || defined(AVMPLUS_AMD64))
+		int intval = _mm_cvttsd_si32(_mm_set_sd(n));
+	#else
+		int intval = MathUtils::real2int(n);
+	#endif
 
 		// make sure n is integer value that fits in 29 bits
-		if (((id<<3)>>3) == n)
-		{
-			// make sure its not -0
-			if (id == 0 && MathUtils::isNegZero(n))
-				return allocDouble(n);
-			else
-			{
-#ifdef AVMPLUS_64BIT
-				return (id<<3) | kIntegerType;
-#else
-				return uint32((id<<3) | kIntegerType);
-#endif
-			}
-		}
-		else
-		{
-			return allocDouble(n);
-		}
+		if (CAN_BE_INT_ATOM(intval, n)) 
+			return MAKE_INT_ATOM(intval);
+
+		return allocDouble(n);
 	}
 #endif // not AVMPLUS_SSE2_ALWAYS
 
@@ -3406,7 +3731,7 @@ return the result of the comparison ToPrimitive(x) == y.
     {
 		if (!isNull(atom))
 		{
-			switch (atom&7)
+			switch (atomKind(atom))
 			{
 			default:
 			case kNamespaceType:
@@ -3424,17 +3749,8 @@ return the result of the comparison ToPrimitive(x) == y.
 				return kundefined;
 			case kBooleanType:
 				return booleanStrings[atom>>3];
-			case kIntegerType: {
-#ifdef AVMPLUS_64BIT
-				intptr_t val = (intptr_t)(atom>>3);
-				if (val > 0x7fffffff)
-					return uintToString((uint32_t)val);
-				else
-					return intToString((int32_t)val);
-#else
-				return intToString((int)(sint32(atom)>>3));
-#endif
-			}
+			case kIntptrType: 
+				return MathUtils::convertIntegerToStringRadix(this, atomGetIntptr(atom), 10, MathUtils::kTreatAsSigned);
 			case kDoubleType:
 				AvmAssert(atom != kDoubleType); // this would be a null pointer to double
 				return doubleToString(atomToDouble(atom));
@@ -3563,13 +3879,18 @@ return the result of the comparison ToPrimitive(x) == y.
 	#endif
 	#endif /* DEBUGGER */
 
-	/*static*/ int AvmCore::integer(Atom atom)
+	/*static*/ int32_t AvmCore::integer(Atom atom)
 	{
 		const int kind = atomKind(atom);
-		if ((1<<kind) & ((1<<kIntegerType)|(1<<kBooleanType)))
-		{
-			return (int32_t)atomInt(atom);
-		} 
+        if (kind == kIntptrType)
+        {
+            AvmAssert(int32_t(atomGetIntptr(atom)) == (int32_t)integer_d(number(atom)));
+            return int32_t(atomGetIntptr(atom));
+        }
+        else if (kind == kBooleanType)
+        {
+            return int32_t(atom>>3);
+        }
 		else 
 		{
 			// TODO optimize the code below.
@@ -3584,15 +3905,17 @@ return the result of the comparison ToPrimitive(x) == y.
 	{
 		// Try a simple case first to see if we have a in-range float value
 
-#ifdef WIN32 // should be any intel build
+#if defined(WIN32) && defined(AVMPLUS_IA32) // this is the same #define as in MathUtils for the real2int there
 		// WIN32's real2int returns 0x80000000 if d is not in a valid integer range
-		int id = MathUtils::real2int (d);
-		if (id != 0x80000000) 
-			return id;
-#elif defined AVMPLUS_SPARC
-		int id = MathUtils::real2int (d);
-		if (id != 0x7fffffff && id != 0x80000000)
-			return id;
+		int intval = MathUtils::real2int(d);
+		if (intval != 0x80000000) 
+			return intval;
+#elif defined(AVMPLUS_SPARC) || defined(AVMPLUS_ARM)
+		// real2int in those cases just maps to an int cast which should give: 		
+		// +/-0.0:0 +/-nan:0 +/-ind:0 -inf:0x80000000 +inf:0x7fffffff den:0 >=0x7fffffff:x7fffffff <=0x80000000:0x80000000
+		int intval = MathUtils::real2int(d);
+		if (intval != 0x7fffffff && intval != (int)0x80000000)
+			return intval;
 #endif
 
 		return doubleToInt32(d);
@@ -3602,31 +3925,31 @@ return the result of the comparison ToPrimitive(x) == y.
 #if defined(AVMPLUS_IA32) || defined(AVMPLUS_AMD64)
 	int AvmCore::integer_d_sse2(double d)
 	{
-		int id;
+		int intval;
 		#ifdef WIN32 
 		#ifdef AVMPLUS_AMD64
-		id = _mm_cvttsd_si32(_mm_set_sd(d));
-		if (id != (int)0x80000000)
-			return id;
+		intval = _mm_cvttsd_si32(_mm_set_sd(d));
+		if (intval != (int)0x80000000)
+			return intval;
 		#else
 		_asm {
 			cvttsd2si eax,d
-			mov id,eax
+			mov intval,eax
 		}
-		if (id != 0x80000000)
-			return id;
+		if (intval != 0x80000000)
+			return intval;
 		#endif
 		#elif defined(_MAC) && (defined(AVMPLUS_IA32) || defined(AVMPLUS_AMD64))		
-		id = _mm_cvttsd_si32(_mm_set_sd(d));
-		if (id != (int)0x80000000)
-			return id;
+		intval = _mm_cvttsd_si32(_mm_set_sd(d));
+		if (intval != (int)0x80000000)
+			return intval;
         #elif defined(SOLARIS)
-        #elif defined AVMPLUS_UNIX
+        #elif defined(AVMPLUS_UNIX)
         asm("movups %1, %%xmm0;"
             "cvttsd2si %%xmm0, %%eax;"
-            "movl %%eax, %0" : "=r" (id) : "m" (d) : "%eax");
-        if (id != (int) 0x80000000)
-            return id;
+            "movl %%eax, %0" : "=r" (intval) : "m" (d) : "%eax");
+        if (intval != (int) 0x80000000)
+            return intval;
 		#endif
 
 		return doubleToInt32(d);
@@ -3865,105 +4188,147 @@ return the result of the comparison ToPrimitive(x) == y.
 		return s->parseIndex((uint32_t&) *result);
 	}
 
-	CodeContext* AvmCore::codeContext() const
+	int32_t AvmCore::getAPI(PoolObject* pool)
 	{
-		if (codeContextAtom == CONTEXT_NONE) {
-			return NULL;
-		} else if (getCodeContextKind(codeContextAtom) == CONTEXTKIND_ENV) {
-			return getCodeContextEnv(codeContextAtom)->codeContext();
-		} else {
-			return getCodeContextObject(codeContextAtom);
+		if (pool != NULL) {
+			return pool->getAPI();
 		}
-	}
-
-	/*static*/ 
-	void AvmCore::decrementAtomRegion(Atom *arr, int length)
-	{
-		for(int i=0; i < length; i++)
+		for (MethodFrame* f = currentMethodFrame; f != NULL; f = f->next)
 		{
-			Atom a = arr[i];
-			RCObject *obj = (RCObject*)(a&~7);
-			if(obj)	{
-				switch(a&7) {
-				case kStringType:
-				case kObjectType:
-				case kNamespaceType:
-					obj->DecrementRef();
-					break;
-				}
-			}
-			arr[i] = 0;
-		}
-	}
-
-	/*static*/ 
-	void AvmCore::atomWriteBarrier(MMgc::GC *gc, const void *container, Atom *address, Atom atomNew)
-	{ 
-		Atom atom = *address;
-		if(!isNull(atom)) {
-			switch(atom&7)
-			{	
-				case kStringType:
-				case kObjectType:
-				case kNamespaceType:
-					MMgc::RCObject *obj = (MMgc::RCObject*)(atom&~7);
-					obj->DecrementRef();
-					break;
-			}
-		}
-
-		switch(atomNew&7)
-		{
-		case kStringType:
-		case kObjectType:
-		case kNamespaceType:
-			if(!isNull(atomNew))
-				((MMgc::RCObject*)(atomNew&~7))->IncrementRef();
-			// fall through
-		case kDoubleType:
+			MethodEnv* env = f->env();
+			if (env && !env->method->pool()->isBuiltin)	 // FIXME is the isBuiltin check necessary?
 			{
-				gc->WriteBarrierNoSubstitute(container, (const void*)atomNew);
+				return env->method->pool()->getAPI();
 			}
-			break;	
-
 		}
+		return this->getDefaultAPI();
+	}
+
+	void AvmCore::setDxns(MethodFrame* f, String* internedUri)
+	{
+		Namespace* ns = newPublicNamespace(internedUri);
+		f->setDxns(ns);
+	}
+
+	void AvmCore::setDxnsLate(MethodFrame* f, Atom uri)
+	{
+		String* internedUri = intern(uri);
+		Namespace* ns = newPublicNamespace(internedUri);
+		f->setDxns(ns);
+	}
+
+	Namespace* AvmCore::dxns() const
+	{
+		// if currentMethodFrame is null, then no AS3 code is executing -- we are being
+		// called directly from builtin code. We really want to return a non-NULL namespace
+		// in this case, so that native code that calls (say) XML::construct directly 
+		// can succeed (otherwise, getDefaultNamespace() would throw exceptions). 
+		if (!currentMethodFrame)
+			return publicNamespace;
+
+		// NULL is ok to return here -- Toplevel::getDefaultNamespace() will throw
+		return MethodFrame::findDxns(currentMethodFrame);
+	}
+
+	// static
+	Namespace* MethodFrame::findDxns(const MethodFrame* start)
+	{
+		for (const MethodFrame* f = start; f != NULL; f = f->next) {
+			// explicit dxns set here? if so, it's the winner
+			if (f->envOrCodeContext & DXNS_NOT_NULL)
+				return f->dxns;
+
+			// if not -- is this a frame with an env? if so, return its default ns, even if null.
+			MethodEnv* env = f->env();
+			if (env)
+				return env->scope()->getDefaultNamespace();
+		}
+		return NULL;
+	}
+
+	// apparently SunPro compiler doesn't like combining REALLY_INLINE with static functions.
+	/*static*/
+	REALLY_INLINE void decr_atom(Atom const a)
+	{
+		// contrary to what you might think from the name, "kUnusedAtomTag" is in fact occasionally used
+		// in player code, so be sure *not* to include it.
+		int const RC_TYPE_MASK = (1 << kObjectType) | (1 << kStringType) | (1 << kNamespaceType);
+		int const aKind = (1 << atomKind(a));
+		if (aKind & RC_TYPE_MASK)
+		{
+			MMgc::RCObject* rcptr = (MMgc::RCObject*)atomPtr(a);
+			if (rcptr)
+				rcptr->DecrementRef();
+		}
+	}
+
+	// apparently SunPro compiler doesn't like combining REALLY_INLINE with static functions.
+	/*static*/
+	REALLY_INLINE void incr_atom(MMgc::GC *gc, const void* container, Atom const a)
+	{
+		int const RC_TYPE_MASK = (1 << kObjectType) | (1 << kStringType) | (1 << kNamespaceType);
+		int const GC_TYPE_MASK = RC_TYPE_MASK | (1 << kDoubleType);
+
+		// assume existing contents of address are potentially uninitialized,
+		// so don't bother even making an assertion.
+		int const aKind = (1 << atomKind(a));
+		if (aKind & GC_TYPE_MASK)
+		{
+			if (aKind & RC_TYPE_MASK)
+			{
+				MMgc::RCObject* rcptr = (MMgc::RCObject*)atomPtr(a);
+				if (rcptr)
+					rcptr->IncrementRef();
+				// fall through to InlineWriteBarrierTrap()
+			}
+			if (gc->IncrementalMarking())
+				gc->InlineWriteBarrierTrap(container);
+		}
+	}
+
+	/*static*/ 
+	void AvmCore::decrementAtomRegion(Atom* arr, int length)
+	{
+		Atom* end = arr + length;
+		while (arr < end)
+		{
+			decr_atom(*arr);
+			*arr++ = 0;
+		}
+	}
+
+	/*static*/ void AvmCore::atomWriteBarrier(MMgc::GC *gc, const void *container, Atom *address, Atom atomNew)
+	{ 
+		decr_atom(*address);
+		incr_atom(gc, container, atomNew);
 		*address = atomNew;
 	}
 
-	Atom AvmCore::gcObjectToAtom(const void* obj)
-	{
+	/*static*/ void AvmCore::atomWriteBarrier_ctor(MMgc::GC *gc, const void *container, Atom *address, Atom atomNew)
+	{ 
+		incr_atom(gc, container, atomNew);
+		*address = atomNew;
+	}
+
+	/*static*/ void AvmCore::atomWriteBarrier_dtor(Atom *address)
+	{ 
+		decr_atom(*address);
+		*address = 0;
+	}
+
 #ifdef _DEBUG
+	Atom AvmCore::genericObjectToAtom(const void* obj)
+	{
 		// We get a null obj here through ElementE4XNode::_insert
-		if (obj)
+		if (obj != NULL)
 		{
 			GC* gc = GC::GetGC(obj);
 			AvmAssert(!gc->IsRCObject(obj));
 		}
-#endif		
 		// return a non-RC atom, makes atomWriteBarrier do the right thing
 		return (Atom)obj|kDoubleType;
 	}
-
-#if defined FEATURE_NANOJIT
-
-	void AvmCore::initMultinameLate(Multiname& name, Atom index)
-	{
-		if (isObject(index))
-		{
-			ScriptObject* i = atomToScriptObject(index);
-			if (i->traits() == traits.qName_itraits)
-			{
-				QNameObject* qname = (QNameObject*) i;
-				bool attr = name.isAttr();
-				qname->getMultiname(name);
-				name.setAttr(attr);
-				return;
-			}
-		}
-
-		name.setName(intern(index));
-	}		
-#endif // NANOJIT
+#endif		
 
 #ifdef AVMPLUS_VERIFYALL
 	void AvmCore::enqFunction(MethodInfo* f) {
@@ -3975,7 +4340,7 @@ return the result of the comparison ToPrimitive(x) == y.
 	}
 
 	void AvmCore::enqTraits(Traits* t) {
-        if (config.verifyall && !t->isInterface) {
+        if (config.verifyall && !t->isInterface()) {
 			TraitsBindingsp td = t->getTraitsBindings();
             enqFunction(t->init);
 		    for (int i=0, n=td->methodCount; i < n; i++)
@@ -3983,7 +4348,7 @@ return the result of the comparison ToPrimitive(x) == y.
         }
 	}
 
-    void AvmCore::verifyEarly(Toplevel* toplevel) {
+    void AvmCore::verifyEarly(Toplevel* toplevel, AbcEnv* abc_env) {
         List<MethodInfo*, LIST_GCObjects> verifyQueue2(GetGC());
 		int verified = 0;
 		do {
@@ -3991,13 +4356,13 @@ return the result of the comparison ToPrimitive(x) == y.
 			while (!verifyQueue.isEmpty()) {
 				MethodInfo* f = verifyQueue.removeLast();
 				if (!f->isVerified()) {
-					if (f->declaringScope() == NULL && f != f->declaringTraits()->init) {
+					if (f->hasNoScopeAndNotClassInitializer()) {
 						verifyQueue2.add(f);
 						continue;
 					}
 					verified++;
 					//console << "pre verify " << f << "\n";
-					f->verify(toplevel);
+					f->verify(toplevel, abc_env);
 					f->setVerified();
 				}
 			}
@@ -4011,5 +4376,325 @@ return the result of the comparison ToPrimitive(x) == y.
 	{
 		// on kReserve ditch native pages and switch from JIT to interpreter
 		// on kEmpty ditch WORDCODE and switch to abc interpreter
+	}
+
+	CodeContext* AvmCore::codeContext() const
+	{
+		for (MethodFrame* f = currentMethodFrame; f != NULL; f = f->next)
+		{
+			// has someone overridden the CodeContext at this level (via EnterCodeContext)?
+			CodeContext* cc = f->cc();
+			if (cc)
+				return cc;
+			
+			MethodEnv* env = f->env();
+			if (env && !env->method->pool()->isBuiltin)
+				return env->codeContext();
+		}
+
+		return NULL;
+	}
+
+	void AvmCore::setStackLimit(uintptr_t p)
+	{
+		stack_limit = p;
+		if (interrupted == NotInterrupted)
+			minstack = p;
+	}
+
+	/* static */
+	void AvmCore::handleStackOverflowMethodEnv(MethodEnv* env)
+	{
+		handleStackOverflowToplevel(env->toplevel());
+	}
+
+	/* static */
+	void AvmCore::handleStackOverflowToplevel(Toplevel* toplevel)
+	{
+		// this could be a real stack overflow, or an interrupt that
+		// used the stack overflow handler as a way to take control of AS3.
+		AvmCore *core = toplevel->core();
+		if (core->interrupted) {
+			handleInterruptToplevel(toplevel);
+			// never returns
+		}
+		
+		// invoke host's stack overflow handler
+		core->stackOverflow(toplevel);
+	}
+	
+	static GCThreadLocal<Toplevel*> PCREContext;
+
+	/* static */
+	void AvmCore::checkPCREStackOverflow()
+	{
+		// Stopgap measure 2009-10-29:  The PCREContext can be NULL when host code (*cough* Flash Player *cough*)
+		// calls directly into the PCRE engine.  We need to fix that, but for the moment we allow it to happen:
+		// it's no worse than before.
+		if (PCREContext != NULL)
+			(PCREContext->core())->stackCheck(PCREContext);
+	}
+
+	/* static */
+	void AvmCore::setPCREContext(Toplevel* env)
+	{
+		PCREContext = env;
+	}
+
+	void AvmCore::raiseInterrupt(InterruptReason reason)
+	{
+		AvmAssert(reason != NotInterrupted);
+		interrupted = reason;
+	}
+
+	/* static */
+	void AvmCore::handleInterruptMethodEnv(MethodEnv *env)
+	{
+		handleInterruptToplevel(env->toplevel());
+	}
+
+	/* static */
+	void AvmCore::handleInterruptToplevel(Toplevel *toplevel)
+	{
+		AvmCore *core = toplevel->core();
+		InterruptReason reason = core->interrupted;
+		core->interrupted = NotInterrupted;
+		core->interrupt(toplevel, reason);
+		// interrupt() must not return!
+		AvmAssert(false);
+	}
+	
+	// BEGIN api versioning
+
+	void AvmCore::setActiveAPI(API api)
+	{
+		active_api_flags |= api;
+	}
+
+	/*
+	  assumptions:
+	  - largest api is represented by the largest bit that is set
+	  - original api is represented by the first bit
+	  - the nth bit represents number n more than the original version
+	*/
+
+	void AvmCore::setAPIInfo(uint32_t apis_start,
+							 uint32_t apis_count, 
+							 uint32_t uris_count, const char** uris,
+							 const API* api_compat)
+	{
+		this->apis_start  = apis_start;
+		this->apis_count  = apis_count;
+		this->uris_count  = uris_count;
+		this->uris		  = uris;
+		this->api_compat  = api_compat;
+		this->largest_api = 0x1 << (apis_count-1);
+		this->active_api_flags = 0;
+		// cache public namespaces
+		this->publicNamespaces = NamespaceSet::_create(GetGC(), apis_count);
+		for (uint32_t i = 0; i < apis_count; ++i) {
+			Namespacep ns = this->internNamespace(this->newNamespace(kEmptyString, Namespace::NS_Public, 0x1<<i));
+            publicNamespaces->_initNsAt(i, ns);
+		}
+	}
+
+	Namespacep AvmCore::findPublicNamespace()
+	{	
+		return publicNamespaces->nsAt(ApiUtils::toVersion(this, this->getAPI(NULL))-apis_start);
+	}
+
+	Namespacep AvmCore::getPublicNamespace(PoolObject* pool)
+	{
+		AvmAssert(pool != NULL);
+		return publicNamespaces->nsAt(ApiUtils::toVersion(this, pool->getAPI())-apis_start);
+	}
+
+	Namespacep AvmCore::getPublicNamespace(int32_t api) 
+	{
+		return publicNamespaces->nsAt(ApiUtils::toVersion(this, api)-apis_start);
+	}
+
+	Namespacep AvmCore::getAnyPublicNamespace() 
+	{
+		return publicNamespaces->nsAt(ApiUtils::toVersion(this, largest_api)-apis_start);
+	}
+
+	// global helpers
+
+	bool ApiUtils::hasVersionMark(Stringp uri) 
+	{
+		uint32_t mark = uri->length()==0 ? 0: uri->charAt(uri->length()-1);
+		if (mark >= ApiUtils::MIN_API_MARK && mark <= ApiUtils::MAX_API_MARK) {
+			return true;
+		}
+		return false;
+	}
+
+	API ApiUtils::getURIAPI(AvmCore* core, Stringp uri) 
+	{
+		uint32_t mark = uri->length()==0 ? 0: uri->charAt(uri->length()-1);
+		// if mark is not recognized as a valid version marker, then ignore it
+		if (mark >= ApiUtils::MIN_API_MARK+core->apis_start && mark <= ApiUtils::MIN_API_MARK+core->apis_start+core->apis_count) {
+			return toAPI(core, mark-ApiUtils::MIN_API_MARK);
+		}
+		return 0;
+	}
+
+	Stringp ApiUtils::getBaseURI(AvmCore* core, Stringp uri) 
+	{
+		uint32_t mark = uri->length()==0 ? 0: uri->charAt(uri->length()-1);
+		if (mark >= ApiUtils::MIN_API_MARK && mark <= ApiUtils::MAX_API_MARK) {
+			uri = core->internString(uri->substr(0, uri->length()-1));
+		}
+		return uri;
+	}
+
+	/*
+	  Return the set of namespaces (including an unversioned namespace) that
+	  are compatible with a set of namespaces that share the same base uri.
+	*/
+
+	bool ApiUtils::isVersionedNS(AvmCore* core, Namespace::NamespaceType type, Stringp uri) 
+	{
+		return type == Namespace::NS_Public && core->isVersionedURI(uri);
+	}
+
+	// this is a poor man's bit checker, but it's probably rich enough.
+	// nanojit and possibly mmgc have similar operations that use the
+	// hardware instructions to do it faster, but it's not clear that
+	// we need the speed. if we do we should provide an public implementation
+	// one an existing implementation
+	// NOTE: this is called from two place so inline, if it gets inlined, is
+	// not a problem
+	inline static uint32_t apiBit(API api) {
+		uint32_t x;
+		switch (api) {
+		case 0x00000001: x =  0; break;
+		case 0x00000002: x =  1; break;
+		case 0x00000004: x =  2; break;
+		case 0x00000008: x =  3; break;
+		case 0x00000010: x =  4; break;
+		case 0x00000020: x =  5; break;
+		case 0x00000040: x =  6; break;
+		case 0x00000080: x =  7; break;
+		case 0x00000100: x =  8; break;
+		case 0x00000200: x =  9; break;
+		case 0x00000400: x = 10; break;
+		case 0x00000800: x = 11; break;
+		case 0x00001000: x = 12; break;
+		case 0x00002000: x = 13; break;
+		case 0x00004000: x = 14; break;
+		case 0x00008000: x = 15; break;
+		case 0x00010000: x = 16; break;
+		case 0x00020000: x = 17; break;
+		case 0x00040000: x = 18; break;
+		case 0x00080000: x = 19; break;
+		case 0x00100000: x = 20; break;
+		case 0x00200000: x = 21; break;
+		case 0x00400000: x = 22; break;
+		case 0x00800000: x = 23; break;
+		case 0x01000000: x = 24; break;
+		case 0x02000000: x = 25; break;
+		case 0x04000000: x = 26; break;
+		case 0x08000000: x = 27; break;
+		case 0x10000000: x = 28; break;
+		case 0x20000000: x = 29; break;
+		case 0x40000000: x = 30; break;
+		case 0x80000000: x = 31; break;
+		default:
+			AvmAssert(false);  // one and only one bit should be set 
+			x = 0;
+		}
+		return x;
+	}
+
+	API ApiUtils::getCompatibleAPIs(AvmCore* core, API api)
+	{
+		if (api==0)
+			return 0;
+		uint32_t x = apiBit(api);
+		AvmAssert(x<core->apis_count);
+		return core->api_compat[x];
+	}
+
+	Namespacep ApiUtils::getVersionedNamespace(AvmCore* core, Namespacep ns, API api) 
+	{
+		AvmAssert(!(ApiUtils::isVersionedNS(core, ns->getType(), ns->getURI()) && api==0));
+		if (!isVersionedNS(core, ns->getType(), ns->getURI()))
+			return ns;
+
+		Namespacep ns2 = core->gotNamespace(ns->getURI(), api);
+		if (ns2 != NULL) {
+			return ns2;
+		}
+		else {
+			return core->internNamespace(core->newNamespace(ns->getURI(), ns->getType(), api));
+		}
+	}
+
+	bool AvmCore::isVersionedURI(Stringp uri) 
+	{
+		// versioning is turned off
+		if (uris_count == 0)
+			return false;
+
+		if (uri->isEmpty())
+			return true;
+
+		// binary search (requires uris to be sorted). avoids the need
+		// to call getBaseURI, and to search the whole list in negative
+		// cases.
+		uint32_t i = this->uris_count / 2;
+		uint32_t l1 = (uint32_t)uri->length();
+		for (uint32_t j = i; j;) {
+			const char* probe = this->uris[i];
+			int32_t r = 0;
+			uint32_t l2 = (uint32_t)strlen(probe);
+			uint32_t len = l1 < l2 ? l1 : l2;
+			for (uint32_t k = 0; k < len; k++) {
+				wchar c1 = uri->charAt(k);
+				wchar c2 = probe[k];
+				if (c1 == c2)
+					continue;
+				r = c1 - c2;
+				break;
+			}
+			// we have a match if the prefixes match and the strings are the same
+			// length modulo the version mark, if there is one. (this code assumes
+			// the uri being checked does not have a unicode characters above 0xF8FF
+			// in its last position)
+			if (r==0) {
+				if (l1==l2 || (l1==l2+1 && uri->charAt(l2) > ApiUtils::MIN_API_MARK)) {
+					return true;
+				}
+				else {
+					// keep looking, in the right direction based on length
+					r = l1-l2;
+				}
+			}
+
+			j /= 2;
+			if (r < 0)
+				i = i - j;
+			else
+				i = i + j;
+		}
+		return false;
+	}
+
+	API ApiUtils::toAPI(AvmCore* core, uint32_t v) 
+	{
+		AvmAssert(v >= core->apis_start && v <= core->apis_start+core->apis_count);
+		return 0x1 << (v-core->apis_start);
+	}
+
+	uint32_t ApiUtils::toVersion(AvmCore* core, API api) 
+	{
+		// handle the special case when versioning is turned off (apis and versions are always zero)
+		if (api==0)
+			return 0;
+		uint32_t x = apiBit(api);
+		AvmAssert(x<core->apis_count);
+		return core->apis_start+x;
 	}
 }

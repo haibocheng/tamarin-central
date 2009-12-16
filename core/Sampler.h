@@ -42,6 +42,88 @@ namespace avmplus
 {
 #ifdef DEBUGGER
 
+    //
+    // Note that "SamplerObjectType" is atomlike, but is NOT an Atom: 
+    //
+    // -- the lower three bits are SamplerObjectTypeKind
+    // -- if kind is kSOT_Object, upper bits are a VTable*
+    // -- if kind is kSOT_String or kSOT_Namespace, upper bits are a Toplevel*
+    // -- if kind is kSOT_Empty, upper bits are zero
+    //
+    // note that for efficiency, the Toplevel* in the String/Namespace case is filled in lazily downstream
+    // (via sotSetToplevel), to avoid having String/Namespace ctors look up the proper Toplevel
+    // when not sampling.
+    //
+    // To reinforce the fact that this Isn't An Atom, it's now its own opaque type, with 
+    // lovely little accessors. Please use them now, rather than casting to intptr and
+    // dancing on the bits directly.
+    //
+
+    enum SamplerObjectTypeKind
+    {
+        kSOT_Object = 0,
+        kSOT_String = 1,
+        kSOT_Namespace = 2,
+        kSOT_Empty = 3
+    };
+
+    REALLY_INLINE SamplerObjectType sotNamespace()
+    {
+        // start with Toplevel == NULL, filled in implicitly later
+        return SamplerObjectType(kSOT_Namespace);
+    }
+
+    REALLY_INLINE SamplerObjectType sotString()
+    {
+        // start with Toplevel == NULL, filled in implicitly later
+        return SamplerObjectType(kSOT_String);
+    }
+
+    REALLY_INLINE SamplerObjectType sotEmpty()
+    {
+        return SamplerObjectType(kSOT_Empty);
+    }
+
+    REALLY_INLINE SamplerObjectType sotObject(VTable* vt)
+    {
+        MMGC_STATIC_ASSERT(kSOT_Object == 0);
+        return SamplerObjectType(uintptr_t(vt) | uintptr_t(kSOT_Object));
+    }
+
+    REALLY_INLINE SamplerObjectTypeKind sotGetKind(SamplerObjectType sot)
+    {
+        return SamplerObjectTypeKind(uintptr_t(sot) & 7);
+    }
+
+    REALLY_INLINE VTable* sotGetVTable(SamplerObjectType sot)
+    {
+        MMGC_STATIC_ASSERT(kSOT_Object == 0);
+        AvmAssert(sotGetKind(sot) == kSOT_Object);
+        return (VTable*)(sot);
+    }
+
+    REALLY_INLINE Toplevel* sotGetToplevel(SamplerObjectType sot)
+    {
+        AvmAssert(sotGetKind(sot) == kSOT_String || sotGetKind(sot) == kSOT_Namespace);
+        return (Toplevel*)(uintptr_t(sot) & ~7);
+    }
+
+    REALLY_INLINE SamplerObjectType sotSetToplevel(SamplerObjectType sot, Toplevel* toplevel)
+    {
+        SamplerObjectTypeKind const sk = sotGetKind(sot);
+        if (sk == kSOT_String || sk == kSOT_Namespace)
+        {
+            sot = SamplerObjectType(uintptr_t(toplevel) | uintptr_t(sk));
+        }
+        return sot;
+    }
+
+    // return value will be a VTable* or a Toplevel* -- intended only for use in adding GC work items
+    REALLY_INLINE void* sotGetGCPointer(SamplerObjectType sot)
+    {
+        return (void*)(uintptr_t(sot) & ~7);
+    }
+
 	// This structure is used to read/write data to the sample stream.
 	// The fields are written out to the sample stream as they are defined here.  
 	struct Sample
@@ -64,7 +146,7 @@ namespace avmplus
 
 		// Following three fields are only filled in for sampleType==NEW_OBJECT_SAMPLE or NEW_AUX_SAMPLE
 		// They are not present in the sample stream for other sample types
-		uintptr typeOrVTable;
+		SamplerObjectType sot;
 		void *ptr;
 		uint64 alloc_size; // size for new mem sample
 	};
@@ -73,7 +155,7 @@ namespace avmplus
 	{
 	public:
 		Sampler(AvmCore*);
-		~Sampler();
+		virtual ~Sampler();
 
 		enum SampleType 
 		{ 
@@ -90,14 +172,14 @@ namespace avmplus
 		void init(bool sampling, bool autoStart);
 		void sampleCheck() { if(takeSample) sample(); }
 
-		uint64 recordAllocationInfo(AvmPlusScriptableObject *obj, uintptr typeOrVTable);
-		uint64 recordAllocationSample(const void* item, uint64_t size, bool callback_ok = true);
+		uint64 recordAllocationInfo(AvmPlusScriptableObject *obj, SamplerObjectType sot);
+		uint64 recordAllocationSample(const void* item, uint64_t size, bool callback_ok = true, bool forceWrite = false);
 		void recordDeallocationSample(const void* item, uint64_t size);
 
-		void startSampling();
-		void stopSampling();
-		void clearSamples();
-		void pauseSampling();
+		virtual void startSampling();
+		virtual void stopSampling();
+		virtual void clearSamples();
+		virtual void pauseSampling();
 
 		void sampleInternalAllocs(bool b);
 
@@ -119,32 +201,6 @@ namespace avmplus
 
 	private:	
 		
-		static void inline align(byte*&b)
-		{
-			if((sintptr)b & 4)
-			{
-#ifdef DEBUG
-				*(int32*)b = 0xaaaaaaaa;
-#endif
-				b += sizeof(int32);
-			}
-		}
-		
-		template<class T>
-		static void inline read(byte *&p, T &u)
-		{
-			u = *(T*)p;
-			p += sizeof(T);
-		}
-
-		template<class T>
-		static void inline write(byte *&p, T u)
-		{
-			*(T*)p = u;
-			p += sizeof(T);
-		}
-		
-		
 		void sample();
 
 		void rewind(byte*&b, uint32 amount)
@@ -160,8 +216,9 @@ namespace avmplus
 	public:
 		VTable*				sampleIteratorVTable;
 		VTable*				slotIteratorVTable;
-	private:
+	protected:
 		AvmCore*			core;
+	private:
 		List<Stringp>		fakeMethodNames; 
 		uint64_t			allocId;
 		uint8_t*			samples;
@@ -169,8 +226,8 @@ namespace avmplus
 		uint8_t*			lastAllocSample;
 		DRC(ScriptObject*)	callback;
 		uintptr_t			timerHandle;
-		MMgc::GCHashtable	uids;
-		MMgc::GCHashtable*	ptrSamples;
+		MMgc::GCHashtable_VMPI		uids;		// important to use the VMPI variant for non-MMGC-based memory allocation.
+		MMgc::GCHashtable_VMPI*		ptrSamples;	// important to use the VMPI variant for non-MMGC-based memory allocation.
 		int32_t				takeSample;
 		uint32_t			numSamples;
 		uint32_t			samples_size;

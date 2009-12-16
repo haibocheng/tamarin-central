@@ -69,7 +69,7 @@ package
 		{
 			if (this === prototype) return ""
 			var n:Namespace = this
-			return n.uri;
+			return n.AS3::toString();
 		}
 
         // Dummy constructor function - This is neccessary so the compiler can do arg # checking for the ctor in strict mode

@@ -44,16 +44,25 @@
 #ifdef MMGC_MEMORY_PROFILER
 	#include <malloc.h>
 	#include <strsafe.h>
+#ifndef UNDER_CE  // Not available on WinMo builds
 	#include <DbgHelp.h>
     #include <io.h>
 #endif
+#endif
 
-size_t VMPI_getVMPageSize()
+static size_t computePagesize()
 {
 	SYSTEM_INFO sysinfo;
 	GetSystemInfo(&sysinfo);
-
+	
 	return sysinfo.dwPageSize;
+}
+
+static size_t pagesize = computePagesize();
+
+size_t VMPI_getVMPageSize()
+{
+	return pagesize;
 }
 
 bool VMPI_canMergeContiguousRegions()
@@ -64,6 +73,11 @@ bool VMPI_canMergeContiguousRegions()
 bool VMPI_useVirtualMemory()
 {
 	return true;
+}
+
+bool VMPI_areNewPagesDirty()
+{
+	return false;
 }
 
 void* VMPI_reserveMemoryRegion(void* address, size_t size)
@@ -154,15 +168,103 @@ void VMPI_releaseAlignedMemory(void* address)
 	VMPI_releaseMemoryRegion(address, 0);
 }
 
-size_t VMPI_getVMPageCount(size_t pageSize)
+#ifdef UNDER_CE
+	typedef DWORD (*pTGetProcessIndexFromID)(HANDLE hProc);
+	static pTGetProcessIndexFromID gGetID=NULL;
+#if _WIN32_WCE>=0x600
+	THIS WILL NOT WORK ON WINCE 6.0 AND ABOVE
+#endif
+#endif
+
+#ifdef UNDER_CE
+
+// The WinCE version of getPrivateResidentPageCount must do some specific things to get
+// an accurate picture of private bytes due to how WinCE lays out memory for the process. 
+// see http://msdn.microsoft.com/en-us/library/bb331824.aspx for a desccription of how the memory is laid out.
+// Note that we are running on Windows Mobile 6.0, but that is based on WinCE 5.0.
+// Basically, first we walk the memory for the process slot, from 0x10000 to 0x2000000.  Then we walk the memory
+// in the large memory area (0x42000000 - 0x80000000), as this is where gcheap allocates memory from.
+
+size_t VMPI_getPrivateResidentPageCount()
 {
-	void *addr = 0;
-	size_t ret;
+	void  *addr = (void*)(0x00010000);
+	void  *endAddr = (void*)(0x02000000);
+
 	size_t bytes=0;
 	MEMORY_BASIC_INFORMATION mib;
 	while(true)
 	{
-		ret = VirtualQuery(addr, &mib, sizeof(MEMORY_BASIC_INFORMATION));
+		size_t ret = VirtualQuery(addr, &mib, sizeof(MEMORY_BASIC_INFORMATION));
+		if(ret == 0)
+			break;
+
+		if((mib.State & MEM_COMMIT))
+			if ((DWORD)mib.BaseAddress + mib.RegionSize > (DWORD)endAddr)
+				bytes += (DWORD)endAddr - (DWORD)mib.BaseAddress;
+			else
+
+			bytes += mib.RegionSize;
+
+			addr = (void*) ((intptr_t)mib.BaseAddress + mib.RegionSize);
+			if (addr>=endAddr)
+				break;
+	}
+
+	MMgc::GCHeap* heap = MMgc::GCHeap::GetGCHeap();
+
+	// We need to also walk the shared memory regions to make sure we
+	// count the blocks we've allocated there
+	MMgc::GCHeap::Region* curRegion = heap->lastRegion;
+	if (curRegion)
+		addr = curRegion->baseAddr;
+	else
+		addr = NULL;
+
+	while (curRegion!=NULL)
+	{
+		addr = curRegion->baseAddr;
+		if (addr < (void*)0x42000000)
+		{
+			// Not in the shared regions
+			curRegion = curRegion->prev;
+			continue;
+		}
+
+		while(true)
+		{
+			size_t ret = VirtualQuery(addr, &mib, sizeof(MEMORY_BASIC_INFORMATION));
+			if(ret == 0)
+				break;
+
+			if((mib.State & MEM_COMMIT)) // && (mib.Type & MEM_PRIVATE))
+			{
+				if ((DWORD)mib.BaseAddress + mib.RegionSize > (DWORD)curRegion->reserveTop)
+					bytes += (DWORD)curRegion->reserveTop - (DWORD)mib.BaseAddress;
+				else
+					bytes += mib.RegionSize;
+			}
+
+			addr = (void*) ((intptr_t)mib.BaseAddress + mib.RegionSize);
+
+			if (addr>=curRegion->reserveTop)
+				break;
+		}
+		curRegion = curRegion->prev;
+	}
+
+	return bytes / VMPI_getVMPageSize();
+}
+
+#else // UNDER_CE
+
+size_t VMPI_getPrivateResidentPageCount()
+{
+	void *addr = 0;
+	size_t bytes=0;
+	MEMORY_BASIC_INFORMATION mib;
+	while(true)
+	{
+		size_t ret = VirtualQuery(addr, &mib, sizeof(MEMORY_BASIC_INFORMATION));
 		if(ret == 0)
 			break;
 
@@ -172,11 +274,20 @@ size_t VMPI_getVMPageCount(size_t pageSize)
 			addr = (void*) ((intptr_t)mib.BaseAddress + mib.RegionSize);
 	}
 
-	return bytes / pageSize;
+	return bytes / VMPI_getVMPageSize();
 }
+#endif //UNDER_CE
+
+// Call VMPI_getPerformanceFrequency() once to initialize its cache; avoids thread safety issues.
+static uint64_t unused_value = VMPI_getPerformanceFrequency();
 
 uint64_t VMPI_getPerformanceFrequency()
 {
+	// *** NOTE ABOUT THREAD SAFETY ***
+	//
+	// This static ought to be safe because it is initialized by a call at startup
+	// (see lines above this function), before any AvmCores are created.
+	
 	static uint64_t gPerformanceFrequency = 0;		
 	if (gPerformanceFrequency == 0) {
 		QueryPerformanceFrequency((LARGE_INTEGER*)&gPerformanceFrequency);
@@ -191,10 +302,22 @@ uint64_t VMPI_getPerformanceCounter()
 	return value.QuadPart;
 }
 
+void VMPI_cleanStack(size_t amt)
+{
+	void *space = alloca(amt);
+	if(space)
+	{
+		VMPI_memset(space, 0, amt);
+	}
+}
+
 #ifdef MMGC_MEMORY_PROFILER
 
+#ifndef UNDER_CE
 namespace MMgc
 {
+	// This relies on headers that don't exist in winmo builds
+
 	// --------------------------------------------------------------------------
 	// --------------------------------------------------------------------------
 	// --------------------------------------------------------------------------
@@ -352,12 +475,13 @@ namespace MMgc
 		GETPROC(SymInitialize);
 	}
 }
-
 	// declaring this statically will dynamically load the dll and procs
 	// at startup, and never ever release them... if this ever becomes NON-debug
 	// code, you might want to have a way to toss all this... but for _DEBUG
 	// only, it should be fine
 static MMgc::DbgHelpDllHelper g_DbgHelpDll;
+#endif
+
 	static const int MaxNameLength = 256;
 
 #ifdef _WIN64 
@@ -368,8 +492,17 @@ static MMgc::DbgHelpDllHelper g_DbgHelpDll;
 
 	bool InitDbgHelp()
 	{
+		static vmpi_spin_lock_t lock;
 		static bool inited = false;
+	
+		// We must hold the lock for the entire initialization process:
+		//  - if we set inited to true and Release the lock then other
+		//    threads may forge ahead without initialization having occured
+		//  - if we leave it false and Release then other threads
+		//    may try to perform initialization as well.
+		MMGC_LOCK(lock);
 		if(!inited) {
+#ifndef UNDER_CE
 			if(!g_DbgHelpDll.m_SymInitialize ||
 				!(*g_DbgHelpDll.m_SymInitialize)(GetCurrentProcess(), NULL, true)) {
 					LPVOID lpMsgBuf;
@@ -377,15 +510,36 @@ static MMgc::DbgHelpDllHelper g_DbgHelpDll;
 						NULL, GetLastError(), MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), // Default language
 						(LPTSTR) &lpMsgBuf, 0, NULL )) 
 					{
-						MMgc::GCDebugMsg("See lpMsgBuf", true);
+						GCAssertMsg(false, "See lpMsgBuf");
 						LocalFree(lpMsgBuf);
-					}			
+					}
 					return false;
 			}
+#endif // ifn UNDER_CE
 			inited = true;
 		}
 		return true;
 	}
+
+#ifdef UNDER_CE
+typedef ULONG NTAPI RtlCaptureStackBackTrace_Function(
+	IN HANDLE hThrd,
+	IN ULONG dwMaxFrames,
+	OUT void* lpFrames,
+	IN DWORD dwFlags,
+	IN DWORD dwSkip);
+
+static RtlCaptureStackBackTrace_Function* const RtlCaptureStackBackTrace_fn = 
+	(RtlCaptureStackBackTrace_Function*)
+	GetProcAddress(LoadLibrary(_T("coredll.dll")), _T("GetThreadCallStack"));
+
+typedef struct _CallSnapshot {
+	DWORD dwReturnAddr;
+} CallSnapshot;
+
+#define STACKSNAP_EXTENDED_INFO 2
+
+#else // UNDER_CE
 
 typedef USHORT NTAPI RtlCaptureStackBackTrace_Function(
 	IN ULONG frames_to_skip,
@@ -397,15 +551,48 @@ static RtlCaptureStackBackTrace_Function* const RtlCaptureStackBackTrace_fn =
 	(RtlCaptureStackBackTrace_Function*)
 	GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlCaptureStackBackTrace");
 
+#endif // UNDER_CE
+
+#ifdef UNDER_CE
+#include <cmnintrin.h>
+extern "C" unsigned long* get_frame_pointer();
+#endif
+
 	bool VMPI_captureStackTrace(uintptr_t *buffer, size_t bufferSize, uint32_t framesToSkip)
 	{
+		if(RtlCaptureStackBackTrace_fn == NULL)
+			return false;
+
+#ifdef UNDER_CE
+
+		CallSnapshot lpFrames[32];
+		DWORD dwCnt = RtlCaptureStackBackTrace_fn(GetCurrentThread(), bufferSize >= 32 ? 32 : bufferSize, (void*)&lpFrames,0, framesToSkip);
+
+		size_t i = 0;
+		for( ; i < dwCnt && i < bufferSize ; ++i )
+		{
+			buffer[i] = lpFrames[i].dwReturnAddr;
+		}
+
+#else
+
 		int num = RtlCaptureStackBackTrace_fn(framesToSkip, (uint32_t)(bufferSize - 1), (PVOID*)buffer, NULL);
 		buffer[num] = 0;
+
+#endif //UNDER_CE
 		return true;
 	}
 
 	bool VMPI_getFileAndLineInfoFromPC(uintptr_t pc, char *filenameBuffer, size_t bufferSize, uint32_t* lineNumber)
 	{
+#ifdef UNDER_CE
+		(void)pc;
+		(void)lineNumber;
+		(void)filenameBuffer;
+		(void)bufferSize;
+
+		return false;
+#else
 		if(!InitDbgHelp())
 			return false;
 
@@ -443,10 +630,18 @@ static RtlCaptureStackBackTrace_Function* const RtlCaptureStackBackTrace_fn =
 		*lineNumber = line.LineNumber;
 
 		return true;
+#endif // UNDER_CE
 	}
 
 	bool VMPI_getFunctionNameFromPC(uintptr_t pc, char *buffer, size_t bufferSize)
 	{
+#ifdef UNDER_CE
+		(void)pc;
+		(void)buffer;
+		(void)bufferSize;
+		return false;
+#else
+
 		if(!InitDbgHelp())
 			return false;
 
@@ -464,6 +659,12 @@ static RtlCaptureStackBackTrace_Function* const RtlCaptureStackBackTrace_fn =
 		StringCchPrintfA(buffer, bufferSize, "%s", pSym->Name);
 		//printf("%s\n", pSym->Name);
 		return true;
+
+#endif //UNDER_CE
 	}
+
+	void VMPI_setupPCResolution() { }
+
+	void VMPI_desetupPCResolution() { }
 
 #endif // MMGC_MEMORY_PROFILER

@@ -49,7 +49,7 @@ namespace avmplus
 
 	class WordcodeEmitter : public WordcodeTranslator {
 	public:
-		WordcodeEmitter(MethodInfo* info);
+		WordcodeEmitter(MethodInfo* info, Toplevel* toplevel);
 #    ifdef AVMPLUS_SELFTEST
 		WordcodeEmitter(AvmCore* core, uint8_t* code_start);
 #    endif
@@ -95,7 +95,6 @@ namespace avmplus
 		void writeInterfaceCall(FrameState* state, const byte *pc, AbcOpcode opcode, uintptr opd1, uint32_t opd2, Traits* type = NULL);
 		void writeNip(FrameState* state, const byte *pc);
 		void writeCheckNull(FrameState* state, uint32_t index);
-		void writeSetContext(FrameState* state, MethodInfo *f);
 		void writeCoerce(FrameState* state, uint32_t index, Traits *type);
 		void writePrologue(FrameState* state, const byte *pc);
 		void writeEpilogue(FrameState* state);
@@ -103,6 +102,7 @@ namespace avmplus
 		void writeOpcodeVerified(FrameState* state, const byte *pc, AbcOpcode opcode);
 		void writeFixExceptionsAndLabels(FrameState* state, const byte *pc);
 		void formatOperand(PrintWriter& buffer, Value& v);
+		void cleanup();
 
 	private:
 		// 'backpatches' represent target addresses of forward jumps in the original code,
@@ -148,8 +148,7 @@ namespace avmplus
 		struct catch_info
 		{
 			const uint8_t* pc;			// address in ABC code to trigger use of this structure
-			void *fixup_loc;		// points to a location to update
-			bool is_target;			// The 'target' field is a intptr_t, not an int (sigh).
+			int32_t *fixup_loc;			// points to a location to update in an ExceptionHandler
 			catch_info* next;
 		};
 		
@@ -162,6 +161,7 @@ namespace avmplus
 		
 		MethodInfo* info;
 		AvmCore* core;
+		Toplevel* avm_toplevel;				// for error classes; may be NULL
 		backpatch_info* backpatches;	// in address order
 		label_info* labels;				// in reverse offset order
 		catch_info* exception_fixes;	// in address order
@@ -178,7 +178,6 @@ namespace avmplus
 		uintptr_t *dest;
 		uintptr_t *dest_limit;
 
-		void cleanup();
 		void refill();
 		void emitRelativeOffset(uintptr_t base_offset, const uint8_t *pc, intptr_t offset);
 		void makeAndInsertBackpatch(const uint8_t* target_pc, uintptr_t patch_offset);
@@ -234,11 +233,7 @@ namespace avmplus
 		}
 #endif	// AVMPLUS_PEEPHOLE_OPTIMIZER
 
-		uint32_t allocateCacheSlot(uint32_t imm30);
-		int num_caches;			// number of entries in 'caches'
-		int next_cache;			// next free entry in 'caches'
-		uint32_t* caches;			// entry i has an imm30 value that represents the multiname whose entry in the MethodEnv's lookup cache is 'i'
-
+		LookupCacheBuilder cache_builder;
 	};
 #endif // AVMPUS_WORD_CODE
 }

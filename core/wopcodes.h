@@ -51,6 +51,7 @@ namespace avmplus
 		WOP_setsuper = 0x05,
 		WOP_dxns = 0x06,
 		WOP_dxnslate = 0x07,
+		WOP_kill = 0x08,
 		WOP_ifnlt = 0x0C,
 		WOP_ifnle = 0x0D,
 		WOP_ifngt = 0x0E,
@@ -158,7 +159,6 @@ namespace avmplus
 		WOP_typeof = 0x95,
 		WOP_not = 0x96,
 		WOP_bitnot = 0x97,
-		WOP_concat = 0x9A,
 		WOP_add = 0xA0,
 		WOP_subtract = 0xA1,
 		WOP_multiply = 0xA2,
@@ -253,8 +253,10 @@ namespace avmplus
 		WOP_findpropglobalstrict = 0x132,
 		WOP_debugenter = 0x133,
 		WOP_debugexit = 0x134,
+		WOP_lix8 = 0x135,
+		WOP_lix16 = 0x136,
 		
-		WOP_LAST = 0x134
+		WOP_LAST = 0x136
 	};
 	
 	struct WordOpcodeAttr

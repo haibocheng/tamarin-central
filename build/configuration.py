@@ -92,6 +92,8 @@ def _configSub(ostest, cputest):
         cpu = 'sparc'
     elif re.search('arm', cputest):
         cpu = 'arm'
+    elif re.search('mips', cputest):
+        cpu = 'mips'
     else:
         raise Exception('Unrecognized CPU: ' + cputest)
 
@@ -186,6 +188,8 @@ class Configuration:
                 'CPPFLAGS'     : (self._debug and '-MTd' or '-MT') or (self._debug and '-MDd' or '-MD'),
                 'CXX'          : 'cl.exe -nologo',
                 'CXXFLAGS'     : '-TP',
+                'CC'           : 'cl.exe -nologo',
+                'CFLAGS'       : '-TC',
                 'DLL_CFLAGS'   : '',
                 'AR'           : 'lib.exe -nologo',
                 'LD'           : 'link.exe -nologo',
@@ -208,6 +212,7 @@ class Configuration:
 				
             if sys.platform.startswith('cygwin'):
                 self._acvars.update({'CXX'          : '$(topsrcdir)/build/cygwin-wrapper.sh cl.exe -nologo'})
+                self._acvars.update({'CC'           : '$(topsrcdir)/build/cygwin-wrapper.sh cl.exe -nologo'})
 
         # Hackery! Make assumptions that we want to build with GCC 3.3 on MacPPC
         # and GCC4 on MacIntel
@@ -216,6 +221,7 @@ class Configuration:
                 'DLL_SUFFIX'   : 'dylib',
                 'CPPFLAGS'     : '-pipe',
                 'CXXFLAGS'     : '',
+                'CFLAGS'       : '',
                 'DLL_CFLAGS'   : '-fPIC',
                 'LDFLAGS'      : '-framework CoreServices',
                 'AR'           : 'ar',
@@ -246,25 +252,52 @@ class Configuration:
                 self._acvars['LDFLAGS'] += ' -arch ppc64 '
             else:
                 raise Exception("Unexpected Darwin processor.")
+                
+            if 'CC' in os.environ:
+                self._acvars['CC'] = os.environ['CC']
+            elif self._target[1] == 'i686':
+                self._acvars['CC'] = 'gcc'
+                self._acvars['CFLAGS'] += ' -arch i686 '
+            elif self._target[1] == 'x86_64':
+                self._acvars['CC'] = 'gcc'
+                self._acvars['CFLAGS'] += ' -arch x86_64 '
+            elif self._target[1] == 'powerpc':
+                self._acvars['CC'] = 'gcc'
+                self._acvars['CFLAGS'] += ' -arch ppc '
+            elif self._target[1] == 'ppc64':
+                self._acvars['CC'] = 'gcc'
+                self._acvars['CFLAGS'] += ' -arch ppc64 '
+            else:
+                raise Exception("Unexpected Darwin processor.")
 
         elif self._target[0] == 'linux':
             self._acvars.update({
                 'CPPFLAGS'     : os.environ.get('CPPFLAGS', ''),
                 'CXX'          : os.environ.get('CXX', 'g++'),
                 'CXXFLAGS'     : os.environ.get('CXXFLAGS', ''),
+                'CC'           : os.environ.get('CC', 'gcc'),
+                'CFLAGS'       : os.environ.get('CFLAGS', ''),
                 'DLL_CFLAGS'   : '-fPIC',
-                'LD'           : 'ar',
-                'LDFLAGS'      : '',
+                'LD'           : os.environ.get('LD', 'ar'),
+                'LDFLAGS'      : os.environ.get('LDFLAGS', ''),
+                'AR'           : os.environ.get('AR', 'ar'),
                 'MKSTATICLIB'  : '$(AR) cr $(1)',
                 'MKDLL'        : '$(CXX) -shared -o $(1)',
                 'MKPROGRAM'    : '$(CXX) -o $(1)'
                 })
+            if self._target[1] == "mips":
+                self._acvars.update({'CXXFLAGS' : '-EL -mips32r2 '})
+                self._acvars.update({'LDFLAGS' : '-EL'})
+                self._acvars.update({'zlib_EXTRA_CFLAGS' : '-EL'})
+                
         elif self._target[0] == 'sunos':
 	    if options.getBoolArg("gcc", False):
                 self._acvars.update({
                 'CPPFLAGS'     : os.environ.get('CPPFLAGS', '') + "-DBROKEN_OFFSETOF",
                 'CXX'          : os.environ.get('CXX', 'g++'),
                 'CXXFLAGS'     : os.environ.get('CXXFLAGS', ''),
+                'CC'           : os.environ.get('CC', 'gcc'),
+                'CFLAGS'       : os.environ.get('CFLAGS', ''),
                 'DLL_CFLAGS'   : '-fPIC',
                 'LD'           : 'ar',
                 'LDFLAGS'      : '',
@@ -280,6 +313,8 @@ class Configuration:
                 'CPPFLAGS'     : '',
                 'CXX'          : 'CC',
                 'CXXFLAGS'     : '',
+                'CC'           : 'cc',
+                'CFLAGS'       : '',
                 'LD'           : 'ar',
                 'LDFLAGS'      : '',
                 'MKSTATICLIB'  : '$(AR) cr $(1)',

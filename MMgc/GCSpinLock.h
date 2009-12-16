@@ -56,7 +56,8 @@ namespace MMgc
 	class GCAcquireSpinlock
 	{
 	public:
-		GCAcquireSpinlock(vmpi_spin_lock_t& spinlock) : m_spinlock(spinlock)
+		REALLY_INLINE explicit GCAcquireSpinlock(vmpi_spin_lock_t *spinlock) : 
+			m_spinlock(spinlock)
 		{
 		#ifdef _DEBUG
 			bool r =
@@ -65,7 +66,8 @@ namespace MMgc
 
 			GCAssert(r);
 		}
-		~GCAcquireSpinlock()
+		
+		REALLY_INLINE ~GCAcquireSpinlock()
 		{
 		#ifdef _DEBUG
 			bool r =
@@ -76,7 +78,7 @@ namespace MMgc
 		}
 
 	private:
-		vmpi_spin_lock_t& m_spinlock;
+		vmpi_spin_lock_t *m_spinlock;
 
 	private: // not implemented
 		GCAcquireSpinlock();

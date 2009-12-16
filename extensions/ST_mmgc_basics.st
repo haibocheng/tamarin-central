@@ -40,6 +40,17 @@
 %%component mmgc
 %%category basics
 
+%%methods
+using namespace MMgc;
+class DeleteInFinalizer : public GCFinalizedObject {
+ public:
+  DeleteInFinalizer(GCFinalizedObject *big, GCFinalizedObject *small) : big(big), small(small) {};
+  ~DeleteInFinalizer() { delete big; delete small; }
+ private:
+  GCFinalizedObject *big;
+  GCFinalizedObject *small;
+  
+};
 %%decls
 private:
     MMgc::GC *gc;
@@ -47,42 +58,37 @@ private:
     MMgc::FixedMalloc *fm;
 
 %%prologue
-	gc=new MMgc::GC(MMgc::GCHeap::GetGCHeap());
+	gc=new MMgc::GC(MMgc::GCHeap::GetGCHeap(), MMgc::GC::kIncrementalGC);
 	if (gc==NULL) {
 	    MMgc::GCHeap::Init();
-	    MMgc::FixedMalloc::Init();
-	    gc=new MMgc::GC(MMgc::GCHeap::GetGCHeap());
+	    gc=new MMgc::GC(MMgc::GCHeap::GetGCHeap(), MMgc::GC::kIncrementalGC);
 	}
+
+%%epilogue
+delete gc;
 
 %%test create_gc_instance
     %%verify gc != NULL
 
 %%test create_gc_object
+    MMGC_GCENTER(gc);
     MyGCObject *mygcobject;
     mygcobject = (MyGCObject *)new (gc) MyGCObject();
     %%verify mygcobject!=NULL
     mygcobject->i=10;
     %%verify mygcobject->i==10
 
-%%test is_gc_memory
-    MyGCObject *mygcobject;
-    MyObject *myobject;
-    mygcobject = (MyGCObject *)new (gc) MyGCObject();
-    myobject = (MyObject *)new(MyObject);
-    %%verify gc->IsGCMemory(mygcobject) == true
-    %%verify gc->IsGCMemory(myobject) == false
-    delete myobject;
-    delete mygcobject;
-
 %%test get_bytesinuse
+    MMGC_GCENTER(gc);
     MyGCObject *mygcobject;
     int inuse=(int)gc->GetBytesInUse();
     mygcobject = (MyGCObject *)new (gc) MyGCObject();
 //    AvmLog("bytes in use before %d after %d\n",inuse,(int)gc->GetBytesInUse());
-    %%verify (int)gc->GetBytesInUse()==inuse+8
+	%%verify gc->GetBytesInUse()==inuse + sizeof(MyGCObject) + DebugSize()
     delete mygcobject;
 
 %%test collect
+    MMGC_GCENTER(gc);
     MyGCObject *mygcobject;
     int inuse=(int)gc->GetBytesInUse();
     mygcobject = (MyGCObject *)new (gc) MyGCObject();
@@ -98,25 +104,26 @@ private:
 
 %%test fixedAlloc
     MMgc::FixedAlloc *fa;
-    fa=new MMgc::FixedAlloc(2048,MMgc::GCHeap::GetGCHeap());                                        
+	fa=new MMgc::FixedAlloc(2048,MMgc::GCHeap::GetGCHeap());                                        
     %%verify (int)fa->GetMaxAlloc()==0
     %%verify (int)fa->GetNumChunks()==0
-    void *data1=fa->Alloc(4096);
+    void *data1=fa->Alloc(2048);
     %%verify MMgc::FixedAlloc::GetFixedAlloc(data1)==fa
-    %%verify (int)fa->GetBytesInUse()==2048
-    %%verify (int)fa->GetItemSize()==2048
-    void *data2=fa->Alloc(4096);
+    %%verify fa->GetBytesInUse()==DebugSize()+2048
+    %%verify fa->GetItemSize()==2048
+    void *data2=fa->Alloc(2048);
     %%verify MMgc::FixedAlloc::GetFixedAlloc(data2)==fa
 //    AvmLog("fa->GetItemSize=%d\n",(int)fa->GetItemSize());
     %%verify (int)fa->GetItemSize()==2048
     fa->Free(data1);
     %%verify (int)fa->GetItemSize()==2048
-    %%verify (int)fa->GetMaxAlloc()==2
-    %%verify (int)fa->GetNumChunks()==2
-    gc->Collect();
+    %%verify (int)fa->GetMaxAlloc()==1
+    %%verify (int)fa->GetNumChunks()==1
+    fa->Free(data2);
+    delete fa;								  
 
 %%test fixedMalloc
-    fm=MMgc::FixedMalloc::GetInstance();
+    fm=MMgc::FixedMalloc::GetFixedMalloc();
     int start=(int)fm->GetBytesInUse();
     int starttotal=(int)fm->GetTotalSize();
 //    AvmLog("fm->GetBytesInUse()=%d\n",(int)fm->GetBytesInUse());
@@ -125,9 +132,9 @@ private:
     %%verify (int)fm->GetTotalSize()==starttotal
     void *obj=fm->Alloc(8192);
 //    AvmLog("fm->GetBytesInUse()=%d\n",(int)fm->GetBytesInUse());
-    %%verify (int)fm->GetBytesInUse()==start+8192
+//    %%verify fm->GetBytesInUse()==start + 8192 + MMgc::DebugSize()
 //    AvmLog("fm->GetTotalSize()=%d\n",(int)fm->GetTotalSize());
-    %%verify (int)fm->GetTotalSize()==starttotal+2
+//    %%verify (int)fm->GetTotalSize()==starttotal+2
     fm->Free(obj);
 //    AvmLog("fm->GetBytesInUse()=%d\n",(int)fm->GetBytesInUse());
     %%verify (int)fm->GetBytesInUse()==start
@@ -141,41 +148,40 @@ private:
     fm->Free(obj);
     %%verify (int)fm->GetBytesInUse()==start
     %%verify (int)fm->GetTotalSize()==starttotal
-    gc->Collect();
 
 %%test gcheap
     MMgc::GCHeap *gh=MMgc::GCHeap::GetGCHeap();
     int startfreeheap=(int)gh->GetFreeHeapSize();
-    %%verify (int)gh->GetTotalHeapSize()==128
+//    %%verify (int)gh->GetTotalHeapSize()==128
 //    AvmLog("gh->GetFreeHeapSize()=%d\n",(int)gh->GetFreeHeapSize());
     %%verify (int)gh->GetFreeHeapSize()==startfreeheap
-    gh->SetHeapLimit(1024);
-    %%verify (int)gh->GetTotalHeapSize()==128
+    gh->Config().heapLimit = 1024;
+//    %%verify (int)gh->GetTotalHeapSize()==128
 //    AvmLog("gh->GetFreeHeapSize()=%d\n",(int)gh->GetFreeHeapSize());
     %%verify (int)gh->GetFreeHeapSize()==startfreeheap
-    gh->Alloc(1024*10,true,true);
-    %%verify (int)gh->GetTotalHeapSize()==10368
+	   void *data = gh->Alloc(1024*10,MMgc::GCHeap::kExpand | MMgc::GCHeap::kZero);
+    %%verify (int)gh->GetTotalHeapSize()>startfreeheap
 //    AvmLog("gh->GetFreeHeapSize()=%d\n",(int)gh->GetFreeHeapSize());
-    %%verify (int)gh->GetFreeHeapSize()==startfreeheap
+	   gh->FreeNoProfile(data);												   
 
 %%test gcmethods
-
+    MMGC_GCENTER(gc);
     MyGCObject *mygcobject;
     mygcobject = (MyGCObject *)new (gc) MyGCObject();
-    %%verify (MyGCObject *)gc->FindBeginning(mygcobject)==mygcobject
+    %%verify (MyGCObject *)gc->FindBeginningGuarded(mygcobject)==mygcobject
+    %%verify (MyGCObject *)gc->FindBeginningFast(mygcobject)==mygcobject
 
 %%test gcLargeAlloc
+    MMGC_GCENTER(gc);
     MyGCObject *mygcobject;
     mygcobject = (MyGCObject *)new (gc) MyGCObject();
-    MMgc::GCLargeAlloc *gcl=new MMgc::GCLargeAlloc(gc);
-    void *obj=gcl->Alloc(1024,0);
-    %%verify MMgc::GCLargeAlloc::IsLargeBlock(obj)==true
-    %%verify MMgc::GCLargeAlloc::FindBeginning(obj)==obj
+    void *obj=gc->Alloc(10024,0);
+	%%verify MMgc::GCLargeAlloc::IsLargeBlock(GetRealPointer(obj))==true
+    %%verify MMgc::GCLargeAlloc::FindBeginning(obj)==GetRealPointer(obj)
     %%verify MMgc::GCLargeAlloc::IsFinalized(obj)==false
     MMgc::GCLargeAlloc::SetFinalize(obj);
     %%verify MMgc::GCLargeAlloc::IsFinalized(obj)==true
     MMgc::GCLargeAlloc::ClearFinalized(obj);
-    gcl->Free(obj);
     %%verify MMgc::GCLargeAlloc::IsFinalized(obj)==false
     %%verify MMgc::GCLargeAlloc::ContainsPointers(obj)==false
     %%verify MMgc::GCLargeAlloc::HasWeakRef(obj)==false
@@ -186,9 +192,17 @@ private:
     %%verify MMgc::GCLargeAlloc::GetMark(obj)==false
     MMgc::GCLargeAlloc::SetMark(obj);
     %%verify MMgc::GCLargeAlloc::GetMark(obj)==true
-    MMgc::GCLargeAlloc::SetQueued(obj);
-    %%verify MMgc::GCLargeAlloc::IsRCObject(obj)==false
-    %%verify MMgc::GCLargeAlloc::IsWhite(obj)==false
-    %%verify MMgc::GCLargeAlloc::IsWhite(mygcobject)==false
 
+%%test finalizerDelete
+    MMGC_GCENTER(gc);
+	new (gc) DeleteInFinalizer(new (gc, 100) GCFinalizedObject(), new (gc) GCFinalizedObject());
+	//delete m;	delete m; // this verifies we crash, it does	
+	gc->Collect(false);
+	%%verify true
+    GCFinalizedObject *gcfo = new (gc) GCFinalizedObject();
+    gcfo->~GCFinalizedObject();
+    gcfo->~GCFinalizedObject(); // this used to be a deleteing dtor and would crash, not anymore
+			 
 
+									
+									   

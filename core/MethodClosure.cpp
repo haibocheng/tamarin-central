@@ -103,8 +103,11 @@ namespace avmplus
 	{		
 		WeakKeyHashtable* mcTable = m->getMethodClosureTable();		
 		Atom mcWeakAtom = mcTable->get(obj);
-		GCWeakRef* ref = (GCWeakRef*)AvmCore::atomToGCObject(mcWeakAtom);
-		MethodClosure* mc;
+		GCWeakRef* ref = (GCWeakRef*)AvmCore::atomToGenericObject(mcWeakAtom);
+		union {
+			GCObject* mc_o;
+			MethodClosure* mc;
+		};
 
 		if (!ref || !ref->get())
 		{
@@ -115,12 +118,12 @@ namespace avmplus
 			// in pure ES3 code)
 			mc->prototype = prototype;
 			mc->setDelegate(prototype);
-			mcWeakAtom = AvmCore::gcObjectToAtom(mc->GetWeakRef());
+			mcWeakAtom = AvmCore::genericObjectToAtom(mc->GetWeakRef());
 			mcTable->add(obj, mcWeakAtom);
 		}
 		else
 		{
-			mc = (MethodClosure*)ref->get();
+			mc_o = ref->get();
 		}
 		return mc;
 	}

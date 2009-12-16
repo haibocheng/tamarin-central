@@ -40,30 +40,81 @@
 #ifndef __OOM_H__
 #define __OOM_H__
 
-#define MMGC_ENTER MMgc::EnterFrame _ef;\
-        _ef.status = setjmp(_ef.jmpbuf);
+#define MMGC_ENTER_VOID							\
+	MMgc::GCHeap::EnterLock();					\
+	if(MMgc::GCHeap::ShouldNotEnter())			\
+	{											\
+		MMgc::GCHeap::EnterRelease();			\
+		return;									\
+	}											\
+	MMgc::EnterFrame _ef;						\
+	MMgc::GCHeap::EnterRelease();				\
+	_ef.status = VMPI_setjmpNoUnwind(_ef.jmpbuf);            \
+	if(_ef.status != 0)							\
+		return;
 
-#define MMGC_ENTER_STATUS (_ef.status)
+
+#define MMGC_ENTER_VOID_NO_GUARD				\
+	MMgc::GCHeap::EnterLock();					\
+	MMgc::EnterFrame _ef;						\
+	MMgc::GCHeap::EnterRelease();				\
+	_ef.status = VMPI_setjmpNoUnwind(_ef.jmpbuf);            \
+	if(_ef.status != 0)							\
+		return;
+
+
+#define MMGC_ENTER_RETURN(_val)					\
+	MMgc::GCHeap::EnterLock();					\
+	if(MMgc::GCHeap::ShouldNotEnter())			\
+	{											\
+		MMgc::GCHeap::EnterRelease();			\
+		return _val;							\
+	}											\
+	MMgc::EnterFrame _ef;						\
+	MMgc::GCHeap::EnterRelease();				\
+	_ef.status = VMPI_setjmpNoUnwind(_ef.jmpbuf);            \
+	if(_ef.status != 0)							\
+		return _val;
 
 namespace MMgc
 {
 	class EnterFrame
 	{
+		friend class GCHeap;
 		friend class FixedMalloc;
 	public:
 		EnterFrame();
 		~EnterFrame();
 		jmp_buf jmpbuf;
 		int status;
-	};
+		void Destroy() { m_heap = NULL; }
+		GC* GetActiveGC() { return m_gc; }
+		void SetActiveGC(GC *gc) { m_gc = gc; }
+		void SetCollectingGC(GC *gc){ m_collectingGC = gc; }
+		GC* GetCollectingGC(){return m_collectingGC;}
+	private:
+		GCHeap *m_heap;
+		GC *m_gc;
+		GC *m_collectingGC;
 
+	};
 	
 	typedef enum _MemoryStatus {
-		kNormal,
-		kReserve,
-		kEmpty,
-		kAbort
+		kMemNormal,
+		kMemSoftLimit,
+		kMemHardLimit,
+		kMemAbort
 	} MemoryStatus;
+
+	/**
+	 * Mutator oom callback mechanism, subclass and call GCHeap::AddOOMCallback
+	 */
+	class OOMCallback
+	{
+	public:
+		virtual ~OOMCallback() {}
+		virtual void memoryStatusChange(MemoryStatus oldStatus, MemoryStatus newStatus) = 0;
+	};
 }
 
 #endif /* __OOM_H__ */

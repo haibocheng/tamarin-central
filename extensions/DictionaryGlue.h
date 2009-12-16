@@ -48,8 +48,6 @@ namespace avmplus
 
 		void init(bool weakKeys);
 	
-		virtual InlineHashtable* getTable() const { return _table->get_ht(); }
-	
 		// multiname and Stringp forms fall through to ScriptObject
 		virtual Atom getAtomProperty(Atom name) const;
 		virtual bool hasAtomProperty(Atom name) const;
@@ -59,11 +57,18 @@ namespace avmplus
 		virtual Atom nextName(int index);
 		virtual int nextNameIndex(int index);
 
-		bool isUsingWeakKeys() const { return _table->weakKeys(); }
-	private:
-		DWB(HeapHashtable*) _table;
+		bool isUsingWeakKeys() const { return getHeapHashtable()->weakKeys(); }
 
+	private:
+		inline HeapHashtable* getHeapHashtable() const 
+		{
+			// uintptr_t (rather than char*) to avoid "increases required alignment" warning
+			return *(HeapHashtable**)(uintptr_t(this) + vtable->traits->getHashtableOffset());
+		}
+		
 		Atom FASTCALL getKeyFromObject(Atom object) const;
+		
+		DECLARE_SLOTS_DictionaryObject;
 	};
 
 	class DictionaryClass : public ClassClosure
@@ -71,6 +76,8 @@ namespace avmplus
 	public:
 		DictionaryClass(VTable *vtable);
 		ScriptObject *createInstance(VTable *ivtable, ScriptObject *delegate);
+		
+		DECLARE_SLOTS_DictionaryClass;
 	};
 }
 

@@ -51,24 +51,32 @@ namespace MMgc
 		va_list args;
 		va_start(args, format);
 
-		vsnprintf(buf, sizeof(buf), format, args);
+		int chars = vsnprintf(buf, sizeof(buf)-2, format, args);
+		buf[chars] = '\n';
+		buf[chars+1] = '\0';
 		va_end(args);
-		GCDebugMsg(buf, debuggerBreak);
+		VMPI_debugLog(buf);
+		if(debuggerBreak)
+			VMPI_debugBreak();
 	#else
 		(void)debuggerBreak;
 		(void)format;
 	#endif
 	}
-
-	void GCDebugMsg(const char* p, bool debugBreak)
+	
+	void GCDebugIndent(size_t count)
 	{
-	#ifdef _DEBUG
-		VMPI_debugLog(p);
-		if(debugBreak)
-			VMPI_debugBreak();
-	#else
-		(void)p;
-		(void)debugBreak;
-	#endif
+#ifdef _DEBUG
+		while (count > 10) {
+			VMPI_debugLog("          ");
+			count -= 10;
+		}
+		while (count > 0) {
+			VMPI_debugLog(" ");
+			count--;
+		}
+#else
+		(void)count;
+#endif
 	}
 }

@@ -50,8 +50,7 @@ namespace avmplus
 		AbcParser(AvmCore* core, ScriptBuffer code, 
 			Toplevel* toplevel,
 			Domain* domain,
-			const NativeInitializer* natives,
-			const List<Stringp>* keepVersions = NULL);
+			const NativeInitializer* natives);
 
 		~AbcParser();
 
@@ -64,7 +63,7 @@ namespace avmplus
 			Toplevel* toplevel,
 			Domain* domain,
 			const NativeInitializer* natives,
-			const List<Stringp>* keepVersions = NULL);
+			API api);
 
 		/** return 0 iff the code starts with a known magic number,
 		  * otherwise an appropriate error code.
@@ -73,11 +72,15 @@ namespace avmplus
 		  */
 		static int canParse(ScriptBuffer code, int* version = NULL);
 
+#if defined(VMCFG_AOT) && defined(DEBUGGER)
+		static void addAOTDebugInfo(PoolObject *pool);
+#endif
+		
 	protected:
-		PoolObject* parse();
+		PoolObject* parse(API api);
 		MethodInfo* resolveMethodInfo(uint32 index) const;
 
-		#ifdef AVMPLUS_VERBOSE
+		#if defined(VMCFG_AOT) || defined(AVMPLUS_VERBOSE)
 		void parseTypeName(const byte* &p, Multiname& m) const;
 		#endif
 
@@ -85,15 +88,16 @@ namespace avmplus
 		Stringp resolveUtf8(uint32 index) const;
 		Stringp parseName(const byte* &pc) const;
 		uint32_t resolveQName(const byte*& pc, Multiname& m) const;
-		uint32_t computeInstanceSize(int class_id, Traits* base) const;
+		void computeInstanceSizeAndSlotsOffset(int class_id, Traits* base, uint16_t& sizeofInstance, uint16_t& offsetofSlots) const;
 		void parseMethodInfos();
 		void parseMetadataInfos();
 		bool parseInstanceInfos();
 		void parseClassInfos();
 		bool parseScriptInfos();
 		void parseMethodBodies();
-		void parseCpool();
-		Traits* parseTraits(uint32_t sizeofInstance,
+		void parseCpool(API api);
+		Traits* parseTraits(uint16_t sizeofInstance,
+							uint16_t offsetofSlots,
 							Traits* base, 
 							Namespacep ns, 
 							Stringp name, 
@@ -105,7 +109,7 @@ namespace avmplus
 		/**
 		 * add script to VM-wide table
 		 */
-		void addNamedScript(Namespacep ns, Stringp name, MethodInfo* script);
+		void addNamedScript(NamespaceSetp nss, Stringp name, MethodInfo* script);
 
 		/**
 		 * Adds traits to the VM-wide traits table, for types
@@ -115,6 +119,7 @@ namespace avmplus
 		 * @param itraits The instance traits of the class
 		 */
 		void addNamedTraits(Namespacep ns, Stringp name, Traits* itraits);
+		void addNamedTraits(NamespaceSetp nss, Stringp name, Traits* itraits);
 
 		/**
 		 * reads in 8 bytes in little endian order and stores in
@@ -126,12 +131,7 @@ namespace avmplus
          * Reads in 2 bytes and turns them into a 16 bit number.  Always reads in 2 bytes.  Currently
          * only used for version number of the ABC file and for version 11 support.
          */
-		int readU16(const byte* p) const
-		{
-			if (p < abcStart || p+1 >= abcEnd)
-				toplevel->throwVerifyError(kCorruptABCError);
-			return p[0] | p[1]<<8;
-		}
+		int readU16(const byte* p) const;
 
         /**
          * Read in a 32 bit number that is encoded with a variable number of bytes.  The value can 
@@ -142,44 +142,7 @@ namespace avmplus
          * Returns the value, and the 2nd argument is set to the number of bytes that were read to get that
          * value.
          */
-		int readS32(const byte *&p) const
-		{
-			// We have added kBufferPadding bytes to the end of the main swf buffer.
-			// Why?  Here we can read from 1 to 5 bytes.  If we were to
-			// put the required safety checks at each byte read, we would slow
-			// parsing of the file down.  With this buffer, only one check at the
-			// top of this function is necessary. (we will read on into our own memory)
-		    if ( p < abcStart || p >= abcEnd )
-				toplevel->throwVerifyError(kCorruptABCError);
-
-			int result = p[0];
-			if (!(result & 0x00000080))
-			{
-				p++;
-				return result;
-			}
-			result = (result & 0x0000007f) | p[1]<<7;
-			if (!(result & 0x00004000))
-			{
-				p += 2;
-				return result;
-			}
-			result = (result & 0x00003fff) | p[2]<<14;
-			if (!(result & 0x00200000))
-			{
-				p += 3;
-				return result;
-			}
-			result = (result & 0x001fffff) | p[3]<<21;
-			if (!(result & 0x10000000))
-		{
-				p += 4;
-				return result;
-			}
-			result = (result & 0x0fffffff) | p[4]<<28;
-			p += 5;
-			return result;
-		}
+		int readS32(const byte *&p) const;
 
 		uint32_t readU30(const byte*& p) const;
 
@@ -197,7 +160,6 @@ namespace avmplus
 		byte*						abcEnd; // one past the end, actually
 		Stringp*					metaNames;
 		Stringp						kNeedsDxns;
-		const List<Stringp>*		keepVersions;
 #ifdef AVMPLUS_VERBOSE
 		Stringp 					kVerboseVerify;
 #endif

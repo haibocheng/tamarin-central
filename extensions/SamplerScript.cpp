@@ -65,32 +65,33 @@ namespace avmplus
 		if (core->debugger())
 		{
 			if (target > 1)
-				lvl = Debugger::astrace_callback;
+				lvl = core->debugger()->astrace_callback;
 			else
-				lvl = Debugger::astrace_console;				
+				lvl = core->debugger()->astrace_console;				
 		}
 	#endif /* DEBUGGER */
 		(void)target;
 		return lvl;
 	}
 	
-	void TraceClass::setLevel(int lvl, int target)
+	Atom TraceClass::setLevel(int lvl, int target)
 	{
 	#ifdef DEBUGGER
 		AvmCore *core = this->core();
 		if (core->debugger())
 		{
 			if (target > 1)
-				Debugger::astrace_callback = (Debugger::TraceLevel) lvl;
+				core->debugger()->astrace_callback = (Debugger::TraceLevel) lvl;
 			else
-				Debugger::astrace_console = (Debugger::TraceLevel) lvl;				
+				core->debugger()->astrace_console = (Debugger::TraceLevel) lvl;				
 		}
 	#endif /* DEBUGGER */
 		(void)lvl;
 		(void)target;
+		return undefinedAtom;
 	}
 
-	void TraceClass::setListener(ScriptObject* f)
+	Atom TraceClass::setListener(FunctionObject* f)
 	{
 	#ifdef DEBUGGER
 		AvmCore *core = this->core();
@@ -104,7 +105,7 @@ namespace avmplus
 			else if (!AvmCore::istype(f->atom(), core->traits.function_itraits)) 
 			{
 				toplevel()->argumentErrorClass()->throwError( kInvalidArgumentError, core->toErrorString("Function"));
-				return;
+				return undefinedAtom;
 			}
 			
 			//MethodClosure* mc = f->toplevel()->methodClosureClass->create(f->getCallMethodEnv(), f->atom());
@@ -112,11 +113,12 @@ namespace avmplus
 		}
 	#endif /* DEBUGGER */
 		(void)f;
+		return undefinedAtom;
 	}
 
-	ScriptObject* TraceClass::getListener()
+	FunctionObject* TraceClass::getListener()
 	{
-		ScriptObject* f = 0;
+		FunctionObject* f = 0;
 	#ifdef DEBUGGER
 		AvmCore *core = this->core();
 		if (core->debugger())
@@ -225,11 +227,10 @@ namespace avmplus
 #endif // DEBUGGER
 
 #ifdef DEBUGGER
-	static VTable* _newVT(VTable* vt, uint32_t sz)
+	static VTable* _newVT(Toplevel* toplevel, PoolObject* pool, uint16_t sz)
 	{
-		Toplevel* toplevel = vt->toplevel();
-		Traits* t = Traits::newTraits(vt->abcEnv->pool(), NULL, sz, 0, TRAITSTYPE_RT);
-		return toplevel->core()->newVTable(t, NULL, NULL, NULL, toplevel);
+		Traits* t = Traits::newTraits(pool, NULL, sz, 0, 0, TRAITSTYPE_RT);
+		return toplevel->core()->newVTable(t, NULL, toplevel);
 	}
 #endif
 
@@ -242,7 +243,7 @@ namespace avmplus
 			return undefinedAtom;
 		
 		if (s->sampleIteratorVTable == NULL)
-			s->sampleIteratorVTable = _newVT(self->vtable, sizeof(SampleIterator));
+			s->sampleIteratorVTable = _newVT(self->toplevel(), self->traits()->pool, sizeof(SampleIterator));
 		ScriptObject *iter = new (self->gc()) SampleIterator(s, self, s->sampleIteratorVTable);
 		return iter->atom();
 #else
@@ -267,43 +268,51 @@ namespace avmplus
 	}
 
 #ifdef DEBUGGER
-	ClassClosure *SamplerScript::getType(ScriptObject* self, Atom typeOrVTable, const void *ptr)
+	ClassClosure *SamplerScript::getType(Toplevel* ss_toplevel, SamplerObjectType sot, const void *ptr)
 	{
-		Toplevel *tl = self->toplevel();
-		AvmCore *core = self->core();
-
-		if((typeOrVTable&7) != 0) {
-			// String of Namespace
-			if((typeOrVTable&~7) != 0) {
-				tl = (Toplevel*)(typeOrVTable&~7);
-			}
-
-			if(((Atom) typeOrVTable&7) == kStringType)
+        Toplevel* tl;
+        
+        switch (sotGetKind(sot))
+        {
+            case kSOT_String:
+            {
+                // toplevel can be null here if there was no CodeContext active
+                // when the sample was taken (ie, string was allocated from C++ code).
+                // in that case, use the TL from the SamplerScript itself... it isn't
+                // technically the right one to use, but is adequate for our purposes here
+                // (it will return a stringClass or namespaceClass that will be valid
+                // for the sampler)
+                tl = sotGetToplevel(sot);
+                if (!tl) tl = ss_toplevel;
 				return tl->stringClass;
-
-			if(((Atom) typeOrVTable&7) == kNamespaceType)
+            }
+            case kSOT_Namespace:
+            {
+                tl = sotGetToplevel(sot);
+                if (!tl) tl = ss_toplevel;
 				return tl->namespaceClass;
+            }
+            default:
+                AvmAssert(0);
+            case kSOT_Object:
+                break;
 		}
 		
-		VTable *vtable = (VTable*)typeOrVTable;
-		if (vtable && vtable->toplevel())
-			tl = vtable->toplevel();
-
-		ScriptObject *obj=NULL;
-		if (ptr != NULL ) {
-			obj = (ScriptObject*)ptr;	
-		}
-		
+        VTable* vt = sotGetVTable(sot);
+        tl = vt->toplevel();
+        AvmCore* core = tl->core();
+        
 		ClassClosure *type;
-		if(obj && AvmCore::istype(obj->atom(), CLASS_TYPE))
+		ScriptObject* obj = (ScriptObject*)ptr;
+		if (obj && AvmCore::istype(obj->atom(), core->traits.class_itraits))
 		{
 			type = tl->classClass;
 		} 
-		else if(obj && AvmCore::istype(obj->atom(), FUNCTION_TYPE))
+		else if (obj && AvmCore::istype(obj->atom(), core->traits.function_itraits))
 		{
 			type = tl->functionClass;
 		}
-		else if(obj && obj->traits()->isActivationTraits())
+		else if (obj && obj->traits()->isActivationTraits())
 		{
 			type = tl->objectClass;
 		}
@@ -311,17 +320,29 @@ namespace avmplus
 		{
 			// fallback answer
 			type = tl->objectClass;
-			ScopeChain* sc = vtable->scope();
 			
-			if(sc && sc->getSize() <= 1) {
+			// note that note all types will have an init method,
+			// so those types may get reported as "objectClass" rather
+			// than something more specific. However, it's not clear
+			// that the Sampler ever really cared about reporting those
+			// objects well in the first place (eg activation or catch objects),
+			// so it doesn't seem we're a lot worse off than before.
+			ScopeChain* sc = NULL;
+			if (vt->init)
+				sc = vt->init->scope();
+			
+			if (sc && sc->getSize() <= 1) 
+            {
 				if(sc->getSize() == 1)
 					type = tl->classClass;
-			} else if(sc) {
+			} 
+            else if (sc) 
+            {
 				Atom ccAtom = sc->getScope(sc->getSize()-1);
 				if(AvmCore::isObject(ccAtom))
 				{
 					type = (ClassClosure*) AvmCore::atomToScriptObject(ccAtom);
-					if(!AvmCore::istype(type->atom(), CLASS_TYPE))
+					if(!AvmCore::istype(type->atom(), core->traits.class_itraits))
 					{
 						// obj is a ClassClosure
 						type = tl->classClass;
@@ -329,97 +350,105 @@ namespace avmplus
 				}
 			}
 		}
-		// If this fires off, Tommy Reilly says: "It basically means we exhausting all efforts to
-		// associate an object with some "type" and failed.  You can ignore it.
-		AvmAssert(!obj || 
-			typeOrVTable < 7 || 
-			  (obj->traits()->name && obj->traits()->name->equalsLatin1("global")) ||
-			(AvmCore::istype(obj->atom(), CLASS_TYPE) && type == tl->classClass) ||
-			(obj->traits()->isActivationTraits() && type == tl->objectClass) ||
-			AvmCore::istype(obj->atom(), type->traits()->itraits));
-		AvmAssert(AvmCore::istype(type->atom(), CLASS_TYPE));	
+		AvmAssert(AvmCore::istype(type->atom(), core->traits.class_itraits));	
 		return type;	
 	}
 #endif // DEBUGGER
 
 #ifdef DEBUGGER
-	ScriptObject* SamplerScript::makeSample(ScriptObject* self, const Sample& sample)
+	bool SamplerScript::set_stack(ScriptObject* self, const Sample& sample, SampleObject* sam)
 	{
-		AvmCore *core = self->core();
-		MMgc::GC* gc = core->GetGC();
-		Sampler* s = core->get_sampler();
-		if (!s)
-			return NULL;
-			
-		int clsId = NativeID::abcclass_flash_sampler_Sample;
-		
-		if(sample.sampleType == Sampler::NEW_OBJECT_SAMPLE || sample.sampleType == Sampler::NEW_AUX_SAMPLE)
-			clsId = NativeID::abcclass_flash_sampler_NewObjectSample;
-		else if(sample.sampleType == Sampler::DELETED_OBJECT_SAMPLE)
-			clsId = NativeID::abcclass_flash_sampler_DeleteObjectSample;
-		
-		SampleClass *cc = (SampleClass*) self->toplevel()->getBuiltinExtensionClass(clsId);
-		SampleObject *sam = (SampleObject*)cc->createInstance(cc->ivtable(), NULL);
-		*(double*)((char*)sam + cc->timeOffset) = (double)sample.micros;
-
-		if(sample.sampleType != Sampler::RAW_SAMPLE)
+		if (sample.stack.depth > 0)
 		{
-			AvmAssertMsg(sample.id != 0, "Didn't get id!");
-			*(double*)((char*)sam + cc->idOffset) = (double)sample.id;
-		}
+			Toplevel* toplevel = self->toplevel();
+			AvmCore* core = toplevel->core();
+			Sampler* s = core->get_sampler();
 
-		if(sample.sampleType == Sampler::DELETED_OBJECT_SAMPLE)
-		{
-			if (cc->sizeOffset > 0)
-			*(double*)((char*)sam + cc->sizeOffset) = (double)sample.size;
-			return sam;
-		}
-		
-		uint32 num;
-
-		if(sample.stack.depth > 0)
-		{
-			VTable *stackFrameVT = self->toplevel()->getBuiltinExtensionClass(NativeID::abcclass_flash_sampler_StackFrame)->vtable->ivtable;		
-			ArrayObject *stack = self->toplevel()->arrayClass->newArray(sample.stack.depth);
-			StackTrace::Element *e = (StackTrace::Element*)sample.stack.trace;
+			StackFrameClass* sfcc = (StackFrameClass*)toplevel->getBuiltinExtensionClass(NativeID::abcclass_flash_sampler_StackFrame);
+			ArrayObject* stack = toplevel->arrayClass->newArray(sample.stack.depth);
+			StackTrace::Element* e = (StackTrace::Element*)sample.stack.trace;
 			for(uint32 i=0; i < sample.stack.depth; i++, e++)
 			{
-				ScriptObject *f = core->newObject(stackFrameVT, NULL);
+				StackFrameObject* sf = (StackFrameObject*)sfcc->createInstance(sfcc->ivtable(), NULL);
 				
 				// at every allocation the sample buffer could overflow and the samples could be deleted
 				// the StackTrace::Element pointer is a raw pointer into that buffer so we need to check
 				// that its still around before dereferencing e
+				uint32_t num;
 				if (s->getSamples(num) == NULL)
-					return NULL;
-		
-				WBRC(gc, f, ((char*)f + cc->nameOffset), uintptr(e->infoname()));	// NOT e->info()->name() 
-				if(e->filename()) {
-					WBRC(gc, f, ((char*)f + cc->fileOffset), e->filename());
-					*(uint32*)((char*)f + cc->lineOffset) = e->linenum();
-				}
-				stack->setUintProperty(i, f->atom());
+					return false;
+				
+				sf->set_name(e->name()); // NOT e->info()->name() because e->name() can be a fake name
+				if(e->filename())
+					sf->set_file(e->filename());
+				sf->set_line(e->linenum());
+				sf->set_scriptID(static_cast<double>(e->functionId()));
+
+				stack->setUintProperty(i, sf->atom());
 			}			
-			WBRC(gc, sam, (char*)sam + cc->stackOffset, stack);
+			sam->set_stack(stack);
 		}
-		
-		if(sample.sampleType == Sampler::RAW_SAMPLE)
-			return sam;
+		return true;
+	}
 
-		if( sample.sampleType == Sampler::NEW_OBJECT_SAMPLE ) {
-
-			if (sample.ptr != NULL ) {
-				((NewObjectSampleObject*)sam)->setRef((AvmPlusScriptableObject*)sample.ptr);
-			}
-			ClassClosure *type = getType(self, sample.typeOrVTable, sample.ptr);
-			WBRC(gc, sam, ((char*)sam + cc->typeOffset), type);
-
-			((NewObjectSampleObject*)sam)->setSize(sample.alloc_size);
-		}
-		else if( sample.sampleType == Sampler::NEW_AUX_SAMPLE ) {
-			// Set up size... we know these samples won't have weakref or type info 
-			((NewObjectSampleObject*)sam)->setSize(sample.alloc_size);
-		}
+	SampleObject* SamplerScript::new_sam(ScriptObject* self, const Sample& sample, int clsid)
+	{
+		Toplevel* toplevel = self->toplevel();
+		ClassClosure* cc = toplevel->getBuiltinExtensionClass(clsid);
+		SampleObject* sam = (SampleObject*)cc->createInstance(cc->ivtable(), NULL);
+		sam->set_time(static_cast<double>(sample.micros));
 		return sam;
+	}
+
+	ScriptObject* SamplerScript::makeSample(ScriptObject* self, const Sample& sample)
+	{
+		Toplevel* toplevel = self->toplevel();
+		AvmCore* core = toplevel->core();
+		Sampler* s = core->get_sampler();
+		if (!s)
+			return NULL;
+		
+		switch (sample.sampleType)
+		{
+			case Sampler::RAW_SAMPLE:
+			{
+				SampleObject* sam = new_sam(self, sample, NativeID::abcclass_flash_sampler_Sample);
+				if (!set_stack(self, sample, sam))
+					return NULL;
+				return sam;
+			}
+			case Sampler::DELETED_OBJECT_SAMPLE:
+			{
+				DeleteObjectSampleObject* dsam = (DeleteObjectSampleObject*)new_sam(self, sample, NativeID::abcclass_flash_sampler_DeleteObjectSample);
+				dsam->set_id(static_cast<double>(sample.id));
+				dsam->set_size(static_cast<double>(sample.size));
+				return dsam;
+			}
+			case Sampler::NEW_OBJECT_SAMPLE:
+			{
+				NewObjectSampleObject* nsam = (NewObjectSampleObject*)new_sam(self, sample, NativeID::abcclass_flash_sampler_NewObjectSample);
+				nsam->set_id(static_cast<double>(sample.id));
+				if (!set_stack(self, sample, nsam))
+					return NULL;
+				if (sample.ptr != NULL )
+					nsam->setRef((AvmPlusScriptableObject*)sample.ptr);
+				nsam->set_type(getType(toplevel, sample.sot, sample.ptr));
+				nsam->setSize(sample.alloc_size);
+				return nsam;
+			}
+			case Sampler::NEW_AUX_SAMPLE:
+			{
+				NewObjectSampleObject* nsam = (NewObjectSampleObject*)new_sam(self, sample, NativeID::abcclass_flash_sampler_NewObjectSample);
+				nsam->set_id(static_cast<double>(sample.id));
+				if (!set_stack(self, sample, nsam))
+					return NULL;
+				nsam->setSize(sample.alloc_size);
+				return nsam;
+			}
+		}
+
+		AvmAssert(0);
+		return NULL;
 	}
 #endif // DEBUGGER
 
@@ -439,7 +468,7 @@ namespace avmplus
 			if(AvmCore::istype(o, CLASS_TYPE) && instanceNames && t->itraits)
 				t = t->itraits;
 			if (s->slotIteratorVTable == NULL)
-				s->slotIteratorVTable = _newVT(self->vtable, sizeof(SlotIterator));
+				s->slotIteratorVTable = _newVT(self->toplevel(), self->traits()->pool, sizeof(SlotIterator));
 			return (new (gc) SlotIterator(t, s->slotIteratorVTable))->atom();			   
 		}
 #else
@@ -721,6 +750,10 @@ namespace avmplus
 		: SampleObject(vtable, delegate), size(0)
 	{}
 
+	DeleteObjectSampleObject::DeleteObjectSampleObject(VTable *vtable, ScriptObject *delegate)
+		: SampleObject(vtable, delegate)
+	{}
+
 	Atom NewObjectSampleObject::get_object()
 	{
 		if(obj) {
@@ -745,42 +778,6 @@ namespace avmplus
 		: ClassClosure(vtable)
 	{
 		createVanillaPrototype();
-		TraitsBindingsp t = vtable->ivtable->traits->getTraitsBindings();
-		Binding b =  t->findBinding(core()->internConstantStringLatin1("time"), core()->publicNamespace);
-		AvmAssert(AvmCore::bindingKind(b) == BKIND_CONST);
-		timeOffset = t->getSlotOffset(AvmCore::bindingToSlotId(b));
-
-		b = t->findBinding(core()->internConstantStringLatin1("stack"), core()->publicNamespace);
-		AvmAssert(AvmCore::bindingKind(b) == BKIND_CONST);
-		stackOffset = t->getSlotOffset(AvmCore::bindingToSlotId(b));
-
-		b = t->findBinding(core()->internConstantStringLatin1("id"), core()->publicNamespace);
-		if(b != BIND_NONE)
-		{
-			AvmAssert(AvmCore::bindingKind(b) == BKIND_CONST);
-			idOffset = t->getSlotOffset(AvmCore::bindingToSlotId(b));
-		}
-
-		sizeOffset = 0;
-		b = t->findBinding(core()->internConstantStringLatin1("size"), core()->publicNamespace);
-		if(AvmCore::bindingKind(b) == BKIND_CONST)
-		{
-			sizeOffset = t->getSlotOffset(AvmCore::bindingToSlotId(b));
-		}
-
-		t = toplevel()->getBuiltinExtensionClass(NativeID::abcclass_flash_sampler_StackFrame)->vtable->ivtable->traits->getTraitsBindings();
-
-		b =  t->findBinding(core()->internConstantStringLatin1("name"), core()->publicNamespace);
-		AvmAssert(AvmCore::bindingKind(b) == BKIND_CONST);
-		nameOffset = t->getSlotOffset(AvmCore::bindingToSlotId(b));
-
-		b = t->findBinding(core()->internConstantStringLatin1("file"), core()->publicNamespace);
-		AvmAssert(AvmCore::bindingKind(b) == BKIND_CONST);
-		fileOffset = t->getSlotOffset(AvmCore::bindingToSlotId(b));
-
-		b = t->findBinding(core()->internConstantStringLatin1("line"), core()->publicNamespace);
-		AvmAssert(AvmCore::bindingKind(b) == BKIND_CONST);
-		lineOffset = t->getSlotOffset(AvmCore::bindingToSlotId(b));
 	}
 
 	ScriptObject *SampleClass::createInstance(VTable *ivtable, ScriptObject* /*delegate*/)
@@ -791,15 +788,25 @@ namespace avmplus
 	NewObjectSampleClass::NewObjectSampleClass(VTable *vtable)
 		: SampleClass(vtable)
 	{		
-		TraitsBindingsp t = vtable->ivtable->traits->getTraitsBindings();
-
-		Binding b =  t->findBinding(core()->internConstantStringLatin1("type"), core()->publicNamespace);
-		AvmAssert(AvmCore::bindingKind(b) == BKIND_CONST);
-		typeOffset = t->getSlotOffset(AvmCore::bindingToSlotId(b));
 	}
 	
 	ScriptObject *NewObjectSampleClass::createInstance(VTable *ivtable, ScriptObject* /*delegate*/)
 	{
 		return new (core()->gc, ivtable->getExtraSize()) NewObjectSampleObject(ivtable, prototype);
 	}
+
+	DeleteObjectSampleClass::DeleteObjectSampleClass(VTable* vtable) : SampleClass(vtable)
+	{		
+	}
+	
+	ScriptObject* DeleteObjectSampleClass::createInstance(VTable* ivtable, ScriptObject* /*delegate*/)
+	{
+		return new (core()->gc, ivtable->getExtraSize()) DeleteObjectSampleObject(ivtable, prototype);
+	}
+
+	ScriptObject* StackFrameClass::createInstance(VTable* ivtable, ScriptObject* /*delegate*/)
+	{
+		return new (core()->gc, ivtable->getExtraSize()) StackFrameObject(ivtable, prototype);
+	}
 }
+

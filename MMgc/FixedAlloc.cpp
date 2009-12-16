@@ -42,10 +42,20 @@
 
 namespace MMgc
 {
-	FixedAlloc::FixedAlloc(int itemSize, GCHeap* heap)
+	FixedAlloc::FixedAlloc(uint32_t itemSize, GCHeap* heap, bool isFixedAllocSafe)
+		: m_isFixedAllocSafe(isFixedAllocSafe)
+	{
+		Init(itemSize, heap);
+	}
+
+	FixedAlloc::FixedAlloc() 
+		: m_isFixedAllocSafe(true)
+	{
+	}
+	
+	void FixedAlloc::Init(uint32_t itemSize, GCHeap* heap)
 	{
 		m_heap = heap;
-
 		m_firstBlock    = NULL;
 		m_lastBlock     = NULL;
 		m_firstFree     = NULL;
@@ -57,6 +67,10 @@ namespace MMgc
 
 		m_itemSize      = itemSize;
 
+#ifdef MMGC_MEMORY_PROFILER
+		m_totalAskSize = 0;
+#endif
+
 		// The number of items per block is kBlockSize minus
 		// the # of pointers at the base of each page.
 		size_t usableSpace = GCHeap::kBlockSize - kBlockHeadSize;
@@ -65,47 +79,76 @@ namespace MMgc
 
 	FixedAlloc::~FixedAlloc()
 	{   
+		Destroy();
+	}
+
+	bool FixedAlloc::IsOnFreelist(FixedBlock *b, void *item)
+	{
+		void *fl = b->firstFree;
+		while(fl) {
+			if(item == fl)
+				return true;
+			fl = *(void**)fl;
+		}
+		return false;
+	}
+	
+	bool FixedAlloc::IsInUse(FixedBlock *b, void *item)
+	{
+		if(b->nextItem && item >= b->nextItem)
+			return false;
+		return !IsOnFreelist(b, item);
+	}
+
+	void FixedAlloc::Destroy()
+	{
 		// Free all of the blocks
  		while (m_firstBlock) {
-#ifdef MMGC_MEMORY_INFO
-			if(m_firstBlock->numAlloc > 0) {
-				// go through every memory location, if the third 4 bytes cast as
-				// an integer isn't 0xedededed then its allocated space and the integer is
-				// an index into the stack trace table, the first 4 bytes will contain
-				// the freelist pointer for free'd items (which is why the trace index is
-				// stored in the second 4)
-				// the size of the item
-				// 1st 4 bytes - size
-				// 2nd 4 bytes - unused
-				// 3rd 4 bytes - 0xedededed if freed correctly
-				uint32_t *mem = (uint32_t*) m_firstBlock->items;
+#ifdef MMGC_MEMORY_PROFILER
+			if(m_firstBlock->numAlloc > 0 && m_heap->GetStatus() != kMemAbort) {
+				union {
+					char* mem_c;
+					uint32_t* mem;
+				};
+				mem_c = m_firstBlock->items;
 				unsigned int itemNum = 0;
 				while(itemNum++ < m_itemsPerBlock) {
-					uint32_t thirdInt32 = *(mem+2);
-					if(thirdInt32 != 0xedededed) {
-						GCDebugMsg(false, "Leaked %d byte item.  Addr: 0x%p\n", GetItemSize(), mem+2);
+					if(IsInUse(m_firstBlock, mem)) {
+						GCLog("Leaked %d byte item.  Addr: 0x%p\n", GetItemSize(), GetUserPointer(mem));
 						PrintAllocStackTrace(GetUserPointer(mem));
 					}
-					mem += (m_itemSize / sizeof(uint32_t));
+					mem_c += m_itemSize;
 				}
-				GCAssert(false);
 			}
 
+#ifdef MMGC_MEMORY_INFO
 			//check for writes on deleted memory
 			VerifyFreeBlockIntegrity(m_firstBlock->firstFree, m_firstBlock->size);
+#endif
 
 #endif
 			FreeChunk(m_firstBlock);
 		}
+		m_firstBlock = NULL;
 	}
 
-	void* FixedAlloc::Alloc(size_t size)
+	void* FixedAlloc::Alloc(size_t size, FixedMallocOpts opts)
 	{ 
 		(void)size;
+		GCAssertMsg(m_heap->StackEnteredCheck() || (opts&kCanFail) != 0, "MMGC_ENTER must be on the stack");
 		GCAssertMsg(((size_t)m_itemSize >= size), "allocator itemsize too small");
 
 		if(!m_firstFree) {
-			CreateChunk(); //exception will be thrown in case of OOM 
+			bool canFail = (opts & kCanFail) != 0;
+			CreateChunk(canFail);
+			if(!m_firstFree) {
+				if (!canFail) {
+					GCAssertMsg(0, "Memory allocation failed to abort properly");
+					GCHeap::SignalInconsistentHeapState("Failed to abort");
+					/*NOTREACHED*/
+				}
+				return NULL;
+			}
 		}
 
 		FixedBlock* b = m_firstFree;
@@ -148,18 +191,28 @@ namespace MMgc
 
 			if (m_firstFree)
 				m_firstFree->prevFree = 0;
-			else
-				CreateChunk();
 		}
 
 		item = GetUserPointer(item);
+#ifdef MMGC_HOOKS
 		if(m_heap->HooksEnabled())
-			m_heap->AllocHook(item, size, b->size - DebugSize());
+		{
+		#ifdef MMGC_MEMORY_PROFILER
+			m_totalAskSize += size;
+		#endif
 
-#ifdef MMGC_MEMORY_INFO
-		// fresh memory poisoning
-		memset(item, 0xfa, b->size - DebugSize());
+			m_heap->AllocHook(item, size, b->size - DebugSize());
+		}
 #endif
+
+#ifdef _DEBUG
+		// fresh memory poisoning
+		if((opts & kZero) == 0)
+			memset(item, 0xfa, b->size - DebugSize());
+#endif
+
+		if((opts & kZero) != 0)
+			memset(item, 0, b->size - DebugSize());
 
 		return item;
 	}
@@ -169,11 +222,20 @@ namespace MMgc
 	{
 		FixedBlock *b = (FixedBlock*) ((uintptr_t)item & ~0xFFF);
 
+		GCAssertMsg(b->alloc->m_heap->IsAddressInHeap(item), "Bogus pointer passed to free");
+
+#ifdef MMGC_HOOKS
 		GCHeap *heap = b->alloc->m_heap;
 		if(heap->HooksEnabled()) {
+		#ifdef MMGC_MEMORY_PROFILER
+			if(heap->GetProfiler())
+				b->alloc->m_totalAskSize -= heap->GetProfiler()->GetAskSize(item);
+		#endif
+
 			heap->FinalizeHook(item, b->size - DebugSize());
 			heap->FreeHook(item, b->size - DebugSize(), 0xed);
 		}
+#endif
 		item = GetRealPointer(item);
 
 		// Add this item to the free list
@@ -203,26 +265,43 @@ namespace MMgc
 		}
 	}
 
-	size_t FixedAlloc::GetBytesInUse()
+	void FixedAlloc::GetUsageInfo(size_t& totalAsk, size_t& totalAllocated)
 	{
-		size_t bytes = 0;
+		totalAsk = totalAllocated = 0;
+
 		FixedBlock *b = m_firstBlock;
 		while(b)
 		{
-			bytes += b->numAlloc * b->size;
+			totalAllocated += b->numAlloc * b->size;
 			b = b->next;
 		}
-		return bytes;
+	
+#ifdef MMGC_MEMORY_PROFILER
+		totalAsk  = m_totalAskSize;
+#endif
 	}
 
-	void FixedAlloc::CreateChunk()
+	void FixedAlloc::CreateChunk(bool canFail)
 	{
 		// Allocate a new block
 		m_maxAlloc += m_itemsPerBlock;
 
-		FixedBlock* b = (FixedBlock*) m_heap->AllocNoProfile(1, true, false);
+		vmpi_spin_lock_t *lock = NULL;
+		if(m_isFixedAllocSafe) {
+			lock = &((FixedAllocSafe*)this)->m_spinlock;
+			VMPI_lockRelease(lock);
+		}
+
+		FixedBlock* b = (FixedBlock*) m_heap->Alloc(1, GCHeap::kExpand | (canFail ? GCHeap::kCanFail : 0));
+
+		if(lock != NULL)
+			VMPI_lockAcquire(lock);
 		
 		GCAssert(m_itemSize <= 0xffff);
+
+		if(!b)
+			return;
+		
 		b->numAlloc = 0;
 		b->size = (uint16_t)m_itemSize;
 		b->firstFree = 0;
@@ -245,7 +324,8 @@ namespace MMgc
 		}
 		m_lastBlock = b;
 
-		// Add our new ChunkBlock to the firstFree list (which should be empty)
+		// Add our new ChunkBlock to the firstFree list (which should
+		// be empty but might not because we let go of the lock above)
 		if (m_firstFree)
 		{
 			GCAssert(m_firstFree->prevFree == 0);
@@ -260,7 +340,7 @@ namespace MMgc
 	
 	void FixedAlloc::FreeChunk(FixedBlock* b)
 	{
-	  m_maxAlloc -= m_itemsPerBlock;
+		m_maxAlloc -= m_itemsPerBlock;
 
 		// Unlink the block from the list
 		if (b == m_firstBlock) {
@@ -293,6 +373,17 @@ namespace MMgc
 		return m_itemSize - DebugSize();
 	}
 
+#ifdef _DEBUG
+	bool FixedAlloc::QueryOwnsObject(const void* item)
+	{
+		const char* ci = (const char*) item;
+		for ( FixedBlock* fb=m_firstBlock ; fb != NULL ; fb=fb->next )
+			if (ci >= (const char*)fb->items && ci < (const char*)fb->items + m_itemsPerBlock*m_itemSize)
+				return true;
+		return false;
+	}
+#endif
+	
 #ifdef MMGC_MEMORY_INFO
 	/* static */
 	void FixedAlloc::VerifyFreeBlockIntegrity(const void* item, uint32_t size)
@@ -323,13 +414,50 @@ namespace MMgc
 	}
 #endif //MMGC_MEMORY_INFO
 
+	// FixedAllocSafe
+
+	FixedAllocSafe::FixedAllocSafe(int itemSize, GCHeap* heap) 
+		: FixedAlloc(itemSize, heap, true)
+	{
+		VMPI_lockInit(&m_spinlock);
+	}
+	
+	FixedAllocSafe::FixedAllocSafe()
+	{
+		VMPI_lockInit(&m_spinlock);
+	}
+	
+	FixedAllocSafe::~FixedAllocSafe()
+	{
+		VMPI_lockDestroy(&m_spinlock);
+	}
+
+	// FastAllocator
+	
 	void *FastAllocator::operator new[](size_t size)
 	{
-		return GCHeap::GetGCHeap()->GetFixedMalloc()->Alloc(size);
+		return FixedMalloc::GetFixedMalloc()->Alloc(size);
 	}
 	
 	void FastAllocator::operator delete [](void *item)
 	{
-		GCHeap::GetGCHeap()->GetFixedMalloc()->Free(item);
+		FixedMalloc::GetFixedMalloc()->Free(item);
 	}
+
+#ifdef MMGC_HEAP_GRAPH
+	/*static*/
+	const void *FixedAlloc::FindBeginning(const void *addr)
+	{
+		FixedBlock *b = GetFixedBlock(addr);
+		uint32_t itemNum = 0;
+		char *mem = b->items;
+		while(itemNum++ < b->alloc->m_itemsPerBlock) {
+			char *next = mem + b->alloc->m_itemSize;
+			if(addr >= mem && addr < next)
+				return mem;
+			mem = next;
+		}
+		return NULL;
+	}
+#endif
 }

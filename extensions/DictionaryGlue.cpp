@@ -72,9 +72,18 @@ namespace avmplus
 	{
 		GCAssert(vtable->traits->isDictionary == true);
 		MMgc::GC* gc = this->gc();
-		_table = weakKeys ? 
-					new (gc) WeakKeyHashtable(gc) : 
-					new (gc) HeapHashtable(gc);
+		
+		HeapHashtable* ht = weakKeys ? new (gc) WeakKeyHashtable(gc) 
+									: new (gc) HeapHashtable(gc);
+
+		//store pointer of newly created hashtable, encapsulated with writebarrier, 
+		//at the hashtable offset address of the corresponding traits
+		union {
+			uint8_t* p;
+			HeapHashtable** hht;
+		};
+		p = (uint8_t*)this + vtable->traits->getHashtableOffset();
+		WB(gc, this, hht, ht);
 	}
 
 	Atom FASTCALL DictionaryObject::getKeyFromObject(Atom key) const
@@ -85,10 +94,13 @@ namespace avmplus
 		AvmAssert(MMgc::GC::Size(obj) >= sizeof(ScriptObject));
 		(void)obj;
 
+		// This commented-out code probably pertains to Bugzilla 507699:
+		// "Dictionary key of Xml type are not matching."
+		//
 		// FIXME: this doesn't work, need to convert back to an XMLObject
 		// on the way out or intern XMLObject's somehow
 		//if(AvmCore::isXML(key))
-		//	key = AvmCore::gcObjectToAtom(AvmCore::atomToXML(key));
+		//	key = AvmCore::genericObjectToAtom(AvmCore::atomToXML(key));
 		
 		return key;
 	}
@@ -97,7 +109,7 @@ namespace avmplus
 	{
 		if (AvmCore::isObject(key)) 
 		{
-			return _table->get(getKeyFromObject(key));
+			return getHeapHashtable()->get(getKeyFromObject(key));
 		} 
 
 		return ScriptObject::getAtomProperty(key);
@@ -107,7 +119,7 @@ namespace avmplus
 	{
 		if (AvmCore::isObject(key)) 
 		{
-			return _table->contains(getKeyFromObject(key));
+			return getHeapHashtable()->contains(getKeyFromObject(key));
 		}
 
 		return ScriptObject::hasAtomProperty(key);
@@ -117,7 +129,7 @@ namespace avmplus
 	{
 		if (AvmCore::isObject(key)) 
 		{
-			_table->remove(getKeyFromObject(key));
+			getHeapHashtable()->remove(getKeyFromObject(key));
 			return true;
 		}
 
@@ -128,7 +140,7 @@ namespace avmplus
 	{
 		if (AvmCore::isObject(key)) 
 		{
-			_table->add(getKeyFromObject(key), value);
+			getHeapHashtable()->add(getKeyFromObject(key), value);
 			return;
 		}
 		
@@ -139,10 +151,14 @@ namespace avmplus
 	{
 		Atom k = ScriptObject::nextName(index);
 
-		if (AvmCore::isGCObject(k) && _table->weakKeys()) 
+		if (AvmCore::isGenericObject(k) && getHeapHashtable()->weakKeys()) 
 		{
-			GCWeakRef* ref = (GCWeakRef*)atomPtr(k);
-			ScriptObject* key = ((ScriptObject*)ref->get());
+			GCWeakRef* ref = (GCWeakRef*)AvmCore::atomToGenericObject(k);
+			union {
+				GCObject* key_o;
+				ScriptObject* key;
+			};
+			key_o = ref->get();
 			if (key) 
 			{
 				AvmAssert(key->traits() != NULL);
@@ -159,39 +175,52 @@ namespace avmplus
 	{
 		AvmAssert(index >= 0);
 
-		if (index != 0) 
-		{
-			index = index<<1;
-		}
-
 		// this can happen if you break in debugger in a subclasses constructor before super
 		// has been called -- let's do it in all builds, it's better than crashing.
-		if (!_table)
+		HeapHashtable* hht = getHeapHashtable();
+		if (!hht)
 		{
 			return 0;
 		}
 
 		// Advance to first non-empty slot.
-		InlineHashtable* ht = _table->get_ht();
-		const Atom* atoms = ht->getAtoms();
-		int numAtoms = ht->getCapacity();
-		while (index < numAtoms) 
+		index <<= 1;
+		InlineHashtable* const ht = hht->get_ht();
+		Atom* const atoms = ht->getAtoms();
+		int const numAtoms = ht->getCapacity();
+		if (hht->weakKeys())
 		{
-			Atom a = atoms[index];
-			if (AvmCore::isGCObject(a) && _table->weakKeys()) 
+			while (index < numAtoms) 
 			{
-				GCWeakRef *weakRef = (GCWeakRef*)AvmCore::atomToGCObject(a);
-				if(weakRef->get())
-					return (index>>1)+1;
-				else {
-					ht->getAtoms()[index] = InlineHashtable::DELETED;
-					ht->getAtoms()[index+1] = InlineHashtable::DELETED;
+				Atom const a = atoms[index];
+				if (AvmCore::isGenericObject(a)) 
+				{
+					GCWeakRef *weakRef = (GCWeakRef*)AvmCore::atomToGenericObject(a);
+					if (weakRef->get())
+						return (index>>1)+1;
+					
+					atoms[index] = InlineHashtable::DELETED;
+					atoms[index+1] = InlineHashtable::DELETED;
 					ht->setHasDeletedItems();
-				}
-			} else if(a != 0 && a != InlineHashtable::DELETED) {
+				} 
+				else if (a != 0 && a != InlineHashtable::DELETED) 
+				{
 					return (index>>1)+1;
+				}
+				index += 2;
 			}
-			index += 2;
+		}
+		else
+		{
+			while (index < numAtoms) 
+			{
+				Atom const a = atoms[index];
+				if (a != 0 && a != InlineHashtable::DELETED) 
+				{
+					return (index>>1)+1;
+				}
+				index += 2;
+			}
 		}
 		return 0;
 	}

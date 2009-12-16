@@ -44,10 +44,12 @@ INCLUDES += \
   -I$(topsrcdir)/pcre \
   -I$(topsrcdir)/eval \
   -I$(topsrcdir)/platform \
+  -I$(topsrcdir)/other-licenses/zlib \
   -I$(topsrcdir)/shell \
   -I$(topsrcdir)/VMPI \
   $(NULL)
 
+$(call RECURSE_DIRS,other-licenses/zlib)
 $(call RECURSE_DIRS,VMPI)
 $(call RECURSE_DIRS,MMgc)
 
@@ -69,6 +71,9 @@ ifeq (powerpc,$(TARGET_CPU))
 $(call RECURSE_DIRS,nanojit)
 endif
 ifeq (ppc64,$(TARGET_CPU))
+$(call RECURSE_DIRS,nanojit)
+endif
+ifeq (mips,$(TARGET_CPU))
 $(call RECURSE_DIRS,nanojit)
 endif
 ifeq (darwin,$(TARGET_OS))

@@ -42,15 +42,23 @@
 namespace avmplus
 {
 	/**
+	 * API is the type of an api bitmask
+	 */
+	typedef int32_t API;
+
+	/**
 	 * a namespace is a primitive value in the system, similar to String
 	 */
 	class Namespace : public AvmPlusScriptableObject
 	{
 	private:
 		friend class AvmCore;
+		friend class MultinameHashtable;
 		// Should these be Stringp's?
 		Atom m_prefix;
+		API m_api; 
 		uintptr m_uri;  // Uses 3 bits for flags, but otherwise is really a Stringp
+
 	public:
         enum NamespaceType
         {
@@ -65,10 +73,15 @@ namespace avmplus
 		~Namespace();
 
 		inline Atom getPrefix() const { return get_prefix(); }
-		inline Stringp getURI() const { return get_uri(); }
+		Stringp getURI() const;
+		inline API getAPI() { return m_api; }
+		inline void setAPI(API api) { m_api = api; }
 
 		Atom get_prefix() const { return m_prefix; }
-		Stringp get_uri() const;
+		Stringp get_uri() const
+		{
+			return getURI();
+		}
 
 		Atom  atom() const { return AtomConstants::kNamespaceType | (Atom)this; }
 
@@ -83,12 +96,15 @@ namespace avmplus
 
 		bool hasPrefix () const;
 
+		bool isPublic() const;
+
 		bool EqualTo(const Namespace* other) const;
 
 		bool isPrivate() const 
 		{
 			return ISNULL(m_prefix);
 		}
+
         NamespaceType getType() const
         {
             return (NamespaceType)(((sint32)m_uri)&7);

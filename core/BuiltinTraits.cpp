@@ -51,16 +51,16 @@ namespace avmplus
 	{
 		AvmCore* core = pool->core;
 
-		null_itraits = Traits::newTraits(pool, NULL, 0, 0, TRAITSTYPE_NVA);
-		null_itraits->ns = core->publicNamespace;
-		null_itraits->name = core->internConstantStringLatin1("null");
+		Namespacep publicNS = core->getPublicNamespace(ApiUtils::getSmallestAPI());
+
+		null_itraits = Traits::newTraits(pool, NULL, 0, 0, 0, TRAITSTYPE_NVA);
+		null_itraits->set_names(publicNS, core->internConstantStringLatin1("null"));
 		null_itraits->final = true;
 		null_itraits->builtinType = BUILTIN_null;
 		null_itraits->resolveSignatures(NULL);
 
-		void_itraits = Traits::newTraits(pool, NULL, 0, 0, TRAITSTYPE_NVA);
-		void_itraits->ns = core->publicNamespace;
-		void_itraits->name = core->internConstantStringLatin1("void");
+		void_itraits = Traits::newTraits(pool, NULL, 0, 0, 0, TRAITSTYPE_NVA);
+		void_itraits->set_names(publicNS, core->internConstantStringLatin1("void"));
 		void_itraits->final = true;
 		void_itraits->builtinType = BUILTIN_void;
 		void_itraits->resolveSignatures(NULL);
@@ -105,31 +105,41 @@ namespace avmplus
 		xml_itraits->set_needsHashtable(false);
 		xmlList_itraits->set_needsHashtable(false);
 
-		// types that don't use the default construct method.
-		array_itraits->hasCustomConstruct  		= true;
-		boolean_itraits->hasCustomConstruct		= true;
-		class_itraits->hasCustomConstruct		= true;
-		date_itraits->hasCustomConstruct		= true;
-		function_itraits->hasCustomConstruct	= true;
-		namespace_itraits->hasCustomConstruct	= true;
-		null_itraits->hasCustomConstruct		= true;
-		number_itraits->hasCustomConstruct		= true;
-		int_itraits->hasCustomConstruct			= true;
-		uint_itraits->hasCustomConstruct		= true;
-		object_itraits->hasCustomConstruct		= true;
-		regexp_itraits->hasCustomConstruct		= true;
-		string_itraits->hasCustomConstruct		= true;
-		void_itraits->hasCustomConstruct		= true;
-		xml_itraits->hasCustomConstruct			= true;
-		xmlList_itraits->hasCustomConstruct		= true;
-		qName_itraits->hasCustomConstruct		= true;
-		math_itraits->hasCustomConstruct		= true;
+		// set the types that don't have custom construct (default is true)
+//		array_itraits->hasCustomConstruct           = true;
+//		boolean_itraits->hasCustomConstruct         = true;
+//		class_itraits->hasCustomConstruct           = true;
+//		date_itraits->hasCustomConstruct            = true;
+		error_itraits->hasCustomConstruct           = false;
+//		function_itraits->hasCustomConstruct  		= true;
+//		int_itraits->hasCustomConstruct             = true;
+//		math_itraits->hasCustomConstruct            = true;
+		methodClosure_itraits->hasCustomConstruct  	= false;
+//		namespace_itraits->hasCustomConstruct  		= true;
+//		null_itraits->hasCustomConstruct            = true;
+//		number_itraits->hasCustomConstruct  		= true;
+//		object_itraits->hasCustomConstruct  		= true;
+//		qName_itraits->hasCustomConstruct           = true;
+//		regexp_itraits->hasCustomConstruct  		= true;
+//		string_itraits->hasCustomConstruct  		= true;
+//		uint_itraits->hasCustomConstruct            = true;
+		vector_itraits->hasCustomConstruct  		= false;
+		vectordouble_itraits->hasCustomConstruct  	= false;
+		vectorint_itraits->hasCustomConstruct  		= false;
+		vectorobj_itraits->hasCustomConstruct  		= false;
+		vectoruint_itraits->hasCustomConstruct  	= false;
+//		void_itraits->hasCustomConstruct            = true;
+//		xmlList_itraits->hasCustomConstruct  		= true;
+//		xml_itraits->hasCustomConstruct             = true;
 
-		vectordouble_itraits->name = core->internConstantStringLatin1("Vector.<Number>");
-		vectorint_itraits->name = core->internConstantStringLatin1("Vector.<int>");
-		vectoruint_itraits->name = core->internConstantStringLatin1("Vector.<uint>");
-		vectorobj_itraits->name = core->internConstantStringLatin1("Vector.<*>");
 
+		vectordouble_itraits->set_names(vectordouble_itraits->ns(), core->internConstantStringLatin1("Vector.<Number>"));
+		vectorint_itraits->set_names(vectorint_itraits->ns(), core->internConstantStringLatin1("Vector.<int>"));
+		vectoruint_itraits->set_names(vectoruint_itraits->ns(), core->internConstantStringLatin1("Vector.<uint>"));
+		vectorobj_itraits->set_names(vectorobj_itraits->ns(), core->internConstantStringLatin1("Vector.<*>"));
+
+		object_istc = ScopeTypeChain::createEmpty(core->GetGC(), object_itraits);
+		class_istc = ScopeTypeChain::createEmpty(core->GetGC(), class_itraits);
 	}
 
 	void BuiltinTraits::initClassTypes(PoolObject* pool)
@@ -149,7 +159,7 @@ namespace avmplus
 		for (uint32_t i=0, n=pool->classCount(); i < n; i++) 
 		{
 			Traits* ctraits = pool->getClassTraits(i);
-			if (ctraits && ctraits->name == name) 
+			if (ctraits && ctraits->name() == name) 
 			{
 				return ctraits;
 			}

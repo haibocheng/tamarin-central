@@ -44,33 +44,31 @@ namespace avmplus
 	 *
 	 * Note: ScopeTypeChain is now immutable; once created it cannot be modified
 	 */
-#ifdef AVMPLUS_TRAITS_MEMTRACK
-	class ScopeTypeChain : public MMgc::GCFinalizedObject
-#else
 	class ScopeTypeChain : public MMgc::GCObject
-#endif
 	{
 	private:
-		inline ScopeTypeChain(int _size, int _fullsize) : size(_size), fullsize(_fullsize) { }
+		ScopeTypeChain(int32_t _size, int32_t _fullsize, Traits* traits);
+		static const ScopeTypeChain* create(MMgc::GC* gc, Traits* traits, const ScopeTypeChain* outer, const Value* values, int32_t nValues, Traits* append, Traits* extra);
 
 	public:
 
-#ifdef AVMPLUS_TRAITS_MEMTRACK 
-		virtual ~ScopeTypeChain();
+		static const ScopeTypeChain* create(MMgc::GC* gc, Traits* traits, const ScopeTypeChain* outer, const FrameState* state, Traits* append, Traits* extra);
+#ifdef VMCFG_AOT
+		static const ScopeTypeChain* create(MMgc::GC* gc, Traits* traits, const ScopeTypeChain* outer, Traits* const* stateTraits, uint32_t nStateTraits, uint32_t nStateWithTraits, Traits* append, Traits* extra);
 #endif
+		static const ScopeTypeChain* createEmpty(MMgc::GC* gc, Traits* traits);
 
-		static ScopeTypeChain* create(MMgc::GC* gc, const ScopeTypeChain* outer, const FrameState* state, Traits* append, Traits* extra);
-		inline static ScopeTypeChain* createEmpty(MMgc::GC* gc) { return create(gc, NULL, NULL, NULL, NULL); }
-
-		inline Traits* getScopeTraitsAt(uint32_t i) const { return (Traits*)(_scopes[i] & ~ISWITH); }
-		inline bool getScopeIsWithAt(uint32_t i) const { return (_scopes[i] & ISWITH) != 0; }
+		const ScopeTypeChain* cloneWithNewTraits(MMgc::GC* gc, Traits* traits) const;
+		Traits* traits() const;
+		Traits* getScopeTraitsAt(uint32_t i) const;
+		bool getScopeIsWithAt(uint32_t i) const;
 
 		#if VMCFG_METHOD_NAMES
 		Stringp format(AvmCore* core) const;
 		#endif
 
 	private:
-		inline void setScopeAt(uint32_t i, Traits* t, bool w) { _scopes[i] = uintptr_t(t) | (w ? ISWITH : 0); }
+		void setScopeAt(uint32_t i, Traits* t, bool w);
 
 		// Traits are MMgc-allocated, thus always 8-byte-aligned, so the low 3 bits are available for us to use
 		static const uintptr_t ISWITH = 0x01;
@@ -80,6 +78,7 @@ namespace avmplus
 		const int32_t		size;
 		const int32_t		fullsize;
 	private:
+		Traits* const		_traits;
 		uintptr_t			_scopes[1];	// actual length = fullsize;
 	// ------------------------ DATA SECTION END
     };
@@ -87,52 +86,33 @@ namespace avmplus
 	/**
 	* a captured scope chain
 	*/
-#ifdef AVMPLUS_TRAITS_MEMTRACK
-	class ScopeChain : public MMgc::GCFinalizedObject
-#else
 	class ScopeChain : public MMgc::GCObject
-#endif
 	{
-		inline ScopeChain(const ScopeTypeChain* scopeTraits, Namespacep dxns) : 
-			_scopeTraits(scopeTraits), _defaultXmlNamespace(dxns)
-		{
-		}
-		
+		ScopeChain(VTable* vtable, AbcEnv* abcEnv, const ScopeTypeChain* scopeTraits, Namespacep dxns);
+
 		#if defined FEATURE_NANOJIT
 		friend class CodegenLIR;
 		#endif
 
 	public:
 
-#ifdef AVMPLUS_TRAITS_MEMTRACK 
-		virtual ~ScopeChain();
-#endif
 		/*
 			dxns is modelled as a variable on an activation object.  The activation
 			object will be in several scope chains, so we can't store dxns in the SC.
 			When it changes, it's new valuable is visible in all closures in scope.
 		*/
 		
-		static ScopeChain* create(MMgc::GC* gc, const ScopeTypeChain* scopeTraits, const ScopeChain* outer, Namespacep dxns);
+		static ScopeChain* create(MMgc::GC* gc, VTable* vtable, AbcEnv* abcEnv, const ScopeTypeChain* scopeTraits, const ScopeChain* outer, Namespacep dxns);
 
-		inline const ScopeTypeChain* scopeTraits() const { return _scopeTraits; }
-		inline int getSize() const { return _scopeTraits->size; }
-		inline Atom getScope(int i) const { AvmAssert(i >= 0 && i < _scopeTraits->size); return _scopes[i]; }
+		ScopeChain* cloneWithNewVTable(MMgc::GC* gc, VTable* vtable, AbcEnv* abcEnv, const ScopeTypeChain* scopeTraits = NULL);
 
-		void setScope(MMgc::GC* gc, int i, Atom value);
-
-		inline Namespacep getDefaultNamespace() const { return _defaultXmlNamespace; }
-
-		//
-		// Shut up these false positives:
-		//
-		// In member function avmplus::Namespacep* avmplus::ScopeChain::getDefaultNamespaceAddr() const:
-		// warning: dereferencing type-punned pointer might break strict-aliasing rules
- 		//
-		#ifdef __GNUC__
-		#pragma GCC system_header
-		#endif // __GNUC__
-		inline Namespacep* getDefaultNamespaceAddr() const { return (Namespacep*)(&_defaultXmlNamespace); }
+		VTable* vtable() const;
+		AbcEnv* abcEnv() const;
+		const ScopeTypeChain* scopeTraits() const;
+		int32_t getSize() const;
+		Atom getScope(int32_t i) const;
+		void setScope(MMgc::GC* gc, int32_t i, Atom value);
+		Namespacep getDefaultNamespace() const;
 
 		#if VMCFG_METHOD_NAMES
 		Stringp format(AvmCore* core) const;
@@ -140,6 +120,8 @@ namespace avmplus
 
 	// ------------------------ DATA SECTION BEGIN
 	private:
+		VTable* const					_vtable;
+		AbcEnv* const					_abcEnv;
 		const ScopeTypeChain* const		_scopeTraits;
 		DRCWB(Namespacep) const			_defaultXmlNamespace;
 		Atom							_scopes[1];			// actual length == size

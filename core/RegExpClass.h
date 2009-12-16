@@ -59,8 +59,10 @@ namespace avmplus
 		// argN = argv[argc]
 		Atom construct(int argc, Atom* argv);
 
-		ATOM_WB kindex;
-		ATOM_WB kinput;
+		DRCWB(String*) kindex;
+		DRCWB(String*) kinput;
+        
+		DECLARE_SLOTS_RegExpClass;
 	};
 }
 

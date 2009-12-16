@@ -99,8 +99,8 @@ namespace avmshell
 		{ NULL, 0 }		
 	};
 
-	DebugCLI::DebugCLI(AvmCore *core)
-		: Debugger(core)
+	DebugCLI::DebugCLI(AvmCore *core, Debugger::TraceLevel tracelevel)
+		: Debugger(core, tracelevel)
 	{
 		currentSourceLen = 0;
         warnMissingSource = true;
@@ -573,7 +573,7 @@ namespace avmshell
 
 		// todo deal with exceptions
 		Multiname mname(
-			core->publicNamespace,
+			core->getAnyPublicNamespace(),
 			core->internStringLatin1(name)
 		);
 

@@ -44,13 +44,33 @@ namespace MMgc
 	{
 		m_blocks = NULL;
 		m_startedFinalize = false;
+#ifdef MMGC_MEMORY_PROFILER
+		m_totalAskSize = 0;
+#endif
 	}
 
-	void* GCLargeAlloc::Alloc(size_t size, int flags)
+#if defined DEBUG || defined MMGC_MEMORY_PROFILER
+	void* GCLargeAlloc::Alloc(size_t originalSize, size_t requestSize, int flags)
+#else
+	void* GCLargeAlloc::Alloc(size_t requestSize, int flags)
+#endif
 	{
-		int blocks = (int)((size+sizeof(LargeBlock)+GCHeap::kBlockSize-1) / GCHeap::kBlockSize);
+		GCHeap::CheckForAllocSizeOverflow(requestSize, sizeof(LargeBlock)+GCHeap::kBlockSize);
+
+		int blocks = (int)((requestSize+sizeof(LargeBlock)+GCHeap::kBlockSize-1) / GCHeap::kBlockSize);
+		uint32_t computedSize = blocks*GCHeap::kBlockSize - sizeof(LargeBlock);
 		
-		LargeBlock *block = (LargeBlock*) m_gc->AllocBlock(blocks, GC::kGCLargeAllocPageFirst, (flags&GC::kZero) != 0);
+		// Allocation must be signalled before we allocate because no GC work must be allowed to
+		// come between an allocation and an initialization - if it does, we may crash, as 
+		// GCFinalizedObject subclasses may not have a valid vtable, but the GC depends on them
+		// having it.  In principle we could signal allocation late but only set the object
+		// flags after signaling, but we might still cause trouble for the profiler, which also
+		// depends on non-interruptibility.
+
+		m_gc->SignalAllocWork(computedSize);
+		
+		LargeBlock *block = (LargeBlock*) m_gc->AllocBlock(blocks, GC::kGCLargeAllocPageFirst, 
+														   (flags&GC::kZero) != 0, (flags&GC::kCanFail) != 0);
 		void *item = NULL;
 
 		if (block)
@@ -60,7 +80,7 @@ namespace MMgc
 			block->flags |= ((flags&GC::kRCObject) != 0) ? kRCObject : 0;
 			block->gc = this->m_gc;
 			block->next = m_blocks;
-			block->usableSize = blocks*GCHeap::kBlockSize - sizeof(LargeBlock);
+			block->size = computedSize;
 			m_blocks = block;
 			
 			item = (void*)(block+1);
@@ -69,13 +89,27 @@ namespace MMgc
 				block->flags |= kMarkFlag;
 
 #ifdef _DEBUG
+			(void)originalSize;
 			if (flags & GC::kZero)
 			{
 				// AllocBlock should take care of this
-				for(int i=0, n=(int)(size/sizeof(int)); i<n; i++) {
+				for(int i=0, n=(int)(requestSize/sizeof(int)); i<n; i++) {
 					if(((int*)item)[i] != 0)
 						GCAssert(false);
 				}
+			}
+#endif
+
+#ifdef MMGC_HOOKS
+			GCHeap* heap = GCHeap::GetGCHeap();
+			if(heap->HooksEnabled()) {
+				size_t userSize = block->size - DebugSize();
+#ifdef MMGC_MEMORY_PROFILER
+				m_totalAskSize += originalSize;
+				heap->AllocHook(GetUserPointer(item), originalSize, userSize);
+#else
+				heap->AllocHook(GetUserPointer(item), 0, userSize);
+#endif
 			}
 #endif
 		}
@@ -85,7 +119,24 @@ namespace MMgc
 	
 	void GCLargeAlloc::Free(const void *item)
 	{
-		LargeBlock *b = GetBlockHeader(item);
+		GCAssertMsg(!m_startedFinalize, "GCLargeAlloc::Free is not allowed during finalization; caller must guard against this.");
+
+		LargeBlock *b = GetLargeBlock(item);
+
+#ifdef MMGC_HOOKS
+		GCHeap* heap = GCHeap::GetGCHeap();
+		if(heap->HooksEnabled())
+		{
+			const void* p = GetUserPointer(item);
+			size_t userSize = GC::Size(p);
+			heap->FreeHook(p, userSize, 0xca);
+#ifdef MMGC_MEMORY_PROFILER
+			if(heap->GetProfiler())
+				m_totalAskSize -= heap->GetProfiler()->GetAskSize(p);
+#endif
+			heap->FinalizeHook(p, userSize);
+		}
+#endif
 
 		if(b->flags & kHasWeakRef)
 			b->gc->ClearWeakRef(GetUserPointer(item));
@@ -95,11 +146,11 @@ namespace MMgc
 		{
 			if(b == *prev)
 			{
-				*prev = b->next;
+				*prev = Next(b);
 				m_gc->FreeBlock(b, b->GetNumBlocks());
 				return;
 			}
-			prev = &(*prev)->next;
+			prev = (LargeBlock**)(&(*prev)->next);
 		}
 		GCAssertMsg(false, "Bad free!");
 	}
@@ -109,7 +160,7 @@ namespace MMgc
 		LargeBlock *block = m_blocks;
 		while (block) {
 			block->flags &= ~(kMarkFlag|kQueuedFlag);
-			block = block->next;
+			block = Next(block);
 		}
 	}
 
@@ -120,32 +171,52 @@ namespace MMgc
 		while (*prev) {			
 			LargeBlock *b = *prev;
 			if ((b->flags & kMarkFlag) == 0) {
+				GCAssert((b->flags & kQueuedFlag) == 0);
+				GC* gc = b->gc;
+				
+				// Large blocks may be allocated by finalizers for large blocks, creating contention
+				// for the block list.  Yet the block list must be live, since eg GetUsageInfo may be
+				// called by the finalizers (or their callees).
+				//
+				// Unlink the block from the list early to avoid contention.
+				
+				*prev = Next(b);
+				b->next = NULL;
+
 				void *item = b+1;
 				if (NeedsFinalize(b)) {
-					GCFinalizable *obj = (GCFinalizable *) item;
-					obj = (GCFinalizable *) GetUserPointer(obj);
-					obj->~GCFinalizable();
+					GCFinalizedObject *obj = (GCFinalizedObject *) item;
+					obj = (GCFinalizedObject *) GetUserPointer(obj);
+					obj->~GCFinalizedObject();
 #if defined(_DEBUG)
 					if((b->flags & kRCObject) != 0) {
-						b->gc->RCObjectZeroCheck((RCObject*)obj);
+						gc->RCObjectZeroCheck((RCObject*)obj);
 					}
 #endif
 				}
 				if(b->flags & kHasWeakRef) {
-					b->gc->ClearWeakRef(GetUserPointer(item));
+					gc->ClearWeakRef(GetUserPointer(item));
 				}
 				
+#ifdef MMGC_HOOKS
 				if(m_gc->heap->HooksEnabled())
-					m_gc->heap->FinalizeHook(GetUserPointer(item), b->usableSize - DebugSize());
+				{
+				#ifdef MMGC_MEMORY_PROFILER
+					if(GCHeap::GetGCHeap()->GetProfiler())
+						m_totalAskSize -= GCHeap::GetGCHeap()->GetProfiler()->GetAskSize(GetUserPointer(item));
+				#endif
+
+					m_gc->heap->FinalizeHook(GetUserPointer(item), b->size - DebugSize());
+				}
+#endif
 				
-				// unlink from list
-				*prev = b->next;
-				b->gc->AddToLargeEmptyBlockList(b);
+				// The block is not empty until now, so now add it.
+				gc->AddToLargeEmptyBlockList(b);
 				continue;
 			}
 			// clear marks
 			b->flags &= ~(kMarkFlag|kQueuedFlag);
-			prev = &b->next;
+			prev = (LargeBlock**)(&b->next);
 		}
 		m_startedFinalize = false;
 	}
@@ -155,6 +226,7 @@ namespace MMgc
 		GCAssert(!m_blocks);
 	}
 
+#ifdef _DEBUG
 	/* static */
 	bool GCLargeAlloc::ConservativeGetMark(const void *item, bool bogusPointerReturnValue)
 	{
@@ -164,15 +236,21 @@ namespace MMgc
 		}
 		return bogusPointerReturnValue;
 	}
+#endif
 	
-	size_t GCLargeAlloc::GetBytesInUse()
+	void GCLargeAlloc::GetUsageInfo(size_t& totalAskSize, size_t& totalAllocated)
 	{
-		size_t bytes=0; 
+		totalAskSize = 0;
+		totalAllocated = 0;
+
 		LargeBlock *block = m_blocks;
 		while (block) {
-			bytes += block->usableSize;
-			block = block->next;
+			totalAllocated += block->size;
+			block = Next(block);
 		}		
-		return bytes;
+	
+#ifdef MMGC_MEMORY_PROFILER
+		totalAskSize += m_totalAskSize;
+#endif
 	}
 }

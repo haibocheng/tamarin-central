@@ -44,45 +44,53 @@ package flash.sampler
      * @langversion 3.0     
      * @keyword StackFrame      
      */
+    [native(cls="StackFrameClass", instance="StackFrameObject", methods="auto", constsetters="true")] // @todo: native only for slot getter/setter
     public final class StackFrame
     {
     
-    /**
-     * The function name in the stack frame. For Flash Player debugger version only.
-     * @playerversion Flash 9.0.115.0
-     * @langversion 3.0     
-     * @keyword StackFrame.name, name      
-     */    
-   	public const name:String;
+		/**
+		 * The function name in the stack frame. For Flash Player debugger version only.
+		 * @playerversion Flash 9.0.115.0
+		 * @langversion 3.0     
+		 * @keyword StackFrame.name, name      
+		 */    
+		public const name:String;
     
-    /**
-     * The file name of the SWF file being debugged. For Flash Player debugger version only.
-     * @playerversion Flash 9.0.115.0
-     * @langversion 3.0     
-     * @keyword StackFrame.file, file      
-     */       
-	public const file:String;
+		/**
+		 * The file name of the SWF file being debugged. For Flash Player debugger version only.
+		 * @playerversion Flash 9.0.115.0
+		 * @langversion 3.0     
+		 * @keyword StackFrame.file, file      
+		 */       
+		public const file:String;
     
-    /**
-     * The line number for the function in the SWF file being debugged. For Flash Player debugger version only.
-     * @playerversion Flash 9.0.115.0
-     * @langversion 3.0     
-     * @keyword StackFrame.line, line      
-     */      
-	public const line:uint;
+		/**
+		 * The line number for the function in the SWF file being debugged. For Flash Player debugger version only.
+		 * @playerversion Flash 9.0.115.0
+		 * @langversion 3.0     
+		 * @keyword StackFrame.line, line      
+		 */      
+		public const line:uint;
+	
+		/**
+		 * The identifier for the script function in the application being profiled.
+		 * @langversion 3.0
+		 * @keyword StackFrame.scriptID, scriptID      
+		 */
+		public const scriptID:Number;
     
-    /**
-     * Converts the StackFrame to a string of its properties.
-     * @return A string containing the <code>name</code> property, and optionally the <code>file</code> 
-     * and <code>line</code> properties (if a SWF file is being debugged) of the StackFrame object. For Flash Player debugger version only.
-     * @playerversion Flash 9.0.115.0
-     * @langversion 3.0     
-     * @keyword StackFrame.toString, toString      
-     */      
-	public function toString():String
-	{
-		return name + "()" + (file ? "[" + file + ":" + line + "]" : "");
-	}
+		/**
+		 * Converts the StackFrame to a string of its properties.
+		 * @return A string containing the <code>name</code> property, and optionally the <code>file</code> 
+		 * and <code>line</code> properties (if a SWF file is being debugged) of the StackFrame object. For Flash Player debugger version only.
+		 * @playerversion Flash 9.0.115.0
+		 * @langversion 3.0     
+		 * @keyword StackFrame.toString, toString      
+		 */      
+		public function toString():String
+		{
+			return name + "()" + (file ? "[" + file + ":" + line + "]" : "");
+		}
     };
 	
 
@@ -96,13 +104,13 @@ package flash.sampler
      * @keyword Sample      
      * @see package.html#getSamples() flash.sampler.getSamples()
      */
-	[native(cls="SampleClass", instance="SampleObject", methods="auto")]
+    [native(cls="SampleClass", instance="SampleObject", methods="auto", constsetters="true")]
     public class Sample
     {
 		/**
 	     * The microseconds that define the duration of the Sample instance. For Flash Player debugger version only.
-             * 
-             * @playerversion Flash 9.0.115.0
+		 * 
+		 * @playerversion Flash 9.0.115.0
 	     * @langversion 3.0     
 	     * @keyword Sample, Sample.time, time         
 		 */
@@ -128,7 +136,7 @@ package flash.sampler
     * @see package.html#getSamples() flash.sampler.getSamples()
     * @includeExample examples\SampleTypesExample.as -noswf    
     */
-	[native(cls="NewObjectSampleClass", instance="NewObjectSampleObject", methods="auto")]
+    [native(cls="NewObjectSampleClass", instance="NewObjectSampleObject", methods="auto", constsetters="true")]
     public final class NewObjectSample extends Sample
     {
     	/** 
@@ -172,7 +180,7 @@ package flash.sampler
     * @see package.html#getSamples() flash.sampler.getSamples()
     * @includeExample examples\SampleTypesExample.as -noswf    
     */    
-	[native(cls="DeleteObjectSampleClass", instance="DeleteObjectSampleObject", methods="auto")]
+    [native(cls="DeleteObjectSampleClass", instance="DeleteObjectSampleObject", methods="auto", constsetters="true")] // @todo: native only for slot getter/setter
     public final class DeleteObjectSample extends Sample
     {
     	/** 

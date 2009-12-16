@@ -45,7 +45,7 @@ namespace avmplus
 	 * class Math
 	 */
 	class MathClass : public ClassClosure
-    {
+	{
 	public:
 		MathClass(VTable* cvtable);
 		~MathClass() 
@@ -69,7 +69,7 @@ namespace avmplus
 		double acos(double x);
 		double asin(double x);
 		double atan(double x);
-		double atan2(double x, double y);
+		double atan2(double y, double x);
 		double ceil(double x);
 		double cos(double x);
 		double exp(double x);
@@ -93,8 +93,10 @@ namespace avmplus
 		double min(double x, double y, const Atom* argv, uint32_t argc);
 
 	private:
-		TRandomFast seed;			
-    };
+		TRandomFast seed;
+        
+		DECLARE_SLOTS_MathClass;
+	};
 }
 
 #endif /* __avmplus_MathClass__ */

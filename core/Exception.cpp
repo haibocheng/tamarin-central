@@ -74,7 +74,7 @@ namespace avmplus
 	
 	bool Exception::isValid()
 	{
-		return (atom&7)==kObjectType;
+		return atomKind(atom) == kObjectType;
 	}
 	
 	//
@@ -116,10 +116,20 @@ namespace avmplus
 		catchAction = kCatchAction_SearchForActionScriptExceptionHandler;
 
 		this->stacktop = core->gc->allocaTop();
-
-		codeContextAtom = core->codeContextAtom;
-		dxnsAddr = core->dxnsAddr;
+		
+		savedMethodFrame = core->currentMethodFrame;
+#ifdef VMCFG_AOT
+		this->llvmUnwindStyle = 0;
+#endif
 	}
+
+#ifdef VMCFG_AOT
+	void ExceptionFrame::beginLlvmUnwindTry(AvmCore *core)
+	{
+		beginTry(core);
+		this->llvmUnwindStyle = 1;
+	}
+#endif
 
 	void ExceptionFrame::endTry()
 	{
@@ -127,21 +137,23 @@ namespace avmplus
 			// ISSUE do we need to check core if it is set in constructor?
 			core->exceptionFrame = prevFrame;
 
-			// Restore the code context to what it was before the try
-			core->codeContextAtom = codeContextAtom;
-			
 			core->gc->allocaPopTo(this->stacktop);
+
+			core->currentMethodFrame = savedMethodFrame;
 		}
 	}
 	
 	void ExceptionFrame::throwException(Exception *exception)
 	{
 		core->exceptionAddr = exception;
-#if defined(_WIN64)
-		longjmp64(jmpbuf, (uintptr)exception); 
-#else
-		longjmp(jmpbuf, 1); 
+#ifdef VMCFG_AOT
+		if(this->llvmUnwindStyle) {
+			llvm_unwind();
+			return;
+		}
 #endif
+
+		VMPI_longjmpNoUnwind(jmpbuf, 1); 
 	}
 
 	void ExceptionFrame::beginCatch()
@@ -157,8 +169,8 @@ namespace avmplus
 		core->callStack = callStack;
 #endif // DEBUGGER
 
+		core->currentMethodFrame = savedMethodFrame;
+
 		core->gc->allocaPopTo(this->stacktop);
-		core->codeContextAtom = codeContextAtom;
-		core->dxnsAddr = dxnsAddr;
 	}
 }

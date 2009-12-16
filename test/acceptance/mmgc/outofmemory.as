@@ -35,6 +35,7 @@
  *
  * ***** END LICENSE BLOCK ***** */
 
+import avmplus.*;
 
 		/****  inner class Node  ***/
 		class Node 
@@ -47,15 +48,25 @@
 		/**** end Node *******/
 
 
-print("before out-of-memory PASSED!");
+trace("before out-of-memory PASSED!");
 var data:Array=new Array();
 var last:Node=new Node();
-for (var i=0;i<100000;i++) {
+var counter:int = 0;
+var memWatcher:Number = 0;
+while (true) {
     var node=new Node(last,last);
     data.push(node);
     last=node;
+    counter++;
+    if ((counter % 20000) == 0){
+        if (System.totalMemory < memWatcher){
+            trace("memory stopped growing, something wrong?");
+            break;
+        }
+        memWatcher = System.totalMemory
+    }
 }
 
 // if reaches this point did not run out of memory
 // in order to run out of memory -memlimit 100 must be a runtime arg to the vm
-print("out-of-memory FAILED!");
+trace("out-of-memory FAILED!");

@@ -37,10 +37,8 @@
 
 #include "avmplus.h"
 
-#ifdef AVMPLUS_VERBOSE
-#define if_verbose(...) if (pool->verbose) { __VA_ARGS__ }
-#else
-#define if_verbose(...)
+#ifdef VMCFG_AOT
+#include "AOTCompiler.h"
 #endif
 
 namespace avmplus
@@ -54,13 +52,13 @@ namespace avmplus
 		Toplevel* toplevel,
 		Domain* domain,
 		const NativeInitializer* natives,
-		const List<Stringp>* keepVersions)
+		API api)
     {
 		int version;
 		int result = canParse(code, &version);
 		
 #ifdef AVMPLUS_VERBOSE
-		if (core->config.verbose)
+		if (core->isVerbose(VB_parse))
 			core->console << "major=" << (version&0xFFFF) << " minor=" << (version>>16) << "\n";
 #endif
 		
@@ -74,8 +72,43 @@ namespace avmplus
 			}
 		}
 
-		AbcParser parser(core, code, toplevel, domain, natives, keepVersions);
-		PoolObject *pObject = parser.parse();
+#ifdef VMCFG_AOT
+		if(!natives) // no natives -- runtime-loaded script
+		{
+			if(version == 0 && code.getSize() == 24) // only ABC "references" -- these are 0.0 version followed by SHA1
+			{
+				void *sha1 = (void *)(code.getBuffer() + 4);
+				for(int i = 0; i < nAOTInfos; i++)
+				{
+					const AOTInfo *aotInfo = &aotInfos[i];
+					AvmAssert(aotInfo != NULL);
+					
+					MMGC_STATIC_ASSERT(sizeof(aotInfo->origABCSHA1) == 20);
+					if(!memcmp(aotInfo->origABCSHA1, sha1, 20))
+					{
+						ReadOnlyScriptBufferImpl scriptBufferImpl(aotInfo->abcBytes, aotInfo->nABCBytes);
+						ScriptBuffer code(&scriptBufferImpl);
+						
+						NativeInitializer ninit(core, aotInfo, 0, 0);
+						PoolObject *pool = decodeAbc(core, code, toplevel, domain, &ninit, api);
+						AvmAssert(pool != NULL);
+						AvmAssert(!pool->isBuiltin);
+						AvmAssert(pool->aotInfo == aotInfo);
+#ifdef DEBUGGER
+						// TODO: is there a better pace to do this for both builtins and user scripts?
+						addAOTDebugInfo(pool);
+#endif
+						return pool;
+					}
+				}
+			}
+			toplevel->throwVerifyError( kCorruptABCError ); // not a reference or not found	
+			return NULL;
+		}
+#endif
+		
+		AbcParser parser(core, code, toplevel, domain, natives);
+		PoolObject *pObject = parser.parse(api);
  		if ( !pObject ) {
  			toplevel->throwVerifyError( kCorruptABCError );
 			/*NOTREACHED*/
@@ -83,7 +116,71 @@ namespace avmplus
 		}
  		else
  			return pObject;
+	}
+
+#if defined(VMCFG_AOT) && defined(DEBUGGER)
+	void AbcParser::addAOTDebugInfo(PoolObject *pool)
+	{
+		AvmCore *core = pool->core;
+		const AOTInfo *aotInfo = pool->aotInfo;
+		Debugger *debugger = core->debugger();
+		
+		if(debugger)
+		{
+			const MethodDebugInfo* methodDebugInfos = aotInfo->methodDebugInfos;
+		
+			if(methodDebugInfos != NULL)
+			{				
+				// create the structure representing the ABC
+				AbcFile* abc = new (core->GetGC()) AbcFile(core, 0);
+				
+				for(int n = 0; n < aotInfo->nABCMethods; n++)
+				{
+					MethodInfo *f = pool->getMethodInfo(n);
+					
+					// create DMIs
+					const MethodDebugInfo &info = methodDebugInfos[n];
+					DebuggerMethodInfo* dmi = DebuggerMethodInfo::create(core, info.local_count, -1, info.scope_count);
+					pool->_method_dmi.set(n, dmi);
+					
+					// set the file in the MethodInfo
+					f->setFile(abc);
+					
+					// get a SourceFile
+					SourceFile *src = NULL;
+					
+					if(info.file_name)
+					{
+						Stringp fileName = pool->getString(info.file_name);
+						src = abc->sourceNamed(fileName);
+						if(!src)
+						{
+							src = new (core->GetGC()) SourceFile(core->GetGC(), fileName);
+							abc->sourceAdd(src);
+						}
+					}
+					
+					// set register names
+					for(int i = 0; i < info.local_count; i++)
+					{
+						int name = info.local_names[i];
+						
+						if(name)
+							f->setRegName(i, pool->getString(name));
+					}
+					
+					// add line info
+					if(src)
+						for(int i = 0; i < info.line_count; i++)
+							src->addLine(info.lines[i], f, 0);
+				}
+				// hook the ABC in
+				debugger->pool2abcIndex.add(pool, (const void *)debugger->abcList.size());
+				debugger->abcList.add(abc);
+			}
+		}
     }
+#endif
 
 	int AbcParser::canParse(ScriptBuffer code, int* version)
 	{
@@ -98,6 +195,9 @@ namespace avmplus
 			*version = v;
 		
 		switch (v) {
+#ifdef VMCFG_AOT
+			case 0: // just a "reference" to an AOT-ed ABC!
+#endif
 			case (46<<16|16):
 				return 0;
 			default:
@@ -108,8 +208,7 @@ namespace avmplus
 	AbcParser::AbcParser(AvmCore* core, ScriptBuffer code, 
 		Toplevel* toplevel,
 		Domain* domain,
-		const NativeInitializer* natives,
-		const List<Stringp>* keepVersions)
+		const NativeInitializer* natives)
 		: instances(core->GetGC(), 0),
 		  toplevel(toplevel),
 		  domain(domain)
@@ -120,7 +219,6 @@ namespace avmplus
 		this->version = AvmCore::readU16(&code[0]) | AvmCore::readU16(&code[2])<<16;
 		this->pos = &code[4];
 		this->natives = natives;
-		this->keepVersions = keepVersions;
 
 		abcStart = &code[0];
 		abcEnd = &code[(int)code.getSize()];
@@ -135,14 +233,18 @@ namespace avmplus
 			core->GetGC()->Free(metaNames);
 	}
 
-	uint32_t AbcParser::computeInstanceSize(int class_id, 
-									   Traits* base) const
+	REALLY_INLINE void AbcParser::computeInstanceSizeAndSlotsOffset(int class_id, 
+																	Traits* base,
+																	uint16_t& sizeofInstance,
+																	uint16_t& offsetofSlots) const
 	{
-		// If this is a native class, return the stated instance size
+		// If this is a native class, use the stated instance size and offset to slot area.
 		const NativeClassInfo* nativeEntry;
 		if (natives && (nativeEntry = natives->get_class(class_id)) != NULL && nativeEntry->sizeofInstance)
 		{
-			return nativeEntry->sizeofInstance;
+			sizeofInstance = nativeEntry->sizeofInstance;
+			offsetofSlots = nativeEntry->offsetofSlotsInstance;
+			return;
 		}
 
 		// Search the inheritance chain for any native classes.
@@ -151,13 +253,17 @@ namespace avmplus
 			if (base->getSizeOfInstance() > sizeof(ScriptObject))
 			{
 				// non-Object base class uses a subclass of ScriptObject, so use that size.
-				return base->getSizeOfInstance();
+				sizeofInstance = base->getSizeOfInstance();
+				// non-native class so slots start after end of C++ data.
+				offsetofSlots = sizeofInstance;
+				return;
 			}
 			base = base->base;
 		}
 
 		// no derived native classes found
-		return uint32_t(sizeof(ScriptObject));
+		sizeofInstance = uint16_t(sizeof(ScriptObject));
+		offsetofSlots = uint16_t(sizeof(ScriptObject));
 	}
 
 	Namespacep AbcParser::parseNsRef(const byte* &pc) const
@@ -173,7 +279,7 @@ namespace avmplus
 		return pool->cpool_ns[index];
 	}
 
-	#ifdef AVMPLUS_VERBOSE
+#if defined(VMCFG_AOT) || defined(AVMPLUS_VERBOSE)
 	void AbcParser::parseTypeName(const byte* &pc, Multiname& m) const
 	{
 		// only save the type name for now.  verifier will resolve to traits
@@ -181,13 +287,13 @@ namespace avmplus
 		if (index == 0)
 		{
 			// type is *
-			m.setNamespace(core->publicNamespace);
+			m.setNamespace(core->getPublicNamespace(pool));
 			m.setName(core->kAsterisk);
 			return;
 		}
 
-		if (index >= pool->constantMnCount)
-			toplevel->throwVerifyError(kCpoolIndexRangeError, core->toErrorString(index), core->toErrorString(pool->constantMnCount));
+		if (index >= pool->cpool_mn_offsets.size())
+			toplevel->throwVerifyError(kCpoolIndexRangeError, core->toErrorString(index), core->toErrorString(pool->cpool_mn_offsets.size()));
 
 		pool->parseMultiname(m, index);
 	}
@@ -196,15 +302,13 @@ namespace avmplus
 	uint32_t AbcParser::resolveQName(const byte* &p, Multiname &m) const
 	{
 		uint32 index = readU30(p);
-		if (index == 0 || index >= pool->constantMnCount)
+		if (index == 0 || index >= pool->cpool_mn_offsets.size())
 			toplevel->throwVerifyError(kCpoolIndexRangeError, core->toErrorString(index), core->toErrorString(pool->constantCount));
 
-		Atom a = pool->cpool_mn[index];
+		pool->parseMultiname(m, index);
 
-		pool->parseMultiname(a, m);
-		if (!m.isQName())
+		if (!pool->isBuiltin && !m.isQName())
 			toplevel->throwVerifyError(kCpoolEntryWrongTypeError, core->toErrorString(index));
-			
 		return index;
 	}
 
@@ -225,7 +329,7 @@ namespace avmplus
 	{
 		if (index > 0 && index < pool->constantStringCount)
 		{
-			return pool->cpool_string[index];
+			return pool->getString(index);
 		}
 		toplevel->throwVerifyError(kCpoolIndexRangeError, core->toErrorString(index), core->toErrorString(pool->constantStringCount));
 		return NULL;
@@ -239,9 +343,9 @@ namespace avmplus
 		return resolveUtf8(index);
 	}
 
-	PoolObject* AbcParser::parse()
+	PoolObject* AbcParser::parse(API api)
 	{
-#ifdef AVMPLUS_WORD_CODE
+#ifdef VMCFG_LOOKUP_CACHE
 		// Loading a new ABC file always invalidates the lookup cache
 		core->invalidateLookupCache();
 #endif
@@ -250,7 +354,7 @@ namespace avmplus
 		core->tmCache()->flush();
 
 		// constant pool
-		parseCpool();
+		parseCpool(api);
 
 		// parse all methodInfos in one pass.  Nested functions must come before outer functions
 		parseMethodInfos();
@@ -269,7 +373,7 @@ namespace avmplus
 			core->traits.initInstanceTypes(pool);
 
 			// register "void"
-			addNamedTraits(core->publicNamespace, VOID_TYPE->name, VOID_TYPE);
+			addNamedTraits(core->getPublicNamespace(ApiUtils::getSmallestAPI()), VOID_TYPE->name(), VOID_TYPE);
 		}
 
 		// type information about class objects
@@ -297,7 +401,8 @@ namespace avmplus
 	 * one for sizing the traits object and the other for allocating it and filling
 	 * it in.
 	 */
-	Traits* AbcParser::parseTraits(uint32_t sizeofInstance, 
+	Traits* AbcParser::parseTraits(uint16_t sizeofInstance,
+									uint16_t offsetofSlots,
 									Traits* base, 
 									Namespacep ns, 
 									Stringp name, 
@@ -313,30 +418,36 @@ namespace avmplus
 			toplevel->throwVerifyError(kCorruptABCError);
 
 		#ifdef AVMPLUS_VERBOSE
-		if (pool->verbose)
+		if (pool->isVerbose(VB_parse))
 			core->console << "        trait_count=" << nameCount << "\n";
 		#endif
 
-		Traits* traits = Traits::newTraits(pool, base, sizeofInstance, traitsPos, posType);
-		traits->ns = ns;
-		traits->name = name;
+		Traits* traits = Traits::newTraits(pool, base, sizeofInstance,offsetofSlots , traitsPos, posType);
+		traits->set_names(ns, name);
 		traits->protectedNamespace = protectedNamespace;
 		
-		bool enableSkips = false;
 		for (uint32_t i=0; i < nameCount; i++)
         {
-			Multiname qn;
-			const uint32_t qn_index = resolveQName(pos, qn);
-			Namespacep ns = qn.getNamespace();
+			Multiname mn;
+			const uint32_t qn_index = resolveQName(pos, mn);
+			Namespacep ns;
+			const NamespaceSet* nss;
+			if (mn.namespaceCount() > 1) {
+				nss = (NamespaceSet*) mn.getNsset();
+				ns = nss->nsAt(0);
+			}
+			else {
+				ns = mn.getNamespace();
+				nss = NamespaceSet::create(core->GetGC(), ns);
+			}
 			// TODO name can come out null and fire all kinds of asserts from a broken compiler
 			// and crash a release build, not sure if null is valid in any cases but there's definitely
 			// a missing verify error here somewhere
-			Stringp name = qn.getName();
+			Stringp name = mn.getName();
 			CHECK_POS(pos);
             int tag = *pos++;
             TraitKind kind = (TraitKind) (tag & 0x0f);
 			
-			bool skip = false;
 			uint32_t class_index = 0;
 			uint32_t method_index = 0;
 			uint32_t slot_id = 0;
@@ -348,7 +459,6 @@ namespace avmplus
 #endif
 
 			// Read in the trait entry.
-			// Skip any traits that have version metadata that indicates they should be removed.
 			switch (kind)
 			{
 			case TRAIT_Slot:
@@ -391,31 +501,11 @@ namespace avmplus
 					if (index >= pool->metadataCount || !metaNames)
 						toplevel->throwVerifyError(kCorruptABCError);
 					Stringp name = metaNames[index];
-					if (pool->stripMetadataIndexes.indexOf(index) != -1)
-						skip = true;  // Stripping this definition
-					else if (name == core->kNeedsDxns)
+					if (name == core->kNeedsDxns)
 						needsDxns = true;
 				}
 			}
-			if (skip) 
-			{
-				if (!enableSkips)
-				{
-					traits->enableSkips(nameCount);
-					enableSkips = true;
-				}
-				traits->setSkip(i);
-				AvmAssert(traits->testSkip(i));
-#ifdef AVMPLUS_VERBOSE
-				if (pool->verbose)
-				{
-					core->console << "skipping definition " << i << " for " << traits << " name=" << Multiname::format(core,ns,name) << "\n";
-				}
-#endif
-				continue;
-			}
-			
-			// Didn't skip the trait, so do set up for the definition now.
+
 			switch (kind)
             {
             case TRAIT_Slot:
@@ -423,7 +513,7 @@ namespace avmplus
             case TRAIT_Class:
 			{
 				if (script)
-					addNamedScript(ns, name, script);
+					addNamedScript(nss, name, script);
 
 				if (kind == TRAIT_Class)
 				{
@@ -436,7 +526,7 @@ namespace avmplus
 						toplevel->throwVerifyError(kClassInfoOrderError, core->toErrorString(class_index));
 
 					#ifdef AVMPLUS_VERBOSE
-					if (pool->verbose)
+					if (pool->isVerbose(VB_parse))
 					{
 						core->console << "            " << traitNames[kind]
 							<< " name=" << Multiname::format(core, ns, name)
@@ -450,7 +540,7 @@ namespace avmplus
 					{
 						// promote instance type to the vm-wide type table.
 						// map type name to traits
-						addNamedTraits(ns, name, ctraits->itraits);
+						addNamedTraits(nss, name, ctraits->itraits);
 						if (tag & ATTR_metadata)
 						{
 							ctraits->itraits->setMetadataPos(meta_pos);
@@ -467,7 +557,7 @@ namespace avmplus
 				else
 				{
 					#ifdef AVMPLUS_VERBOSE
-					if (pool->verbose)
+					if (pool->isVerbose(VB_parse))
 					{
 						core->console << "            " << traitNames[kind]
 							<< " name=" << Multiname::format(core,ns,name)
@@ -485,7 +575,7 @@ namespace avmplus
             case TRAIT_Method:
 			{
 				#ifdef AVMPLUS_VERBOSE
-				if (pool->verbose)
+				if (pool->isVerbose(VB_parse))
 				{
 					core->console << "            " << traitNames[kind]
 						<< " name=" << Multiname::format(core, ns, name)
@@ -524,7 +614,7 @@ namespace avmplus
 				
 				// only export one name for an accessor 
 				if (script && !domain->getNamedScript(name,ns))
-					addNamedScript(ns, name, script);
+					addNamedScript(nss, name, script);
 
                 break;
 			}
@@ -541,7 +631,7 @@ namespace avmplus
 				for (uint32_t metadata = 0; metadata < metadataCount; ++metadata)
 				{
 					uint32_t index = readU30(meta_pos);
-					if (pool->verbose)
+					if (pool->isVerbose(VB_parse))
 						core->console << "            [" << metaNames[index] << "]\n";
 				}
             }
@@ -555,9 +645,11 @@ namespace avmplus
     {
         int methodCount = readU30(pos);
 
-		if_verbose(
+		#ifdef AVMPLUS_VERBOSE
+		if(pool->isVerbose(VB_parse)) {
 			core->console << "method_count=" << methodCount << "\n";
-		)
+		}
+		#endif
 
 		int size = methodCount == 0 ? 1 : methodCount;
 
@@ -595,6 +687,10 @@ namespace avmplus
 			// MethodInfo
 			const int param_count = readU30(pos);
 
+#ifdef VMCFG_AOT
+			const byte* ret_type_pos = pos;
+#endif
+
 		// @todo -- we should add an AbcParser equivalent of skipU30;
 		// then the next two clauses would be 			
 		//		skipU30(pos, param_count+1);
@@ -602,12 +698,12 @@ namespace avmplus
 			#ifdef AVMPLUS_VERBOSE
 			Multiname returnTypeName;
 			parseTypeName(pos, returnTypeName);
-			if_verbose(
+			if(pool->isVerbose(VB_parse)) {
 				core->console << "    " << offset << ":method["<<i<<"]\n"
 					<< "        returnType=" << returnTypeName << "\n"
 					<< "        param_count=" << param_count 
 				    << "\n";
-			)
+			}
 			#else
 			readU30(pos);// return type name
 			#endif
@@ -617,9 +713,9 @@ namespace avmplus
 				#ifdef AVMPLUS_VERBOSE
 				Multiname multiname;
 				parseTypeName(pos, multiname);
-				if_verbose(
+				if(pool->isVerbose(VB_parse)) {
 					core->console << "            paramType["<<j<<"]="<< multiname << "\n";
-				)
+				}
 				#else
 				readU30(pos);
 				#endif
@@ -628,14 +724,16 @@ namespace avmplus
             uint32_t name_index = readU30(pos);
             (void)name_index;
 			CHECK_POS(pos);
-			const uint8_t abcFlags = *pos++;
+			uint8_t abcFlags = *pos++;
 
-			if_verbose(
+			#ifdef AVMPLUS_VERBOSE
+			if(pool->isVerbose(VB_parse)) {
 				core->console << "        name_index=" << name_index;
 				if (name_index > 0 && name_index < pool->constantStringCount)
-					core->console << " \"" << pool->cpool_string[name_index] << "\"";
+					core->console << " \"" << pool->getString(name_index) << "\"";
 				core->console << "\n        flags=" << (uint32_t)abcFlags << "\n";
-			)
+			}
+			#endif
 
 			const NativeMethodInfo* ni = NULL;
 			if (abcFlags & MethodInfo::NATIVE)
@@ -651,9 +749,32 @@ namespace avmplus
 				}
 			}
 
+#ifdef VMCFG_AOT
+			bool isCompiled = false;
+			{
+				Multiname returnTypeName;
+				parseTypeName(ret_type_pos, returnTypeName);
+
+				NativeMethodInfo compiledMethodInfo;
+
+				if (!ni && natives->getCompiledInfo(&compiledMethodInfo, returnTypeName, i))
+				{
+					ni = &compiledMethodInfo;
+					abcFlags |= MethodInfo::compiledMethodFlags();
+					isCompiled = true;
+				}
+			}
+#endif
+
 			const int optional_count = (abcFlags & MethodInfo::HAS_OPTIONAL) ? readU30(pos) : 0;
 
 			MethodInfo* info = new (core->GetGC()) MethodInfo(i, pool, info_pos, abcFlags, ni);
+			
+#ifdef VMCFG_AOT
+			if(isCompiled)
+				info->setCompiledMethod();
+#endif
+			
 			#if VMCFG_METHOD_NAMES
 			if (core->config.methodNames)
 			{
@@ -698,9 +819,11 @@ namespace avmplus
     {
         uint32_t metadataCount = readU30(pos);
 
-		if_verbose(
+		#ifdef AVMPLUS_VERBOSE
+		if(pool->isVerbose(VB_parse)) {
 			core->console << "metadata_count=" << metadataCount << "\n";
-		)
+		}
+		#endif
 
 		if (metadataCount > uint32_t(abcEnd - pos))
 			toplevel->throwVerifyError(kCorruptABCError);
@@ -725,40 +848,46 @@ namespace avmplus
 				// constant pool names are stuck and always reachable via PoolObject, DRC or WB
 				metaNames[i] = name;
 
-				if_verbose(
+				#ifdef AVMPLUS_VERBOSE
+				if(pool->isVerbose(VB_parse)) {
 					core->console << "    " << name;
-				)
+				}
+				#endif
+
 				int values_count = readU30(pos);
 				if (values_count > 0)
 				{
-					if_verbose(
+					#ifdef AVMPLUS_VERBOSE
+					if(pool->isVerbose(VB_parse)) {
 						core->console << "(";
-					)
+					}
+					#endif
 					for(int q = 0; q < values_count; ++q)
 					{
 						uint32_t a = readU30(pos);
 						uint32_t b = readU30(pos);
-						if(keepVersions
-							&& name == core->kVersion 
-							&& a==0 
-							&& keepVersions->indexOf(resolveUtf8(b))==-1)
-						{
-							// Found the metadata to strip
-							pool->stripMetadataIndexes.add(i);
-						}
-						if_verbose(
+						#ifdef AVMPLUS_VERBOSE
+						if(pool->isVerbose(VB_parse)) {
 							core->console << a << "," << b;
 							if (q+1 < values_count)
 								core->console << " ";
-						)
+						}
+						#else
+						(void)a;
+						(void)b;
+						#endif
 					}
-					if_verbose(
+					#ifdef AVMPLUS_VERBOSE
+					if(pool->isVerbose(VB_parse)) {
 						core->console << ")";
-					)
+					}
+				#endif
 				}
-				if_verbose(
+			#ifdef AVMPLUS_VERBOSE
+			if(pool->isVerbose(VB_parse)) {
 					core->console << "\n";
-				)
+			}
+			#endif
 			}
 		}
     }
@@ -767,9 +896,11 @@ namespace avmplus
     {
         int bodyCount = readU30(pos);
 
-		if_verbose(
+		#ifdef AVMPLUS_VERBOSE
+		if(pool->isVerbose(VB_parse)) {
 			core->console << "bodies_count=" << bodyCount << "\n";
-		)
+		}
+		#endif
 
 #ifdef AVMPLUS_VERBOSE
 		const byte* startpos = pos;
@@ -810,7 +941,11 @@ namespace avmplus
 
 			int code_length = readU30(pos);
 
-			if (code_length <= 0) 
+			if (code_length <= 0
+#ifdef VMCFG_AOT
+				&& !info->needActivation() // AOT allows a dummy body so that it can represent activation traits
+#endif
+				) 
 			{
 				toplevel->throwVerifyError(kInvalidCodeLengthError, core->toErrorString(code_length));
 			}
@@ -822,7 +957,8 @@ namespace avmplus
 
             int exception_count = readU30(pos);
 
-			if_verbose(
+			#ifdef AVMPLUS_VERBOSE
+			if(pool->isVerbose(VB_parse)) {
 				core->console << "    " << offset << ":method["<<method_index<<"] max_stack=" << max_stack
 					<< " local_count=" << local_count 
 					<< " init_scope_depth=" << init_scope_depth 
@@ -830,7 +966,8 @@ namespace avmplus
 					<< " code_length=" << code_length
 					<< " exception_count=" << exception_count
 				    << "\n";
-			)
+			}
+			#endif
 
 			if (exception_count != 0) 
 			{
@@ -851,12 +988,12 @@ namespace avmplus
 					uint32 name_index = (version != (46<<16|15)) ? readU30(pos) : 0;
 					if (name_index != 0)
 					{
-						if (name_index >= pool->constantMnCount)
+						if (name_index >= pool->cpool_mn_offsets.size())
 							toplevel->throwVerifyError(kCpoolIndexRangeError, core->toErrorString(name_index), core->toErrorString(pool->constantCount));
 						pool->parseMultiname(qn, name_index);
 					}
 
-					if (pool->verbose)
+					if (pool->isVerbose(VB_parse))
 					{
 						core->console << "            exception["<<i<<"] from="<< from
 							<< " to=" << to
@@ -881,7 +1018,7 @@ namespace avmplus
 					if (version != (46<<16|15))
 					{
 						const uint32 name_index = readU30(pos); // variable name
-						if (name_index >= pool->constantMnCount)
+						if (name_index >= pool->cpool_mn_offsets.size())
 							toplevel->throwVerifyError(kCpoolIndexRangeError, core->toErrorString(name_index), core->toErrorString(pool->constantCount));
 					}
 					#endif
@@ -891,7 +1028,8 @@ namespace avmplus
 			if (info->hasMethodBody())
 			{
 				// Interface methods should not have bodies
-				if (info->declaringTraits() && info->declaringTraits()->isInterface)
+				Traits* declaringTraits = info->declaringTraits();
+				if (declaringTraits && declaringTraits->isInterface())
 				{
 					toplevel->throwVerifyError(kIllegalInterfaceMethodBodyError, core->toErrorString(info));
 				}
@@ -927,13 +1065,14 @@ namespace avmplus
 					#ifdef AVMPLUS_VERBOSE
 					if (core->config.methodNames)
 					{
-						ns = core->publicNamespace;
-						name = core->internString(info->getMethodName());
+						ns = core->getPublicNamespace(pool);
+						name = core->internString(info->getMethodNameWithTraits(declaringTraits));
 					}
 					#endif
 					// activation traits are raw types, not subclasses of object.  this is
 					// okay because they aren't accessable to the programming model.
-					Traits* act = parseTraits(sizeof(ScriptObject), 
+					Traits* act = parseTraits(sizeof(ScriptObject),
+																sizeof(ScriptObject), 
 																NULL, 
 																ns, 
 																name, 
@@ -942,8 +1081,7 @@ namespace avmplus
 																TRAITSTYPE_ACTIVATION, 
 																NULL);
 					act->final = true;
-					info->set_activationTraits(act);
-					//info->activationTraits->resolveSignatures(NULL);
+					info->init_activationTraits(act);
 				}
 				else
 				{
@@ -953,17 +1091,54 @@ namespace avmplus
 			}
 			else
 			{
-				// native methods should not have bodies!
-				toplevel->throwVerifyError(kIllegalNativeMethodBodyError, core->toErrorString(info));
+#ifdef VMCFG_AOT
+				if (info->needActivation())
+				{
+					Namespacep ns = NULL;
+					Stringp name = NULL;
+					#ifdef AVMPLUS_VERBOSE
+					if (core->config.methodNames)
+					{
+						ns = core->getPublicNamespace(pool);
+						name = core->internString(info->getMethodNameWithTraits(info->declaringTraits()));
+					}
+					#endif
+					// activation traits are raw types, not subclasses of object.  this is
+					// okay because they aren't accessable to the programming model.
+					Traits* act = parseTraits(sizeof(ScriptObject), 
+											  sizeof(ScriptObject),
+											  NULL, 
+											  ns, 
+											  name, 
+											  NULL, 
+											  pos,
+											  TRAITSTYPE_ACTIVATION, 
+											  NULL);
+						act->final = true;
+						info->init_activationTraits(act);
+						pool->aotInfo->activationTraits[method_index] = act;
+				} else
+#endif
+				{
+					// native methods should not have bodies!
+					toplevel->throwVerifyError(kIllegalNativeMethodBodyError, core->toErrorString(info));
+				}
 			}
-		}
+    	}
     }
 
-    void AbcParser::parseCpool()
+    void AbcParser::parseCpool(API api)
     {
-		pool = new (core->GetGC()) PoolObject(core, code, pos);
+		pool = new (core->GetGC()) PoolObject(core, code, pos, api);
 		pool->domain = domain;
+		
+#ifdef VMCFG_AOT
+		AvmAssert(natives != 0);
+		pool->isBuiltin = natives->hasBuiltins();
+		pool->aotInfo = natives->get_aotInfo();
+#else
 		pool->isBuiltin = (natives != NULL);
+#endif
 
 		uint32 int_count = readU30(pos);
 		// sanity check to prevent huge allocations
@@ -975,7 +1150,7 @@ namespace avmplus
 		pool->constantIntCount = int_count;
 
 #ifdef AVMPLUS_VERBOSE
-		pool->verbose = core->config.verbose;
+		pool->verbose_vb = core->config.verbose_vb; // pool picks up global settings
 #endif
 
 #ifdef AVMPLUS_VERBOSE
@@ -989,11 +1164,13 @@ namespace avmplus
 #endif
 			// S32 value
 			cpool_int.set(i, readS32(pos));
-			if_verbose(
+			#ifdef AVMPLUS_VERBOSE
+			if(pool->isVerbose(VB_parse)) {
 				core->console << "    " << offset << ":" << "cpool_int["<<(uint32_t)i<<"]="
 					<<constantNames[CONSTANT_Int] << " ";
 				core->console << cpool_int[i] << "\n";
-			)
+			}
+			#endif
 		}
 
 		uint32 uint_count = readU30(pos);
@@ -1016,12 +1193,14 @@ namespace avmplus
 			// U32 value
 			cpool_uint.set(i, (unsigned)readS32(pos));
 
-			if_verbose(
+			#ifdef AVMPLUS_VERBOSE
+			if(pool->isVerbose(VB_parse)) {
 				core->console << "    " << offset << ":" << "cpool_uint["<<i<<"]="
 					<<constantNames[CONSTANT_UInt] << " ";
 				core->console << (double)cpool_uint[i];
 				core->console << "\n";
-			)
+			}
+			#endif
 		}
 
 		uint32 double_count = readU30(pos);
@@ -1043,70 +1222,69 @@ namespace avmplus
 #endif
 			double value = readDouble(pos);
 			cpool_double.set(i, (double*)(core->allocDouble(value)&~7));
-			if_verbose(
+			#ifdef AVMPLUS_VERBOSE
+			if(pool->isVerbose(VB_parse)) {
 				core->console << "    " << offset << ":" << "cpool_double["<<i<<"]="
 					<<constantNames[CONSTANT_Double] << " ";
 				core->console << *cpool_double[i];
 				core->console << "\n";
-			)
+			}
+			#endif
 		}
 
 		uint32 string_count = readU30(pos);
 		if (string_count > (uint32)(abcEnd - pos))
 			toplevel->throwVerifyError(kCorruptABCError);
 
-		List<Stringp> &cpool_string = pool->cpool_string;
 		MMGC_MEM_TYPE(pool);
-		cpool_string.ensureCapacity(string_count);
-		pool->constantStringCount = string_count;
+		pool->setupConstantStrings(string_count);
 
 #ifdef AVMPLUS_VERBOSE
 		startpos = pos;
 #endif
 
-		const bool constData = code.getImpl()->isConstant();
-		
+		pool->_abcStringStart = pos;
+
+		PoolObject::ConstantStringData* dataP = pool->_abcStrings.data;
+		AvmAssert(core->kEmptyString != NULL);
+		dataP->str = core->kEmptyString;
 		for(uint32_t i = 1; i < string_count; ++i)
 		{
 #ifdef AVMPLUS_VERBOSE
 			int offset = (int)(pos-startpos);
 #endif
-
+			// save the byte position into the cpool array
+			(++dataP)->abcPtr = pos;
 			// number of characters
 			// todo - is compiler emitting no. of chars or no. of bytes?
 			int len = readU30(pos);
 
 			// check to see if we are trying to read past the file end or the beginning.
-			if (pos < abcStart || pos+len >= abcEnd )
+            // Also check for valid UTF8.
+			if (pos < abcStart || pos+len >= abcEnd || 
+                UnicodeUtils::Utf8ToUtf16((const uint8*) pos, len, NULL, 0, true) < 0)
+            {
+                // if we throw a verify error here, _abcStringEnd will never be set, and _abcStrings
+                // will be left in an inconsistent state. having _abcStringStart set but not _abcStringEnd
+                // can cause dynamicizeStrings to make poor decisions. So clean up before throwing.
+                pool->_abcStringStart = NULL;
+                pool->_abcStringEnd = NULL;
+                VMPI_memset(pool->_abcStrings.data, 0, string_count*sizeof(PoolObject::ConstantStringData*));
 				toplevel->throwVerifyError(kCorruptABCError);
-			// don't need to create an atom for this now, because
-			// each caller will take care of it.
+            }
 
-			// @todo: for now we assume that strings from compiled-in ABC data is constant,
-			// but ABC data from any other source is not constant since it may be unloaded.
-			// A further optimization would be to add a way to "un-constant" interned strings
-			// in an unloaded ABC range.
-			Stringp s = core->internStringUTF8((const char*)pos, len, constData);
-
-			// internStringUTF8() will return NULL if we pass it invalid UTF8 data and its "strict" arg is true
-			// (which it is by default) -- invalid UTF8 in the ABC == verify error.
-			if (!s)	
-				toplevel->throwVerifyError(kCorruptABCError);
-
-			// Jit skips WB on string constants so make them sticky
-			// fixme -- it's incorrect to skip WB's on const's, bug was fixed; is this still required?
-			s->Stick();
-
-			cpool_string.set(i, s);
-			pos += len;
-
-			if_verbose(
+#ifdef AVMPLUS_VERBOSE
+			if(pool->isVerbose(VB_parse)) {
 				core->console << "    " << offset << ":" << "cpool_string["<<i<<"]="
-					<<constantNames[CONSTANT_Utf8] << " ";
-				core->console << core->format(cpool_string[i]->atom());
+					<< constantNames[CONSTANT_Utf8] << " ";
+				core->console.write(pos, len);
 				core->console << "\n";
-			)
+			}
+#endif
+			// skip the UTF-8 string
+			pos += len;
 		}
+		pool->_abcStringEnd = pos;
 
 		uint32 ns_count = readU30(pos);
 		if (ns_count > (uint32)(abcEnd - pos))
@@ -1130,11 +1308,11 @@ namespace avmplus
 			CPoolKind kind = (CPoolKind) *(pos++);
 			switch(kind)
 			{
-				case CONSTANT_Namespace: 
+				case CONSTANT_Namespace:
                 case CONSTANT_PackageNamespace:
                 case CONSTANT_PackageInternalNs:
                 case CONSTANT_ProtectedNamespace:
-			    case CONSTANT_ExplicitNamespace:					
+			    case CONSTANT_ExplicitNamespace:
                 case CONSTANT_StaticProtectedNs:
 				{
 					uint32 index = readU30(pos);
@@ -1158,7 +1336,26 @@ namespace avmplus
                     if (index)
 					{
 						Stringp uri = resolveUtf8(index);
-						cpool_ns.set(i, core->internNamespace(core->newNamespace(uri, type)));
+						API api = ApiUtils::getURIAPI(core, uri);
+						if (api) {
+							uri = ApiUtils::getBaseURI(core, uri);
+						}
+						else {
+							if (pool->isBuiltin) {
+								// builtins are by default in the largest version
+								api = ApiUtils::getLargestAPI(core);
+							}
+							else {
+								api = pool->getAPI();
+							}
+
+							// finally, if it has as version mark then strip it. this only happens
+							// when asc and avm are out of sync, which is a contingency we support
+							if (ApiUtils::hasVersionMark(uri))
+								uri = ApiUtils::getBaseURI(core, uri);
+						}
+						Namespacep ns = core->internNamespace(core->newNamespace(uri, type, api));
+						cpool_ns.set(i, ns);
 					}
 					else
 					{
@@ -1182,12 +1379,14 @@ namespace avmplus
 					toplevel->throwVerifyError(kCpoolEntryWrongTypeError, core->toErrorString(i));
 				}
 			}
-			if_verbose(
+			#ifdef AVMPLUS_VERBOSE
+			if(pool->isVerbose(VB_parse)) {
 				core->console << "    " << offset << ":" << "cpool_ns["<<i<<"]="
 					<<constantNames[kind] << " ";
 				core->console << core->format(cpool_ns[i]->atom());
 				core->console << "\n";
-			)
+			}
+			#endif
 		}
 
 		uint32 ns_set_count = readU30(pos);
@@ -1211,48 +1410,42 @@ namespace avmplus
 			
 			if (ns_count > (uint32)(abcEnd - pos))
 				toplevel->throwVerifyError(kCorruptABCError);
-			NamespaceSet* namespace_set = core->newNamespaceSet(ns_count);
 
-			Namespacep* nss = namespace_set->namespaces;
+			NamespaceSet* namespace_set = NamespaceSet::_create(core->GetGC(), ns_count);
 			for(uint32 j=0; j < ns_count; ++j)
 			{
 				Namespacep ns = parseNsRef(pos);
 				if (!ns)
 					toplevel->throwVerifyError(kIllegalNamespaceError);
-				//namespace_set->namespaces[j] = ns;
-				WBRC(core->GetGC(), namespace_set, &nss[j], ns);
+				namespace_set->_initNsAt(j, ns);
 			}
 			cpool_ns_set.set(i, namespace_set);
 
-			if_verbose(
+			#ifdef AVMPLUS_VERBOSE
+			if(pool->isVerbose(VB_parse)) {
 				core->console << "    " << offset << ":" << "cpool_ns_set["<<i<<"]="
 					<<constantNames[CONSTANT_NamespaceSet] << " ";
 				core->console << cpool_ns_set[i]->format(core);
 				core->console << "\n";
-			)
+			}
+			#endif
 		}
 
 		uint32 mn_count = readU30(pos);
 		if (mn_count > (uint32)(abcEnd - pos))
 			toplevel->throwVerifyError(kCorruptABCError);
 
-		// TODO: why Atom?  its actually a list of positions
-		List<Atom, LIST_NonGCObjects> &cpool_mn = pool->cpool_mn;
+		List<uint32_t>& cpool_mn_offsets = pool->cpool_mn_offsets;
 
 		MMGC_MEM_TYPE(pool);
-		cpool_mn.ensureCapacity(mn_count);
-		pool->constantMnCount = mn_count;
+		cpool_mn_offsets.ensureCapacity(mn_count);
 
-#ifdef AVMPLUS_VERBOSE
-		startpos = pos;
-#endif
 		for(uint32_t i = 1; i < mn_count; ++i )
 		{
-#ifdef AVMPLUS_VERBOSE
-			int offset = (int)(pos-startpos);
-#endif
 			CHECK_POS(pos);
-			CPoolKind kind = (CPoolKind) *(pos++);
+			uint32_t const offset = uint32_t(pos - pool->_abcStart);
+			cpool_mn_offsets.set(i, offset);
+			CPoolKind kind = (CPoolKind)*pos++;
 			switch(kind)
 			{
 			case CONSTANT_Qname: 
@@ -1261,7 +1454,6 @@ namespace avmplus
 				// U16 namespace_index
 				// U16 name_index
 				// parse a multiname with one namespace (aka qname)
-				cpool_mn.set(i, pool->posToAtom(pos-1));
 				parseNsRef(pos);
 				parseName(pos);
 				break;
@@ -1272,22 +1464,18 @@ namespace avmplus
 			{
 				// U16 name_index
 				// parse a multiname with just a name; ns fetched at runtime
-				cpool_mn.set(i, pool->posToAtom(pos-1));
 				parseName(pos);
 				break;
 			}
 			case CONSTANT_RTQnameL:
 			case CONSTANT_RTQnameLA:
 			{
-				cpool_mn.set(i, pool->posToAtom(pos-1));
 				break;
 			}
 
 			case CONSTANT_Multiname:
 			case CONSTANT_MultinameA:
 			{
-				cpool_mn.set(i, pool->posToAtom(pos-1));
-   				
 				parseName(pos);
 				
 				uint32 index = readU30(pos);
@@ -1302,8 +1490,6 @@ namespace avmplus
 			case CONSTANT_MultinameL:
 			case CONSTANT_MultinameLA:
 			{
-				cpool_mn.set(i, pool->posToAtom(pos-1));
-   				
 				uint32 index = readU30(pos);
 
 				if (!index || index >= pool->constantNsSetCount)
@@ -1316,12 +1502,12 @@ namespace avmplus
 			
 			case CONSTANT_TypeName:
 			{
-				cpool_mn.set(i, pool->posToAtom(pos-1));
-
 				uint32 index = readU30(pos);
 
-				if(!index || index >= pool->constantMnCount)
-					toplevel->throwVerifyError(kCpoolIndexRangeError, core->toErrorString(index), core->toErrorString(pool->constantMnCount));
+                // compare index against mn_count, *not* cpool_mn_offsets.size(), as the latter is still being built...
+                // it's ok to forward-reference here.
+				if(!index || index >= mn_count)
+					toplevel->throwVerifyError(kCpoolIndexRangeError, core->toErrorString(index), core->toErrorString(mn_count));
 
 				index = readU30(pos);
 				if(index != 1)
@@ -1332,50 +1518,80 @@ namespace avmplus
 			default:
 				toplevel->throwVerifyError(kCpoolEntryWrongTypeError, core->toErrorString(i));
 			}
-			if_verbose(
+			#ifdef AVMPLUS_VERBOSE
+			if(pool->isVerbose(VB_parse)) {
 				core->console << "    " << offset << ":" << "cpool_mn["<<i<<"]="
 					<<constantNames[kind] << " ";
 				Multiname name;
 				pool->parseMultiname(name, i);
 				core->console << name;
 				core->console << "\n";
-			)
+			}
+			#endif
 		}
+    }
+
+    void AbcParser::addNamedTraits(NamespaceSetp nss, Stringp name, Traits* itraits)
+    {
+        // check to see if the base namespace has been added, if so then
+        // all versions have been added
+        Namespace* ns = nss->nsAt(0);
+        if (!ns->isPrivate()) {
+			// compute the compatible apis for all namespaces and construct a namespace
+			// with that composite api
+			API apis = 0;
+            for (NamespaceSetIterator iter(nss); iter.hasNext();) 
+            {
+                Namespacep nsi = iter.next();
+				AvmAssert(pool->isBuiltin && ApiUtils::isVersionedNS(core, nsi->getType(), nsi->getURI()) ? nsi->getAPI() != 0 : true);
+				apis |= ApiUtils::getCompatibleAPIs(core, nsi->getAPI());
+			}
+			ns = ApiUtils::getVersionedNamespace(core, ns, apis);
+			if (!domain->getNamedTrait(name, ns)) {
+				domain->addNamedTrait(name, ns, itraits);
+			}
+		}
+        else {
+            // duplicate class
+            //Multiname qname(ns,name);
+            //toplevel->definitionErrorClass()->throwError(kRedefinedError, core->toErrorString(&qname));
+        }
     }
 
 	void AbcParser::addNamedTraits(Namespacep ns, Stringp name, Traits* itraits)
 	{
-		if (!ns->isPrivate() && !domain->getNamedTrait(name, ns))
-		{
-			domain->addNamedTrait(name, ns, itraits);
-		}
-		else
-		{
-			// duplicate class
-			//Multiname qname(ns,name);
-			//toplevel->definitionErrorClass()->throwError(kRedefinedError, core->toErrorString(&qname));
-		}
+		addNamedTraits(NamespaceSet::create(core->GetGC(), ns), name, itraits);
 	}
-	
-	void AbcParser::addNamedScript(Namespacep ns, Stringp name, MethodInfo* script)
+
+	void AbcParser::addNamedScript(NamespaceSetp nss, Stringp name, MethodInfo* script)
 	{
-		MethodInfo* s = domain->getNamedScript(name, ns);
-		if (!s)
+		Namespacep ns = nss->nsAt(0); // just need one
+		if (ns->isPrivate()) 
 		{
-			if(ns->isPrivate())
+			pool->addPrivateNamedScript(name, ns, script);
+		}
+		else 
+		{
+			// use the first namespace to see if its been added
+			MethodInfo* s = domain->getNamedScript(name, ns);
+			if (!s)
 			{
-				pool->addPrivateNamedScript(name, ns, script);
+				API apis = 0;
+                for (NamespaceSetIterator iter(nss); iter.hasNext();) 
+                {
+                    Namespacep nsi = iter.next();
+					AvmAssert(pool->isBuiltin && ApiUtils::isVersionedNS(core, nsi->getType(), nsi->getURI()) ? nsi->getAPI() != 0 : true);
+					apis |= ApiUtils::getCompatibleAPIs(core, nsi->getAPI());
+				}
+				ns = ApiUtils::getVersionedNamespace(core, ns, apis);
+				domain->addNamedScript(name, ns, script);
 			}
 			else
 			{
-				domain->addNamedScript(name, ns, script);
+				// duplicate definition
+				//Multiname qname(ns, name);
+				//toplevel->definitionErrorClass()->throwError(kRedefinedError, core->toErrorString(&qname));
 			}
-		}
-		else
-		{
-			// duplicate definition
-			//Multiname qname(ns, name);
-			//toplevel->definitionErrorClass()->throwError(kRedefinedError, core->toErrorString(&qname));
 		}
 	}
 
@@ -1392,9 +1608,11 @@ namespace avmplus
 
 		uint32_t count = readU30(pos);
 
-		if_verbose(
+		#ifdef AVMPLUS_VERBOSE
+		if(pool->isVerbose(VB_parse)) {
 			core->console << "script_count=" << count << "\n";
-		)
+		}
+		#endif
 
 #ifdef AVMPLUS_VERBOSE
 		const byte* startpos = pos;
@@ -1408,8 +1626,7 @@ namespace avmplus
 		if (count > (uint32)(abcEnd - pos))
 			toplevel->throwVerifyError(kCorruptABCError);
 
-		pool->scripts.ensureCapacity(count);
-		pool->scriptCount = count;
+		pool->_scripts.ensureCapacity(count);
 
 		// make global objects subclasses of Object
 
@@ -1419,27 +1636,31 @@ namespace avmplus
 
 			int init_index = readU30(pos);
 
-			if_verbose(
+			#ifdef AVMPLUS_VERBOSE
+			if(pool->isVerbose(VB_parse)) {
 				core->console << "    " << (int)(script_pos-startpos) << ":script[" << i << "]"
 					<< " init_index=" << init_index
 					<< "\n";
-			)
+			}
+			#endif
 			MethodInfo* script = resolveMethodInfo(init_index);
+			Traits* declaringTraits = script->declaringTraits();
 
-			if (script->declaringTraits() != NULL)
+			if (declaringTraits != NULL)
 			{
 				// method has already been bound to a different type.  Can't bind it twice because
 				// it can only have one environment, for its scope chain and super references.
-				toplevel->throwVerifyError(kAlreadyBoundError, core->toErrorString(script), core->toErrorString(script->declaringTraits()));
+				toplevel->throwVerifyError(kAlreadyBoundError, core->toErrorString(script), core->toErrorString(declaringTraits));
 			}
 
-			Traits* traits = parseTraits(sizeof(ScriptObject), 
+			Traits* traits = parseTraits(sizeof(ScriptObject),
+											sizeof(ScriptObject),
 											core->traits.object_itraits, 
-											core->publicNamespace, 
+											core->getPublicNamespace(pool), 
 											core->kglobal, 
 											script, 
 											script_pos,
-											TRAITSTYPE_SCRIPT_FROM_ABC,
+											TRAITSTYPE_SCRIPT,
 											NULL);
 
 			if( !traits ) return false; // parseTraits failed
@@ -1460,22 +1681,23 @@ namespace avmplus
 			}
 			#endif
 
-			pool->scripts.set(i, script);
-
-			// initial scope chain is []
-			traits->set_scope(ScopeTypeChain::createEmpty(core->GetGC()));
+			pool->_scripts.set(i, traits);
+#ifdef VMCFG_AOT
+			pool->aotInfo->scriptTraits[i] = traits;
+#endif
 		}
 
 		return true;
 	}
 
 	bool AbcParser::parseInstanceInfos()
-    {
-        classCount = readU30(pos);
-
-		if_verbose(
+	{
+		classCount = readU30(pos);
+#ifdef AVMPLUS_VERBOSE
+		if(pool->isVerbose(VB_parse)) {
 			core->console << "class_count=" << classCount <<"\n";
-		)
+		}
+#endif
 
 #ifdef AVMPLUS_VERBOSE
 		const byte* startpos = pos;
@@ -1494,18 +1716,28 @@ namespace avmplus
 
 		instances.ensureCapacity(classCount);
 
-        for (uint32_t i=0; i < classCount; i++)
-        {
-            const byte* instancepos = pos;
+		for (uint32_t i=0; i < classCount; i++)
+		{
+			const byte* instancepos = pos;
 
-            // CONSTANT_QName name of this class
+			// CONSTANT_QName name of this class
+
+			Multiname mn;
+			resolveQName(pos, mn);
 			Namespacep ns;
 			Stringp name;
-
-			Multiname qname;
-			resolveQName(pos, qname);
-			ns = qname.getNamespace();
-			name = qname.getName();
+			name = mn.getName();
+			const NamespaceSet* nss;
+			if (mn.namespaceCount() > 1) 
+			{
+				nss = mn.getNsset();
+				ns = nss->nsAt(0);
+			}
+			else 
+			{
+				ns = mn.getNamespace();
+				nss = NamespaceSet::create(core->GetGC(), ns);
+			}
 
 			// resolving base class type means class heirarchy must be a Tree
 			Traits* baseTraits = pool->resolveTypeName(pos, toplevel);
@@ -1516,22 +1748,24 @@ namespace avmplus
 				(FUNCTION_TYPE != NULL && baseTraits == FUNCTION_TYPE && !pool->isBuiltin))
 			{
 				// error - attempt to extend final class
-				if_verbose(
-					core->console << qname << " can't extend final class " << baseTraits << "\n";
-				)
-				toplevel->throwVerifyError(kCannotExtendFinalClass, core->toErrorString(&qname));
+                #ifdef AVMPLUS_VERBOSE
+				if(pool->isVerbose(VB_parse)) {
+					core->console << mn << " can't extend final class " << baseTraits << "\n";
+				}
+                #endif
+				toplevel->throwVerifyError(kCannotExtendFinalClass, core->toErrorString(&mn));
 			}
 
-			if (baseTraits && baseTraits->isInterface)
+			if (baseTraits && baseTraits->isInterface())
 			{
 				// error, can't extend interface
-				toplevel->throwVerifyError(kCannotExtendError, core->toErrorString(&qname), core->toErrorString(baseTraits));
+				toplevel->throwVerifyError(kCannotExtendError, core->toErrorString(&mn), core->toErrorString(baseTraits));
 			}
 
-            // read flags:	bit 0: sealed
+			// read flags:	bit 0: sealed
 			//				bit 1: final
-			//              bit 2: interface
-			//              bit 3: protected
+			//				bit 2: interface
+			//				bit 3: protected
 			CHECK_POS(pos);
 			int flags = *pos++;
 
@@ -1542,34 +1776,38 @@ namespace avmplus
 				protectedNamespace = parseNsRef(pos);
 			}
 			
-            int interfaceCount = readU30(pos);
+			int interfaceCount = readU30(pos);
 			const byte* interfacePos = pos;
 
 			if(interfaceCount)
 			{
+				if (interfaceCount >= 0x10000000)
+					toplevel->throwVerifyError(kCorruptABCError);
+
 				for( int x = 0; x < interfaceCount; ++ x )
 				{
 					Traits *t = pool->resolveTypeName(pos, toplevel);
-					if (!t || !t->isInterface)
+					if (!t || !t->isInterface())
 					{
-						// error, can't extend interface
-						toplevel->throwVerifyError(kCannotImplementError, core->toErrorString(&qname), core->toErrorString(t));
+						// error, can't implement non-interface type
+						toplevel->throwVerifyError(kCannotImplementError, core->toErrorString(&mn), core->toErrorString(t));
 					}
 				}
 			}
 
-			// TODO make sure the inheritance is legal.  
-			//  - can't override final members
-			//  - overrides agree with base class signature
+			// TODO make sure the inheritance is legal.	 
+			//	- can't override final members
+			//	- overrides agree with base class signature
 			
-            uint32_t iinit_index = readU30(pos);
+			uint32_t iinit_index = readU30(pos);
 			MethodInfo* iinit = resolveMethodInfo(iinit_index);
 
-			if_verbose(
+#ifdef AVMPLUS_VERBOSE
+			if(pool->isVerbose(VB_parse)) {
 				// TODO:  fixup this math here, since the 2's are all wrong
 				core->console
-					<< "    " << (int)(instancepos-startpos) << ":instance[" << i << "]"
-					<< " " << qname;
+					<< "	" << (int)(instancepos-startpos) << ":instance[" << i << "]"
+					<< " " << mn;
 
 				if (baseTraits)
 					core->console << " extends " << baseTraits;
@@ -1578,16 +1816,21 @@ namespace avmplus
 					<< " interface_count=" << interfaceCount
 					<< " iinit_index=" << iinit_index
 					<< "\n";
-			)
-
-			Traits* itraits = parseTraits(computeInstanceSize(i, baseTraits), 
-											baseTraits, 
-											ns, 
-											name, 
-											0, 
-											instancepos,
-											TRAITSTYPE_INSTANCE_FROM_ABC, 
-											protectedNamespace);
+			}
+#endif
+			TraitsPosType postype = (flags & 4) ? TRAITSTYPE_INTERFACE : TRAITSTYPE_INSTANCE;
+			uint16_t sizeofInstance = 0;
+			uint16_t offsetofSlots = 0;
+			computeInstanceSizeAndSlotsOffset(i, baseTraits, sizeofInstance, offsetofSlots);
+			Traits* itraits = parseTraits(sizeofInstance, 
+										  offsetofSlots,  
+										  baseTraits, 
+										  ns, 
+										  name, 
+										  0, 
+										  instancepos,
+										  postype, 
+										  protectedNamespace);
 			if( !itraits ) return false;
 			if (!baseTraits && core->traits.object_itraits == NULL)
 			{
@@ -1598,41 +1841,44 @@ namespace avmplus
 
 			// AS3 language decision: dynamic is not inherited.
 			itraits->set_needsHashtable((flags&1) == 0);
-			itraits->final   = (flags&2) != 0;
+			itraits->final	 = (flags&2) != 0;
 
-			if (flags & 4)
+			if (itraits->isInterface())
 			{
-				itraits->isInterface = true;
-
 				// check for slotCount != 0 now done at resolve time
 
 				// interface base must be *
 				if (baseTraits)
 				{
 					// error, can't extend this type
-					toplevel->throwVerifyError(kCannotExtendError, core->toErrorString(&qname), core->toErrorString(baseTraits));
+					toplevel->throwVerifyError(kCannotExtendError, core->toErrorString(&mn), core->toErrorString(baseTraits));
 				}
 			}
 
-			if (iinit->declaringTraits() != NULL)
+			Traits* declaringTraits = iinit->declaringTraits();
+			if (declaringTraits != NULL)
 			{
 				// method has already been bound to a different type.  Can't bind it twice because
 				// it can only have one environment, for its scope chain and super references.
-				toplevel->throwVerifyError(kAlreadyBoundError, core->toErrorString(iinit), core->toErrorString(iinit->declaringTraits()));
+				toplevel->throwVerifyError(kAlreadyBoundError, core->toErrorString(iinit), core->toErrorString(declaringTraits));
 			}
 
 			iinit->makeMethodOf(itraits);
 			itraits->init = iinit;
 
-			// parse the interfaces.  resolving type refs here means interface heirarchy must be a DAG.
+#ifdef AVMPLUS_VERBOSE
+			// print the interfaces.  interfaces have been resolved above so any
+			// errors would have been reported earlier.
 			for (int j=0, n=interfaceCount; j < n; j++)
 			{
 				Traits *interfaceTraits = pool->resolveTypeName(interfacePos, toplevel);
-				(void)interfaceTraits;
-				if_verbose(
-					core->console << "        interface["<<j<<"]=" << interfaceTraits <<"\n";
-				)
+				if(pool->isVerbose(VB_parse)) {
+					core->console << "		  interface["<<j<<"]=" << interfaceTraits <<"\n";
+				}
 			}
+#else
+			(void)interfacePos;
+#endif
 						
 			instances.set(i, itraits);
 
@@ -1643,9 +1889,9 @@ namespace avmplus
 			else
 			{
 				// error, can't redefine a class or interface
-				//toplevel->definitionErrorClass()->throwError(kRedefinedError, core->toErrorString(&qname));
+				//toplevel->definitionErrorClass()->throwError(kRedefinedError, core->toErrorString(&mn));
 			}
-        }
+		}
 
 		return true;
     }
@@ -1665,15 +1911,16 @@ namespace avmplus
         {
             // CONSTANT_Multiname name of this class
 			Traits* itraits = instances[i];
-			Namespacep ns = itraits->ns;
-			Stringp name = itraits->name;
+			Namespacep ns = itraits->ns();
+			Stringp name = itraits->name();
 
 			const byte* class_pos = pos;
 
 			uint32_t cinit_index = readU30(pos);
             MethodInfo* cinit = resolveMethodInfo(cinit_index);
 
-			if_verbose(
+			#ifdef AVMPLUS_VERBOSE
+			if(pool->isVerbose(VB_parse)) {
 				core->console
 					<< "    " << (int)(class_pos-startpos) << ":class[" << i << "]"
 					<< " " << ns << "::" << name;
@@ -1681,25 +1928,29 @@ namespace avmplus
 				core->console
 					<< " cinit_index=" << cinit_index
 					<< "\n";
-			)
+			}
+			#endif
 
 			const NativeClassInfo* nativeEntry = natives ? natives->get_class(i) : NULL;
-			Traits* ctraits = parseTraits(nativeEntry && nativeEntry->sizeofClass ? nativeEntry->sizeofClass : sizeof(ClassClosure),
+			bool haveClassNativeInfo = nativeEntry && nativeEntry->sizeofClass;
+			Traits* ctraits = parseTraits(haveClassNativeInfo ? nativeEntry->sizeofClass : sizeof(ClassClosure),
+											haveClassNativeInfo ? nativeEntry->offsetofSlotsClass : sizeof(ClassClosure), 
 											CLASS_TYPE, 
 											ns, 
 											core->internString(core->concatStrings(name, core->newConstantStringLatin1("$"))), 
 											NULL, 
 											class_pos,
-											TRAITSTYPE_CLASS_FROM_ABC, 
+											TRAITSTYPE_CLASS, 
 											itraits->protectedNamespace);
 
 			ctraits->setCreateClassClosureProc(nativeEntry ? nativeEntry->createClassClosure : NULL);
 
-			if (cinit->declaringTraits() != NULL)
+			Traits* declaringTraits = cinit->declaringTraits();
+			if (declaringTraits != NULL)
 			{
 				// method has already been bound to a different type.  Can't bind it twice because
 				// it can only have one environment, for its scope chain and super references.
-				toplevel->throwVerifyError(kAlreadyBoundError, core->toErrorString(cinit), core->toErrorString(cinit->declaringTraits()));
+				toplevel->throwVerifyError(kAlreadyBoundError, core->toErrorString(cinit), core->toErrorString(declaringTraits));
 			}
 			
 			cinit->makeMethodOf(ctraits);

@@ -50,14 +50,17 @@ namespace avmshell
 		void init(DomainObject *base);
 		Atom loadBytes(ByteArrayObject *bytes);
 		ClassClosure* getClass(Stringp name);
- 		ScriptObject *get_domainMemory() const;
- 		void set_domainMemory(ScriptObject *mem);
+		// AS3 declaration requires these are ByteArrayObject
+ 		ByteArrayObject* get_domainMemory() const;
+ 		void set_domainMemory(ByteArrayObject* mem);
 		
 		DWB(DomainEnv*) domainEnv;
 		DWB(Toplevel*) domainToplevel;
 
 	  private:
 	    ScriptObject* finddef(const Multiname& multiname, DomainEnv* domainEnv);
+		
+		DECLARE_SLOTS_DomainObject;
 	};
 
 	class DomainClass : public ClassClosure
@@ -69,6 +72,8 @@ namespace avmshell
 
 		DomainObject* get_currentDomain();
  		int get_MIN_DOMAIN_MEMORY_LENGTH();
+		
+		DECLARE_SLOTS_DomainClass;
 	};
 }
 

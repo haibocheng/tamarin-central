@@ -165,14 +165,25 @@ namespace avmplus
 		return a;
 	}
 
-	static void addBindings(MultinameHashtable* bindings, TraitsBindingsp tb, uint32_t flags)
+	void TypeDescriber::addBindings(AvmCore* core, MultinameHashtable* bindings, TraitsBindingsp tb, uint32_t flags)
 	{
 		if (!tb) return;
 		if ((flags & TypeDescriber::HIDE_OBJECT) && !tb->base) return;
-		addBindings(bindings, tb->base, flags);
-		for (int32_t index = 0; (index = tb->next(index)) != 0; )
+		addBindings(core, bindings, tb->base, flags);
+		StTraitsBindingsIterator iter(tb);
+		uint32_t curapi = core->getAPI(NULL);
+		while (iter.next())
 		{
-			bindings->add(tb->keyAt(index), tb->nsAt(index), tb->valueAt(index));
+			if (!iter.key()) continue;
+			Namespacep ns = iter.ns();
+			if (ApiUtils::isVersionedNS(core, ns->getType(), ns->getURI())) {
+				// Skip names that don't match the current version
+				API api = iter.apis();
+				if (!(curapi & api)) {
+					continue;
+				}
+			}
+			bindings->add(iter.key(), iter.ns(), iter.value());
 		}
 	}
 	
@@ -196,7 +207,7 @@ namespace avmplus
 		ArrayObject* variables = NULL;
 		ScriptObject* constructor = NULL;
 
-		if (flags & INCLUDE_BASES)
+		if (flags & INCLUDE_METADATA)
 		{
 			metadata = new_array();
 			PoolObject* class_mdpool;
@@ -215,21 +226,10 @@ namespace avmplus
 		if (flags & INCLUDE_INTERFACES)
 		{
 			interfaces = new_array();
-			// our TraitsBindings only includes our own interfaces, not any we might have inherited, 
-			// so walk the tree. there might be redundant interfaces listed in the inheritance, 
-			// so use a list to remove dupes
-			List<Traitsp> unique(gc);
-			for (TraitsBindingsp tbi = tb; tbi; tbi = tbi->base) 
+			for (InterfaceIterator iter(traits); iter.hasNext();)
 			{
-				for (uint32_t i = 0; i < tbi->interfaceCapacity; ++i)
-				{
-					Traitsp ti = tbi->getInterface(i);
-					if (ti && ti->isInterface && unique.indexOf(ti) < 0)
-					{
-						unique.add(ti);
-						pushstr(interfaces, describeClassName(ti));
-					}
-				}
+				Traits* ti = iter.next();
+				pushstr(interfaces, describeClassName(ti));
 			}
 		}
 
@@ -255,26 +255,19 @@ namespace avmplus
 			// make a flattened set of bindings so we don't have to check for overrides as we go.
 			// This is not terribly efficient, but doesn't need to be.
 			MultinameHashtable* mybind = new (gc) MultinameHashtable();
-			addBindings(mybind, tb, flags);
+			addBindings(m_toplevel->core(), mybind, tb, flags);
 
 			// Don't want interface methods, so post-process and wipe out any
-			// bindings that were added. Be sure to walk up the inheritance
-			// chain to get interfaces implemented by our ancestors but not us.
-			for (TraitsBindingsp bb = tb; bb; bb = bb->base) 
+			// bindings that were added.
+			for (InterfaceIterator ifc_iter(traits); ifc_iter.hasNext();)
 			{
-				for (uint32_t i = 0; i < bb->interfaceCapacity; ++i)
+				Traitsp ti = ifc_iter.next();
+				TraitsBindingsp tbi = ti->getTraitsBindings();
+				StTraitsBindingsIterator iter(tbi);
+				while (iter.next())
 				{
-					Traitsp ti = bb->getInterface(i);
-					if (ti && ti->isInterface)
-					{
-						TraitsBindingsp tbi = ti->getTraitsBindings();
-						for (int32_t index = 0; (index = tbi->next(index)) != 0; )
-						{
-							Stringp name = tbi->keyAt(index);
-							Namespacep ns = tbi->nsAt(index);
-							mybind->add(name, ns, BIND_NONE);
-						}
-					}
+					if (!iter.key()) continue;
+					mybind->add(iter.key(), iter.ns(), BIND_NONE);
 				}
 			}
 			
@@ -284,9 +277,11 @@ namespace avmplus
 			{
 				for (TraitsBindingsp tbi = tb->base; tbi; tbi = tbi->base) 
 				{
-					for (int32_t index = 0; (index = tbi->next(index)) != 0; )
+					StTraitsBindingsIterator iter(tbi);
+					while (iter.next())
 					{
-						Namespacep ns = tbi->nsAt(index);
+						if (!iter.key()) continue;
+						Namespacep ns = iter.ns();
 						if (ns->getURI()->length() > 0 && nsremoval.indexOf(ns) < 0)
 						{
 							nsremoval.add(ns);
@@ -295,11 +290,13 @@ namespace avmplus
 				}
 			}
 
-			for (int32_t index = 0; (index = mybind->next(index)) != 0; )
+			StMNHTIterator iter(mybind);
+			while (iter.next())
 			{
-				Binding binding = mybind->valueAt(index);
-				Stringp name = mybind->keyAt(index);
-				Namespacep ns = mybind->nsAt(index);
+				if (!iter.key()) continue;
+				Stringp name = iter.key();
+				Namespacep ns = iter.ns();
+				Binding binding = iter.value();
 				Stringp nsuri = ns->getURI();
 				TraitsMetadata::MetadataPtr md1 = NULL;
 				TraitsMetadata::MetadataPtr md2 = NULL;
@@ -307,12 +304,13 @@ namespace avmplus
 				PoolObject* md2pool = NULL;
 
 				// We only display public members -- exposing private namespaces could compromise security.
-				if (ns->getType() != Namespace::NS_Public) 
+				if (ns->getType() != Namespace::NS_Public) {
 					continue;
+				}
 				
-				if ((flags & HIDE_NSURI_METHODS) && nsremoval.indexOf(ns) >= 0)
+				if ((flags & HIDE_NSURI_METHODS) && nsremoval.indexOf(ns) >= 0) {
 					continue;
-			
+				}			
 				ScriptObject* v = new_object();
 
 				const BindingKind bk = AvmCore::bindingKind(binding);
@@ -387,7 +385,7 @@ namespace avmplus
 							uint8_t(kstrid_emptyString),	// BKIND_METHOD
 							uint8_t(kstrid_emptyString),	// BKIND_VAR
 							uint8_t(kstrid_emptyString),	// BKIND_CONST
-							uint8_t(kstrid_emptyString),	// BKIND_ITRAMP
+							uint8_t(kstrid_emptyString),	// unused
 							uint8_t(kstrid_readonly),		// BKIND_GET
 							uint8_t(kstrid_writeonly),		// BKIND_SET
 							uint8_t(kstrid_readwrite)		// BKIND_GETSET
@@ -514,22 +512,46 @@ namespace avmplus
 
 	Stringp TypeDescriber::poolstr(PoolObject* pool, uint32_t index)
 	{
-		Stringp name = index < pool->cpool_string.size() ? pool->cpool_string[index] : NULL;
-		return name ? name : str(kstrid_emptyString);
+		return index < pool->constantStringCount ? pool->getString(index) : str(kstrid_emptyString);
 	}
 	
-	ScriptObject* TypeDescriber::describeType(Atom value, uint32_t flags)
+    // bug comaptibility note: FP10 and earlier sniffed the Atom type and return 'int' for
+    // all integer atoms. This is wrong, but we should preserve the behavior. Note that we
+    // compare the numeric range: doesn't matter for 32-bit builds, but 64-builds have larger
+    // possible int atoms, so this preserves the existing behavior of "29-bit int -> int" even
+    // on 64-bit systems. 
+    static bool isIntAtom29Bit(Atom value)
+    {
+        if (atomIsIntptr(value))
+        {
+            intptr_t const i = atomGetIntptr(value);
+            int32_t const i32 = (int32_t(i)<<3)>>3;
+            return i == intptr_t(i32);
+        }
+        return false;
+    }
+
+	Traits* TypeDescriber::chooseTraits(Atom value, uint32_t flags)
 	{
 		Traitsp traits;
 		if (value == undefinedAtom)
 			traits = m_toplevel->core()->traits.void_itraits;
 		else if (ISNULL(value))
 			traits = m_toplevel->core()->traits.null_itraits;
+		else if (isIntAtom29Bit(value))
+			traits = m_toplevel->core()->traits.int_itraits;
 		else
 			traits = m_toplevel->toTraits(value);
 
 		if (flags & USE_ITRAITS)
 			traits = traits->itraits;
+        
+        return traits;
+    }
+    
+	ScriptObject* TypeDescriber::describeType(Atom value, uint32_t flags)
+	{
+		Traitsp traits = chooseTraits(value, flags);
 
 		if (!traits)
 			return NULL;
@@ -546,5 +568,27 @@ namespace avmplus
 		setpropmulti(o, props, elem_count(props));
 
 		return o;
+	}
+
+	Stringp TypeDescriber::getQualifiedClassName(Atom value)
+	{
+		Traitsp traits = chooseTraits(value, 0);
+        return traits ? describeClassName(traits) : NULL;
+	}
+
+	Stringp TypeDescriber::getQualifiedSuperclassName(Atom value)
+	{
+		// getQualifiedSuperclassName explicitly allows us to pass Class or Instance,
+		// and either should resolve to super of Instance
+		Traitsp traits = chooseTraits(value, 0);
+        if (!traits)
+            return NULL;
+            
+		if (traits->itraits)
+			traits = traits->itraits;
+        
+        return traits->base && traits->base != m_toplevel->core()->traits.class_itraits ? 
+                describeClassName(traits->base) : 
+                NULL;
 	}
 }

@@ -41,8 +41,6 @@
 
 namespace avmplus
 {
-#undef DEBUG_EARLY_BINDING
-
 	Toplevel::Toplevel(AbcEnv* abcEnv) : 
 		_abcEnv(abcEnv),
 		_builtinClasses(NULL),
@@ -53,22 +51,26 @@ namespace avmplus
 		AvmCore* core = this->core();
 		MMgc::GC* gc = core->GetGC();
 		PoolObject* pool = abcEnv->pool();
-		Traits* mainTraits = pool->scripts[pool->scriptCount-1]->declaringTraits();
-
-		// ISSUE can we just make this the public namespace?
-		ScopeChain* emptyScope = ScopeChain::create(gc, mainTraits->scope(), NULL, core->newNamespace(core->kEmptyString));
+		Traits* mainTraits = pool->getScriptTraits(pool->scriptCount()-1);
 
 			// create a temp object vtable to use, since the real one isn't created yet
 			// later, in OP_newclass, we'll replace with the real Object vtable, so methods
 			// of Object and Class have the right scope.
-		object_ivtable = core->newVTable(core->traits.object_itraits, NULL, emptyScope, abcEnv, NULL);
-		object_ivtable->resolveSignatures();
+		object_ivtable = core->newVTable(core->traits.object_itraits, NULL, NULL);
+		Namespacep publicNS = core->getPublicNamespace(core->getDefaultAPI());
+		ScopeChain* object_iscope = ScopeChain::create(gc, object_ivtable, abcEnv, core->traits.object_istc, NULL, publicNS);
+		object_ivtable->resolveSignatures(object_iscope);
 
 		// global objects are subclasses of Object
-		VTable* mainVTable = core->newVTable(mainTraits, object_ivtable, emptyScope, abcEnv, this);
-		ScriptEnv* main = new (gc) ScriptEnv(mainTraits->init, mainVTable);
+		bool wasResolved = mainTraits->isResolved();
+		VTable* mainVTable = core->newVTable(mainTraits, object_ivtable, this);
+		AvmAssert(mainTraits->isResolved());
+		if (!wasResolved)
+			mainTraits->init_declaringScopes(ScopeTypeChain::createEmpty(core->GetGC(), mainTraits));
+		ScriptEnv* main = new (gc) ScriptEnv(mainTraits->init, mainVTable, abcEnv);
 		mainVTable->init = main;
-		mainVTable->resolveSignatures();
+		toplevel_scope = ScopeChain::create(gc, mainVTable, abcEnv, mainTraits->init->declaringScope(), NULL, publicNS);
+		mainVTable->resolveSignatures(toplevel_scope);
 
 		_global = new (gc, mainVTable->getExtraSize()) ScriptObject(mainVTable, NULL);
 		main->global = _global;
@@ -76,8 +78,9 @@ namespace avmplus
 		// create temporary vtable for Class, so we have something for OP_newclass
 		// to use when it creates Object$ and Class$.  once that happens, we replace
 		// with the real Class$ vtable.
-		class_ivtable = core->newVTable(core->traits.class_itraits, object_ivtable, emptyScope, abcEnv, this);
-		class_ivtable->resolveSignatures();
+		class_ivtable = core->newVTable(core->traits.class_itraits, object_ivtable, this);
+		ScopeChain* class_iscope = ScopeChain::create(gc, class_ivtable, abcEnv, core->traits.class_istc, NULL, publicNS);
+		class_ivtable->resolveSignatures(class_iscope);
 
 		core->exportDefs(mainTraits, main);
 	}
@@ -92,7 +95,7 @@ namespace avmplus
 	ClassClosure* Toplevel::findClassInPool(int class_id, PoolObject* pool)
 	{
 		Traits* traits = pool->getClassTraits(class_id)->itraits;
-		Multiname qname(traits->ns, traits->name);
+		Multiname qname(traits->ns(), traits->name());
 		AvmAssert(_global != NULL);
 		ScriptObject* container = _global->vtable->init->finddef(&qname);
 
@@ -113,7 +116,7 @@ namespace avmplus
 	{
 		if (!AvmCore::isNullOrUndefined(atom))
 		{
-			switch (atom&7)
+			switch (atomKind(atom))
 			{
 			default:
 			
@@ -127,7 +130,7 @@ namespace avmplus
 				return AvmCore::atomToScriptObject(atom)->getDelegate();
 
 			case kDoubleType:
-			case kIntegerType:
+			case kIntptrType:
 				// ISSUE what about int?
 				return numberClass->prototype;
 
@@ -144,44 +147,13 @@ namespace avmplus
 			return NULL;
 		}
 	}
-
-	// equivalent to ToObject, obj->traits.  exception if null or undefined.
-	VTable* Toplevel::toVTable(Atom atom)
-	{
-		if (!AvmCore::isNullOrUndefined(atom))
-		{
-			switch (atom&7)
-			{
-			case kObjectType:
-				return AvmCore::atomToScriptObject(atom)->vtable;
-			case kNamespaceType:
-				return namespaceClass->ivtable();
-			case kStringType:
-				return stringClass->ivtable();
-			case kBooleanType:
-				return booleanClass->ivtable();
-			case kIntegerType:
-			case kDoubleType:
-				// ISSUE what about int?
-				return numberClass->ivtable();
-			}
-		}
-		else
-		{
-            // TypeError in ECMA
-			throwTypeError(
-					(atom == undefinedAtom) ? kConvertUndefinedToObjectError :
-										kConvertNullToObjectError);
-		}
-		return NULL;
-	}
 	
-	// equivalent to ToObject, obj->traits.  exception if null or undefined.
+	// equivalent to ToObject, obj->vtable->traits.  exception if null or undefined.
 	Traits* Toplevel::toTraits(Atom atom)
 	{
 		if (!AvmCore::isNullOrUndefined(atom))
 		{
-			switch (atom&7)
+			switch (atomKind(atom))
 			{
 			case kObjectType:
 				return AvmCore::atomToScriptObject(atom)->traits();
@@ -191,7 +163,7 @@ namespace avmplus
 				return core()->traits.string_itraits;
 			case kBooleanType:
 				return core()->traits.boolean_itraits;
-			case kIntegerType:
+			case kIntptrType:
 			case kDoubleType:
 				// ISSUE what about int?
 				return core()->traits.number_itraits;
@@ -211,68 +183,13 @@ namespace avmplus
 		return NULL;
 	}
 	
-    /**
-     * OP_call.
-     *
-     * arg0 = argv[0]
-     * arg1 = argv[1]
-     * argN = argv[argc]
-     */
-    Atom Toplevel::op_call(Atom method, int argc, Atom* atomv)
-    {
-		// The construction of the multiname and the resulting error string is
-		// delegated because in-lining it here prevents the call to call() from
-		// being a tail call - the address of a local multiname is taken, this
-		// makes GCC (arguably incorrectly, given the scope of the variable)
-		// turn off tail calling.
-		
-		if (!AvmCore::isObject(method))
-			throwTypeErrorWithName(kCallOfNonFunctionError, "value");
-		
-		return AvmCore::atomToScriptObject(method)->call(argc, atomv);
-    }
-
-    /**
-     * OP_construct.  Note that arguments are in the opposite order from AVM.
-     *
-	 * this = argv[0] // ignored
-     * arg1 = argv[1]
-     * argN = argv[argc]
-     */
-    Atom Toplevel::op_construct(Atom ctor, int argc, Atom* atomv)
-    {
-		if (!AvmCore::isObject(ctor))
-		{
-			throwTypeError(kConstructOfNonFunctionError);
-		}
-
-		ScriptObject *ct = AvmCore::atomToScriptObject(ctor);
-		Atom val = ct->construct(argc, atomv);
-		return val;
-	}
-
-	/**
-	* OP_applytype.
-	*
-	* arg1 = argv[0]
-	* argN = argv[argc-1]
-	*/
-	Atom Toplevel::op_applytype(Atom factory, int argc, Atom* atomv)
-	{
-		if (!AvmCore::isObject(factory))
-		{
-			throwTypeError(kTypeAppOfNonParamType);
-		}
-		return AvmCore::atomToScriptObject(factory)->applyTypeArgs(argc, atomv);
-	}
-	
 	// E4X 10.5.1, pg 37
 	QNameObject* Toplevel::ToAttributeName(Atom attributeName)
 	{
 		if (!AvmCore::isNullOrUndefined(attributeName))
 		{
 			AvmCore* core = this->core();
-			switch (attributeName&7)
+			switch (atomKind(attributeName))
 			{
 			case kNamespaceType:
 				attributeName = AvmCore::atomToNamespace(attributeName)->getURI()->atom();
@@ -304,7 +221,7 @@ namespace avmplus
 					break;
 				}
 			case kBooleanType:
-			case kIntegerType:
+			case kIntptrType:
 			case kDoubleType:
 			default: // number
 				throwTypeError(kConvertUndefinedToObjectError);
@@ -320,7 +237,7 @@ namespace avmplus
 	}
 
 	// E4X 10.6.1, page 38
-	// This returns a Multiname create from a unqualified generic type.
+	// This returns a Multiname created from a unqualified generic type.
 	// The multiname returned will have one namespace and will be correctly
 	// marked as an attribute if input is an attribute
 	void Toplevel::ToXMLName(const Atom p, Multiname& m) 
@@ -330,7 +247,7 @@ namespace avmplus
 
 		if (!AvmCore::isNullOrUndefined(p))
 		{
-			switch (p & 7)
+			switch (atomKind(p))
 			{
 			case kNamespaceType:
 				s = AvmCore::atomToNamespace(p)->getURI();
@@ -348,7 +265,7 @@ namespace avmplus
 						QNameObject *q = AvmCore::atomToQName(p);
 
 						m.setAttr(q->isAttr() ? true : false);
-						m.setNamespace(core->newNamespace(q->get_uri()));
+						m.setNamespace(core->newNamespace(q->getURI()));
 						Stringp name = q->get_localName();
 						if (name == core->kAsterisk)
 						{
@@ -366,7 +283,7 @@ namespace avmplus
 						break;
 					}
 				}
-			case kIntegerType:
+			case kIntptrType:
 			case kDoubleType:
 			case kStringType:
 			case kBooleanType:
@@ -405,7 +322,8 @@ namespace avmplus
 			m.setAnyName(); // marks it as an anyName
 		}
 
-		m.setNamespace(core->publicNamespace);
+		// NOTE need a public, so use the caller's public
+		m.setNamespace(core->findPublicNamespace());
 	}
 
 	void Toplevel::CoerceE4XMultiname(const Multiname *m, Multiname &out)
@@ -460,14 +378,14 @@ namespace avmplus
 				if (!bMatch)
 				{
 					int newNameCount = m->namespaceCount() + 1;
-					NamespaceSet *nsset = core->newNamespaceSet(newNameCount);
+					NamespaceSet* nsset = NamespaceSet::_create(core->GetGC(), newNameCount);
 					for (int i=0, n=m->namespaceCount(); i < n; i++)
 					{
-						nsset->namespaces[i] = m->getNamespace(i);
+						nsset->_initNsAt(i, m->getNamespace(i));
 					}
 					//Stringp s1 = string(getDefaultNamespace()->getPrefix());
 					//Stringp s2 = string(getDefaultNamespace()->getURI());
-					nsset->namespaces[newNameCount-1] = this->getDefaultNamespace();
+					nsset->_initNsAt(newNameCount-1, this->getDefaultNamespace());
 					out.setNsset(nsset);
 				}
 				else
@@ -526,137 +444,10 @@ namespace avmplus
 		}
 	}
 
-	Atom Toplevel::callproperty(Atom base, const Multiname* multiname, int argc, Atom* atomv, VTable* vtable)
-	{
-		Binding b = getBinding(vtable->traits, multiname);
-		switch (AvmCore::bindingKind(b))
-		{
-		case BKIND_METHOD:
-		{
-			#ifdef DEBUG_EARLY_BINDING
-			core()->console << "callproperty method " << vtable->traits << " " << multiname->getName() << "\n";
-			#endif
-			// force receiver == base.  if caller used OP_callproplex then receiver was null.
-			atomv[0] = base;
-			MethodEnv* method = vtable->methods[AvmCore::bindingToMethodId(b)];
-			AvmAssert(method != NULL);
-			return method->coerceEnter(argc, atomv);
-		}
-		case BKIND_VAR:
-		case BKIND_CONST:
-		{
-			#ifdef DEBUG_EARLY_BINDING
-			core()->console << "callproperty slot " << vtable->traits << " " << multiname->getName() << "\n";
-			#endif
-			Atom method = AvmCore::atomToScriptObject(base)->getSlotAtom(AvmCore::bindingToSlotId(b));
-			return op_call(method, argc, atomv);
-		}
-		case BKIND_GET:
-		case BKIND_GETSET:
-		{
-			#ifdef DEBUG_EARLY_BINDING
-			core()->console << "callproperty getter " << vtable->traits << " " << multiname->getName() << "\n";
-			#endif
-			// Invoke the getter on base
-			int m = AvmCore::bindingToGetterId(b);
-			MethodEnv *f = vtable->methods[m];
-			Atom method = f->coerceEnter(base);
-			return op_call(method, argc, atomv);
-		}
-		case BKIND_SET:
-		{
-			#ifdef DEBUG_EARLY_BINDING
-			core()->console << "callproperty setter " << vtable->traits << " " << multiname->getName() << "\n";
-			#endif
-			// read on write-only property
-			throwReferenceError(kWriteOnlyError, multiname, vtable->traits);
-		}
-		default:
-			#ifdef DEBUG_EARLY_BINDING
-			core()->console << "callproperty dynamic " << vtable->traits << " " << multiname->getName() << "\n";
-			#endif
-			if (AvmCore::isObject(base))
-			{
-				return AvmCore::atomToScriptObject(base)->callProperty(multiname, argc, atomv);
-			}
-			else
-			{
-				// primitive types are not dynamic, so we can go directly
-				// to their __proto__ object
-				ScriptObject* proto = toPrototype(base);
-				Atom method = proto->getMultinameProperty(multiname);
-				return op_call(method, argc, atomv);
-			}
-		}
-	}
-
-	Atom Toplevel::constructprop(const Multiname* multiname, int argc, Atom* atomv, VTable* vtable)
-	{
-		Binding b = getBinding(vtable->traits, multiname);
-		Atom obj = atomv[0];
-		AvmCore* core = this->core();
-		switch (AvmCore::bindingKind(b))
-		{
-		case BKIND_METHOD:
-		{
-			// can't invoke method as constructor
-			MethodEnv* env = vtable->methods[AvmCore::bindingToMethodId(b)];
-			throwTypeError(kCannotCallMethodAsConstructor, core->toErrorString(env->method));
-		}
-		case BKIND_VAR:
-		case BKIND_CONST:
-		{
-			#ifdef DEBUG_EARLY_BINDING
-			core->console << "constructprop slot " << vtable->traits << " " << multiname->getName() << "\n";
-			#endif
-			Atom ctor = AvmCore::atomToScriptObject(obj)->getSlotAtom(AvmCore::bindingToSlotId(b));
-			if (!AvmCore::istype(ctor, CLASS_TYPE) && !AvmCore::istype(ctor, FUNCTION_TYPE))
-				throwTypeError(kNotConstructorError, core->toErrorString(multiname));
-			return op_construct(ctor, argc, atomv);
-		}
-		case BKIND_GET:
-		case BKIND_GETSET:
-		{
-			#ifdef DEBUG_EARLY_BINDING
-			core->console << "constructprop getter " << vtable->traits << " " << multiname->getName() << "\n";
-			#endif
-			// Invoke the getter
-			int m = AvmCore::bindingToGetterId(b);
-			MethodEnv *f = vtable->methods[m];
-			Atom ctor = f->coerceEnter(obj);
-			return op_construct(ctor, argc, atomv);
-		}
-		case BKIND_SET:
-		{
-			#ifdef DEBUG_EARLY_BINDING
-			core->console << "constructprop setter " << vtable->traits << " " << multiname->getName() << "\n";
-			#endif
-			// read on write-only property
-			throwReferenceError(kWriteOnlyError, multiname, vtable->traits);
-		}
-		default:
-			#ifdef DEBUG_EARLY_BINDING
-			core->console << "constructprop dynamic " << vtable->traits << " " << multiname->getName() << "\n";
-			#endif
-			if ((obj&7)==kObjectType)
-			{
-				return AvmCore::atomToScriptObject(obj)->constructProperty(multiname, argc, atomv);
-			}
-			else
-			{
-				// primitive types are not dynamic, so we can go directly
-				// to their __proto__ object
-				ScriptObject* proto = toPrototype(obj);
-				Atom ctor = proto->getMultinameProperty(multiname);
-				return op_construct(ctor, argc, atomv);
-			}
-		}
-	}	
-
 	Atom Toplevel::instanceof(Atom atom, Atom ctor)
 	{
 		AvmCore* core = this->core();
-		if ((ctor&7) != kObjectType ||
+		if (atomKind(ctor) != kObjectType ||
 			(!AvmCore::istype(ctor, core->traits.function_itraits) &&
 			!AvmCore::istype(ctor, core->traits.class_itraits)))
 		{
@@ -683,27 +474,19 @@ namespace avmplus
 	
 	Traits* Toplevel::toClassITraits(Atom atom)
 	{
-		switch (atom&7)
+		if (!AvmCore::isObject(atom)) // includes null check
 		{
-		case kObjectType:
-		{
-			if( !AvmCore::isNull(atom) )
-			{
-				Traits* itraits = AvmCore::atomToScriptObject(atom)->traits()->itraits;
-				if (itraits == NULL)
-					throwTypeError(kIsTypeMustBeClassError);
-				return itraits;
-			}
-			// else fall through and report an error
-		}
-		default:
             // TypeError in ECMA
 			// ISSUE the error message should say "whatever" is not a class
 			throwTypeError(
 					   (atom == undefinedAtom) ? kConvertUndefinedToObjectError :
 											kConvertNullToObjectError);
-			return NULL;
 		}
+
+		Traits* itraits = AvmCore::atomToScriptObject(atom)->traits()->itraits;
+		if (itraits == NULL)
+			throwTypeError(kIsTypeMustBeClassError);
+		return itraits;
 	}
 
 	Atom Toplevel::in_operator(Atom nameatom, Atom obj) 
@@ -711,189 +494,41 @@ namespace avmplus
 		AvmCore* core = this->core();
 		Traits* t = this->toTraits(obj); // includes null check
 
+		bool has_interned = false;
 		if (!AvmCore::isDictionaryLookup(nameatom, obj))
 		{
 			Stringp name = core->intern(nameatom);
+			has_interned = true;
 
 			// ISSUE should we try this on each object on the proto chain or just the first?
 			TraitsBindingsp td = t->getTraitsBindings();
-			if (td->findBinding(name, core->publicNamespace) != BIND_NONE)
+			// NOTE looking for a name that matches the caller's version, so use caller's public
+			if (td->findBinding(name, core->findPublicNamespace()) != BIND_NONE)
 				return trueAtom;
 
 			nameatom = name->atom();
 		}
 
-		ScriptObject* o = (obj&7)==kObjectType ? 
+		ScriptObject* o = atomKind(obj)==kObjectType ? 
 				AvmCore::atomToScriptObject(obj) : 
 				this->toPrototype(obj);
 		do
 		{
 			if (o->hasAtomProperty(nameatom))
 				return trueAtom;
+
+			// First hasAtomProperty call can be a dictionary and take any 
+			// type of object but the rest need an interned string.
+			if (!has_interned)
+			{
+				nameatom=core->intern(nameatom)->atom();
+				has_interned = true;
+			}
 		}
 		while ((o = o->getDelegate()) != NULL);
 		return falseAtom;
 	}
-
-	/**
-	 * implements ECMA implicit coersion.  returns the coerced value,
-	 * or throws a TypeError if coersion is not possible.
-	 */
-	 
-	 // NOTE: parts of this function have been explicitly inlined into MethodEnv::unbox1 for
-	 // efficiency. If you change/fix this method, you may need to change/fix MethodEnv::unbox1 as well.
-    Atom Toplevel::coerce(Atom atom, Traits* expected) const
-    {
-		Traits* actual;
-		AvmCore* core = this->core();
-
-		// these types always succeed
-		const BuiltinType ebt = Traits::getBuiltinType(expected);
-		switch (ebt)
-		{
-			case BUILTIN_any:
-				return atom;
-			case BUILTIN_boolean:
-				return AvmCore::booleanAtom(atom);
-			case BUILTIN_number:
-				return core->numberAtom(atom);
-			case BUILTIN_string:
-				return AvmCore::isNullOrUndefined(atom) ? nullStringAtom : core->string(atom)->atom();
-			case BUILTIN_int:
-				return core->intAtom(atom);
-			case BUILTIN_uint:
-				return core->uintAtom(atom);
-			case BUILTIN_object:
-				return atom == undefinedAtom ? nullObjectAtom : atom;
-		}
-		// else fall thru
-
-		if (AvmCore::isNullOrUndefined(atom))
-			return (ebt == BUILTIN_void) ? undefinedAtom : nullObjectAtom;
-
-		switch (atomKind(atom))
-		{
-		case kStringType:
-			actual = STRING_TYPE;
-			break;
-
-		case kBooleanType:
-			actual = BOOLEAN_TYPE;
-			break;
-
-		case kDoubleType:
-			actual = NUMBER_TYPE;
-			break;
-
-		case kIntegerType:
-			actual = INT_TYPE;
-			break;
-
-		case kNamespaceType:
-			actual = NAMESPACE_TYPE;
-			break;
-
-		case kObjectType:
-			actual = AvmCore::atomToScriptObject(atom)->traits();
-			break;
-
-		default:
-			// unexpected atom type
-			AvmAssert(false);
-			return false;
-		}
-
-		if (actual->containsInterface(expected))
-		{
-			return atom;
-		}
-		else
-		{
-			// failed
-#ifdef AVMPLUS_VERBOSE
-			//core->console << "checktype failed " << expected << " <- " << atom << "\n";
-#endif
-			throwTypeError(kCheckTypeFailedError, core->atomToErrorString(atom), core->toErrorString(expected));
-			return atom;//unreachable
-		}
-    }
-
-	void Toplevel::coerceobj(ScriptObject* obj, Traits* expected) const
-	{
-		if (obj && !obj->traits()->containsInterface(expected))
-		{
-			// failed
-#ifdef DEBUGGER
-			//core->console << "checktype failed " << expected << " <- " << atom << "\n";
-#endif
-			throwTypeError(kCheckTypeFailedError, core()->atomToErrorString(obj->atom()), core()->toErrorString(expected));
-		}
-	}
 	
-    Atom Toplevel::add2(Atom lhs, Atom rhs)
-    {
-		AvmCore* core = this->core();
-
-		// do common cases first/quick:
-		if (AvmCore::isNumber(lhs) && AvmCore::isNumber(rhs))
-		{
-			// C++ porting note. if either side is undefined, null or NaN then result must be NaN.
-			// Java's + operator ensures this for double operands.
-			// cn:  null should convert to 0, so I think the above comment is wrong for null.
-			goto add_numbers;
-		}
-		else if (AvmCore::isString(lhs) || AvmCore::isString(rhs) || AvmCore::isDate(lhs) || AvmCore::isDate(rhs))
-		{
-			goto concat_strings;
-		}
-
-
-		// then look for the more unlikely cases
-		
-		// E4X, section 11.4.1, pg 53
-		
-		if (AvmCore::isXMLorXMLList(lhs) && AvmCore::isXMLorXMLList(rhs))
-		{
-			XMLListObject *l = new (core->GetGC()) XMLListObject(xmlListClass());
-			l->_append(lhs);
-			l->_append(rhs);
-			return l->atom();
-		}
-		
-		// to catch oddball cases like:
-		//   function foo() { };
-		//   foo.prototype.valueOf = function() { return new Object(); }
-		//   foo.prototype.toString = function() { return 2; }
-		//   print( new foo() + 33 ); // should be 35
-		//
-		// we need to follow the E3 spec:
-		// 1. call ToPrimitive() on lhs and rhs, then
-		// if L is String || R is String, concat, else add toNumber(lhs) to toNumber(rhs)
-
-		// ToPrimitive() will call [[DefaultValue]], which calls valueOf().  If the result is
-		//  a primitive, return that value else call toString() instead.
-
-		// from E3:
-		// NOTE No hint is provided in the calls to ToPrimitive in steps 5 and 6. All native ECMAScript objects except Date objects handle
-		// the absence of a hint as if the hint Number were given; Date objects handle the absence of a hint as if the hint String were given.
-		// Host objects may handle the absence of a hint in some other manner.
-		
-		lhs = AvmCore::primitive(lhs); // Date is handled above with the String argument case,  we don't have to check for it here.
-		rhs = AvmCore::primitive(rhs);
-
-		if (!(AvmCore::isString(lhs) || AvmCore::isString(rhs)))
-		{
-			goto add_numbers;
-		}
-		// else fall thru to concat_strings
-
-concat_strings:
-		return core->concatStrings(core->string(lhs), core->string(rhs))->atom();
-
-add_numbers:	
-		return core->doubleToAtom(AvmCore::number(lhs) + AvmCore::number(rhs));
-    }
-
 	bool Toplevel::hasproperty(Atom obj, const Multiname* multiname, VTable* vtable)
 	{
 		const Binding propBinding = getBinding(vtable->traits, multiname);
@@ -902,14 +537,14 @@ add_numbers:
 		{
 		case BKIND_NONE:
 			{
-				// Property does not have binding.  Might be a dynamic property.
-				// Have to walk the prototype chain.
-				const ScriptObject* curObj = AvmCore::isObject(obj) ?
-												AvmCore::atomToScriptObject(obj) :
-												toPrototype(obj);
-				
-				if (curObj->isValidDynamicName(multiname))
+				if (multiname->isValidDynamicName())
 				{
+                    // Property does not have binding.  Might be a dynamic property.
+                    // Have to walk the prototype chain.
+                    const ScriptObject* curObj = AvmCore::isObject(obj) ?
+                                                    AvmCore::atomToScriptObject(obj) :
+                                                    toPrototype(obj);
+                    
 					// Walk the prototype chain looking for the property.
 					while ((!result) && (curObj != NULL))
 					{
@@ -950,7 +585,7 @@ add_numbers:
 				if (AvmCore::isObject(obj))
 				{
 					ScriptObject* o = AvmCore::atomToScriptObject(obj);
-					if (o->isValidDynamicName(multiname) && o->traits()->needsHashtable())
+					if (multiname->isValidDynamicName() && o->traits()->needsHashtable())
 					{
 						result = o->deleteMultinameProperty(multiname);
 					}
@@ -960,7 +595,7 @@ add_numbers:
 
 		case BKIND_METHOD:
 			{
-				if (multiname->contains(core()->publicNamespace) && isXmlBase(obj)) 
+				if (AvmCore::isXMLorXMLList(obj) && multiname->containsAnyPublicNamespace()) 
 				{
 					ScriptObject* o = AvmCore::atomToScriptObject(obj);
 					// dynamic props should hide declared methods
@@ -985,15 +620,11 @@ add_numbers:
 	Atom Toplevel::getproperty(Atom obj, const Multiname* multiname, VTable* vtable)
     {
 		Binding b = getBinding(vtable->traits, multiname);
-		AvmCore* core = this->core();
         switch (AvmCore::bindingKind(b))
         {
 		case BKIND_METHOD: 
 		{
-			#ifdef DEBUG_EARLY_BINDING
-			core->console << "getproperty method " << vtable->traits << " " << multiname->getName() << "\n";
-			#endif
-			if (multiname->contains(core->publicNamespace) && isXmlBase(obj))
+			if (AvmCore::isXMLorXMLList(obj) && multiname->containsAnyPublicNamespace())
 			{
 				// dynamic props should hide declared methods
 				ScriptObject* so = AvmCore::atomToScriptObject(obj);
@@ -1007,18 +638,12 @@ add_numbers:
         case BKIND_VAR:
         case BKIND_CONST:
 		{
-			#ifdef DEBUG_EARLY_BINDING
-			core->console << "getproperty slot " << vtable->traits << " " << multiname->getName() << "\n";
-			#endif
 			int slot = AvmCore::bindingToSlotId(b);
 			return AvmCore::atomToScriptObject(obj)->getSlotAtom(slot);
 		}
 
 		case BKIND_NONE:
-			#ifdef DEBUG_EARLY_BINDING
-			core->console << "getproperty dynamic " << vtable->traits << " " << multiname->getName() << "\n";
-			#endif
-			if ((obj&7) == kObjectType)
+			if (atomKind(obj) == kObjectType)
 			{
 				// try dynamic lookup on instance.  even if the traits are sealed,
 				// we might need to search the prototype chain
@@ -1030,9 +655,9 @@ add_numbers:
 				// to their __proto__ object.  but they are sealed, so fail if
 				// the property is not found on the proto chain.
 
-				ScriptObject* delegate = toPrototype(obj);
-				if (delegate->isValidDynamicName(multiname))
+				if (multiname->isValidDynamicName())
 				{
+                    ScriptObject* delegate = toPrototype(obj);
 					return delegate->ScriptObject::getStringPropertyFromProtoChain(multiname->getName(), delegate, toTraits(obj));
 				}
 				else
@@ -1045,9 +670,6 @@ add_numbers:
 		case BKIND_GET:
 		case BKIND_GETSET:
 		{
-			#ifdef DEBUG_EARLY_BINDING
-			core->console << "getproperty getter " << vtable->traits << " " << multiname->getName() << "\n";
-			#endif
 			// Invoke the getter
 			int m = AvmCore::bindingToGetterId(b);
 			MethodEnv *f = vtable->methods[m];
@@ -1055,9 +677,6 @@ add_numbers:
 		}
 		case BKIND_SET:
 		{
-			#ifdef DEBUG_EARLY_BINDING
-			core->console << "getproperty setter " << vtable->traits << " " << multiname->getName() << "\n";
-			#endif
 			// read on write-only property
 			throwReferenceError(kWriteOnlyError, multiname, vtable->traits);
 		}
@@ -1081,10 +700,7 @@ add_numbers:
         {
 		case BKIND_METHOD: 
 		{
-			#ifdef DEBUG_EARLY_BINDING
-			core()->console << "setproperty method " << vtable->traits << " " << multiname->getName() << "\n";
-			#endif
-			if (multiname->contains(core()->publicNamespace) && isXmlBase(obj))
+			if (AvmCore::isXMLorXMLList(obj) && multiname->containsAnyPublicNamespace())
 			{
 				// dynamic props should hide declared methods
 				ScriptObject* so = AvmCore::atomToScriptObject(obj);
@@ -1103,21 +719,13 @@ add_numbers:
 		}
 		case BKIND_VAR:
 		{
-			#ifdef DEBUG_EARLY_BINDING
-			core()->console << "setproperty slot " << vtable->traits << " " << multiname->getName() << "\n";
-			#endif
-			int slot = AvmCore::bindingToSlotId(b);
-			const TraitsBindingsp td = vtable->traits->getTraitsBindings();
-			AvmCore::atomToScriptObject(obj)->setSlotAtom(slot, coerce(value, td->getSlotTraits(slot)));
+			AvmCore::atomToScriptObject(obj)->coerceAndSetSlotAtom(AvmCore::bindingToSlotId(b), value);
             return;
 		}
 
 		case BKIND_SET: 
 		case BKIND_GETSET: 
 		{
-			#ifdef DEBUG_EARLY_BINDING
-			core()->console << "setproperty setter " << vtable->traits << " " << multiname->getName() << "\n";
-			#endif
 			// Invoke the setter
 			uint32 m = AvmCore::bindingToSetterId(b);
 			AvmAssert(m < vtable->traits->getTraitsBindings()->methodCount);
@@ -1128,18 +736,12 @@ add_numbers:
 		}
 		case BKIND_GET: 
 		{
-			#ifdef DEBUG_EARLY_BINDING
-			core()->console << "setproperty getter " << vtable->traits << " " << multiname->getName() << "\n";
-			#endif
 			throwReferenceError(kConstWriteError, multiname, vtable->traits);
 			return;
 		}
 
 		case BKIND_NONE:
 		{
-			#ifdef DEBUG_EARLY_BINDING
-			core()->console << "setproperty dynamic " << vtable->traits << " " << multiname->getName() << "\n";
-			#endif
 			if (AvmCore::isObject(obj))
 			{
 				AvmCore::atomToScriptObject(obj)->setMultinameProperty(multiname, value);
@@ -1169,40 +771,25 @@ add_numbers:
 		// restore the defaultNamespace location as we enter/leave methods, so we
 		// always can get to the current value.
 		AvmCore* core = this->core();
-#ifdef _DEBUG
-		AvmAssert(!core->dxnsAddr || (uintptr)(*core->dxnsAddr) != 0xcccccccc);
-#endif
-		if (!core->dxnsAddr || !(*core->dxnsAddr))
+		Namespace* dxns = core->dxns();
+		if (!dxns)
 			throwTypeError(kNoDefaultNamespaceError);
-		return *core->dxnsAddr;
+		return dxns;
 	}
 
-	/**
-	 * find the binding for a property given a full multiname reference.  The lookup
-	 * must produce a single binding, or it's an error.  Note that the name could be
-	 * bound to the same binding in multiple namespaces.
-	 */
-	Binding Toplevel::getBinding(Traits* traits, const Multiname* ref) const
+	Binding Toplevel::getBindingAndDeclarer(Traits* traits, const Multiname& ref, Traitsp& declarer) const
 	{
 		Binding b = BIND_NONE;
-		if (traits && ref->isBinding())
+		if (traits && ref.isBinding())
 		{
 			if (!traits->isResolved())
 				traits->resolveSignatures(this);
 				
-			TraitsBindingsp tb = traits->getTraitsBindings();
-			if (!ref->isNsset())
+			b = traits->getTraitsBindings()->findBindingAndDeclarer(ref, declarer);
+			if (b == BIND_AMBIGUOUS)
 			{
-				b = tb->findBinding(ref->getName(), ref->getNamespace());
-			}
-			else
-			{
-				b = tb->findBinding(ref->getName(), ref->getNsset());
-				if (b == BIND_AMBIGUOUS)
-				{
-					// ERROR.  more than one binding is available.  throw exception.
-					throwTypeError(kAmbiguousBindingError, core()->toErrorString(ref));
-				}
+				// ERROR.  more than one binding is available.  throw exception.
+				throwTypeError(kAmbiguousBindingError, core()->toErrorString(ref));
 			}
 		}
 		return b;
@@ -1357,7 +944,8 @@ add_numbers:
 			NativeInitializer* nativeInitializer = NULL;	// "native" not supported for eval code
 			Toplevel* toplevel = (Toplevel*)self;
 			String *newsrc = AvmCore::atomToString(input)->appendLatin1("\0", 1);
-			return core->handleActionSource(newsrc, filename, domainEnv, toplevel, nativeInitializer, codeContext);
+			uint32_t api = core->getAPI(NULL);
+			return core->handleActionSource(newsrc, filename, domainEnv, toplevel, nativeInitializer, codeContext, api);
 		}
 #endif // VMCFG_EVAL
 		return undefinedAtom;
@@ -1389,12 +977,12 @@ add_numbers:
 		StringIndexer str(in);
 		while (pos < in->length())
 		{
-			utf32_t ch = str[pos++];
+			uint32_t ch = str[pos++];
 			if (ch == '%') 
 			{
 				int32_t curPos = pos;
 				int len = 2;
-				if (pos < (in->length() - 5) && str[pos] == 'u')
+				if (pos <= (in->length() - 5) && str[pos] == 'u')
 				{
 					len = 4;
 					pos++;
@@ -1411,7 +999,7 @@ add_numbers:
 							ch = '%';
 							break;
 						}
-						ch = (utf32_t)((ch<<4) | v);
+						ch = (uint32_t)((ch<<4) | v);
 					}
 				}
 			}
@@ -1664,7 +1252,7 @@ add_numbers:
 		// delegated to this function because in-lining it in the caller prevents
 		// taill calling.  See comments in op_call, above.
 		
-		Multiname name(core()->publicNamespace, core()->internString(core()->newStringLatin1(namestr)));
+		Multiname name(core()->findPublicNamespace(), core()->internString(core()->newStringLatin1(namestr)));
 		throwTypeError(id, core()->toErrorString(&name));
 	}
 	
@@ -1748,4 +1336,16 @@ add_numbers:
 	ErrorClass* Toplevel::securityErrorClass() const { return getErrorClass(avmplus::NativeID::abcclass_SecurityError); }
 	ErrorClass* Toplevel::syntaxErrorClass() const { return getErrorClass(avmplus::NativeID::abcclass_SyntaxError); }
 	ErrorClass* Toplevel::verifyErrorClass() const { return getErrorClass(avmplus::NativeID::abcclass_VerifyError); }
+
+	// virtual
+	ClassClosure *Toplevel::getBuiltinExtensionClass(int /*clsid*/)
+	{
+		return NULL;
+	}
+
+	// virtual
+	bool Toplevel::sampler_trusted(ScriptObject* /*sampler*/)
+	{
+		return true;
+	}
 }

@@ -40,7 +40,6 @@
 #define __avmplus_MathUtils__
 
 #include "BigInteger.h"
-#include "avmplusTypes.h"
 
 namespace avmplus
 {
@@ -121,6 +120,14 @@ namespace avmplus
 		static double sqrt(double value);
 		static double tan(double value);
 		static double toInt(double value);
+
+		// toIntClamp() is like toInt(), where the result is
+		// clamped such that -clampMagnitude <= result <= clampMagnitude. (This includes
+		// infinities.) useful for String functions where the result
+		// will be converted to integer (again) and subsequent clamping
+		// would be done. 
+		static int32_t toIntClamp(double value, int32_t clampMagnitude);
+		
 		#if defined(WIN32) && defined(AVMPLUS_IA32)
 		// This routine will return 0x80000000 if the double value overflows
 		// and integer and is not between -2^31 and 2^31-1. 
@@ -151,7 +158,14 @@ namespace avmplus
 			 * needs 347.  But why be stingy?  There may be other cases that are 
 			 * even bigger, it's hard to say.
 			 */
-			 kMinSizeForDouble_toString			= 380
+			 kMinSizeForDouble_base10_toString	= 380,
+			 /**
+			  *  Buffer size for converting IEEE-754 double to string
+			  *  using worst-case radix(2) plus a leading '-' char.
+			  *  Denormalized (i.e., very small) numbers are  truncated 
+			  *  to "0" so they don't require additional space.
+			  */
+			  kMinSizeForDouble_base2_toString	= 1025
 		};
 		
 		enum UnsignedTreatment

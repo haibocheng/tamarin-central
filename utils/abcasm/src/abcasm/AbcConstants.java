@@ -235,7 +235,6 @@ interface AbcConstants {
     int OP_typeof = 0x95;
     int OP_not = 0x96;
     int OP_bitnot = 0x97;
-    int OP_concat = 0x9A;
     int OP_add_d = 0x9B;
     int OP_add = 0xA0;
     int OP_subtract = 0xA1;
@@ -331,8 +330,8 @@ interface AbcConstants {
         "pushscope     ",
         "pushnamespace ",
         "hasnext2      ",
-        "OP_0x33       ",
-        "OP_0x34       ",
+        "OP_0x33       ", // lix8 (internal)
+        "OP_0x34       ", // lix16 (internal)
         "li8           ",
         "li16          ",
         "li32          ",
@@ -434,7 +433,7 @@ interface AbcConstants {
         "bitnot        ",
         "OP_0x98       ",
         "OP_0x99       ",
-        "concat        ",
+        "OP_0x9A       ",
         "add_d         ",
         "OP_0x9C       ",
         "OP_0x9D       ",

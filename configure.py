@@ -72,10 +72,12 @@ if (buildShell):
 
 APP_CPPFLAGS = "-DAVMSHELL_BUILD "
 APP_CXXFLAGS = ""
+APP_CFLAGS = ""
 OPT_CXXFLAGS = "-O3 "
 OPT_CPPFLAGS = ""
 DEBUG_CPPFLAGS = "-DDEBUG -D_DEBUG "
 DEBUG_CXXFLAGS = ""
+DEBUG_CFLAGS = ""
 DEBUG_LDFLAGS = ""
 OS_LIBS = []
 OS_LDFLAGS = ""
@@ -106,6 +108,10 @@ if MMGC_DYNAMIC:
     MMGC_DEFINES['MMGC_DLL'] = None
     MMGC_CPPFLAGS += "-DMMGC_IMPL "
 
+arm_fpu = o.getBoolArg("arm-fpu",False)  
+if arm_fpu:
+    APP_CPPFLAGS += "-DAVMSYSTEM_ARM_FPU=1 "
+
 the_os, cpu = config.getTarget()
 
 # For -Wreorder, see https://bugzilla.mozilla.org/show_bug.cgi?id=475750
@@ -124,10 +130,12 @@ if config.getCompiler() == 'GCC':
     APP_CXXFLAGS = "-Wall -Wcast-align -Wdisabled-optimization -Wextra -Wformat=2 -Winit-self -Winvalid-pch -Wno-invalid-offsetof -Wno-switch -Wparentheses -Wpointer-arith -Wreorder -Wsign-compare -Wunused-parameter -Wwrite-strings -Wno-ctor-dtor-privacy -Woverloaded-virtual -Wsign-promo -Wno-char-subscripts -fmessage-length=0 -fno-exceptions -fno-rtti -fno-check-new -fstrict-aliasing -fsigned-char  "
     if GCC_MAJOR_VERSION >= 4:
         APP_CXXFLAGS += "-Wstrict-null-sentinel "
-        if GCC_MAJOR_VERSION == 4 and GCC_MINOR_VERSION <= 2: # 4.0 - 4.2
+        if (GCC_MAJOR_VERSION == 4 and GCC_MINOR_VERSION <= 2) or cpu == 'mips': # 4.0 - 4.2
             APP_CXXFLAGS += "-Wstrict-aliasing=0 "
         else: # gcc 4.3 or later
             APP_CXXFLAGS += "-Werror -Wempty-body -Wno-logical-op -Wmissing-field-initializers -Wstrict-aliasing=3 -Wno-array-bounds -Wno-clobbered -Wstrict-overflow=0 -funit-at-a-time  "
+    if arm_fpu:
+        OPT_CXXFLAGS += "-mfloat-abi=softfp -mfpu=vfp -march=armv6"  # compile to use hardware fpu and armv6
     if config.getDebug():
         APP_CXXFLAGS += ""
     else:
@@ -139,21 +147,30 @@ elif config.getCompiler() == 'VS':
         OS_LDFLAGS += "-MAP "
         if config.getDebug():
             DEBUG_CXXFLAGS = "-Od "
+            DEBUG_CFLAGS = "-Od "
             APP_CXXFLAGS += "-GR- -fp:fast -GS- -Zc:wchar_t- -Zc:forScope "
         else:
             OPT_CXXFLAGS = "-O2 -GR- "
+            
+        if arm_fpu:
+            OPT_CXXFLAGS += "-QRfpe- -QRarch6"  # compile to use hardware fpu and armv6
     else:
         APP_CXXFLAGS = "-W4 -WX -wd4291 -GF -fp:fast -GS- -Zc:wchar_t- "
+        APP_CFLAGS = "-W4 -WX -wd4291 -GF -fp:fast -GS- -Zc:wchar_t- "
         OS_LDFLAGS += "-SAFESEH:NO -MAP "
         if config.getDebug():
-            DEBUG_CXXFLAGS = "-Od -EHsc "
+            DEBUG_CXXFLAGS = "-Od "
+            DEBUG_CFLAGS = "-Od "
         else:
             OPT_CXXFLAGS = "-O2 -Ob1 -GR- "
+            OPT_CFLAGS = "-O2 -Ob1 -GR- "
         if memoryProfiler:
             OPT_CXXFLAGS += "-Oy- -Zi "
     DEBUG_CXXFLAGS += "-Zi "
+    DEBUG_CFLAGS += "-Zi "
     DEBUG_LDFLAGS += "-DEBUG "
 elif config.getCompiler() == 'SunStudio':
+    APP_CXXFLAGS = "-template=no%extdef "
     OPT_CXXFLAGS = "-xO5 "
     DEBUG_CXXFLAGS += "-g "
 else:
@@ -167,7 +184,7 @@ zlib_lib = o.getStringArg('zlib-lib')
 if zlib_lib is not None:
     AVMSHELL_LDFLAGS = zlib_lib
 else:
-    AVMSHELL_LDFLAGS = '$(call EXPAND_LIBNAME,z)'
+    AVMSHELL_LDFLAGS = '$(call EXPAND_LIBNAME,zlib)'
 
 
 if the_os == "darwin":
@@ -186,9 +203,11 @@ if the_os == "darwin":
         config.subst("MACOSX_DEPLOYMENT_TARGET",10.5)
         if cpu == 'x86_64':
             APP_CXXFLAGS += "-arch x86_64 "
+            APP_CFLAGS += "-arch x86_64 "
             OS_LDFLAGS += "-arch x86_64 "
         else:
             APP_CXXFLAGS += "-arch ppc64 "
+            APP_CFLAGS += "-arch ppc64 "
             OS_LDFLAGS += "-arch ppc64 "
     else:
         APP_CXXFLAGS += "-mmacosx-version-min=10.4 -isysroot /Developer/SDKs/MacOSX10.4u.sdk "
@@ -198,7 +217,11 @@ elif the_os == "windows" or the_os == "cygwin":
                          '_CRT_SECURE_NO_DEPRECATE': None})
     OS_LDFLAGS += "-MAP "
     if cpu == "arm":
-        APP_CPPFLAGS += "-DARM -D_ARM_ -DARMV5 -DUNICODE -DUNDER_CE=1 -DMMGC_ARM -QRarch5t "
+        APP_CPPFLAGS += "-DARM -D_ARM_ -DUNICODE -DUNDER_CE=1 -DMMGC_ARM "
+        if arm_fpu:
+            APP_CPPFLAGS += "-DARMV6 -QRarch6 "
+        else:
+            APP_CPPFLAGS += "-DARMV5 -QRarch5t "
         OS_LIBS.append('mmtimer corelibc coredll')
     else:
         APP_CPPFLAGS += "-DWIN32_LEAN_AND_MEAN -D_CONSOLE "
@@ -210,14 +233,14 @@ elif the_os == "linux":
                          'AVMPLUS_UNIX': None,
                          'LINUX': None})
     OS_LIBS.append('pthread')
-    if cpu == "x86_64":
-        # workaround https://bugzilla.mozilla.org/show_bug.cgi?id=467776
-        OPT_CXXFLAGS += '-fno-schedule-insns2 '
+#    if cpu == "x86_64":
+#        # workaround https://bugzilla.mozilla.org/show_bug.cgi?id=467776
+#        OPT_CXXFLAGS += '-fno-schedule-insns2 '
     if config.getDebug():
         OS_LIBS.append("dl")
 elif the_os == "sunos":
     if config.getCompiler() != 'GCC':
-        APP_CXXFLAGS = ""
+        APP_CXXFLAGS = "-template=no%extdef "
         OPT_CXXFLAGS = "-xO5 "
         DEBUG_CXXFLAGS = "-g "
     MMGC_DEFINES.update({'UNIX': None,
@@ -248,11 +271,19 @@ elif cpu == "x86_64":
 elif cpu == "arm":
     # we detect this in core/avmbuild.h and MMgc/*build.h
     None
+elif cpu == "mips":
+    # we detect this in core/avmbuild.h and MMgc/*build.h
+    None
 else:
     raise Exception("Unsupported CPU")
 
 if o.getBoolArg('perfm'):
     APP_CPPFLAGS += "-DPERFM "
+
+if o.help:
+    sys.stdout.write(o.getHelp())
+    sys.exit(1)
+
 
 # We do two things with MMGC_DEFINES: we append it to APP_CPPFLAGS and we also write MMgc-config.h
 APP_CPPFLAGS += ''.join(val is None and ('-D%s ' % var) or ('-D%s=%s ' % (var, val))

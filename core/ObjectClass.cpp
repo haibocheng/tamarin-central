@@ -105,7 +105,7 @@ namespace avmplus
 		When the hasOwnProperty method is called with argument V, the following steps are taken:
 		1. Let O be this object.
 		2. Call ToString(V).
-		3. If O doesnt have a property with the name given by Result(2), return false.
+		3. If O doesn't have a property with the name given by Result(2), return false.
 		4. Return true.
 		NOTE Unlike [[HasProperty]] (section 8.6.2.4), this method does not consider objects in the prototype chain.
      */
@@ -130,13 +130,14 @@ namespace avmplus
 			case kStringType:
 			case kBooleanType:
 			case kDoubleType:
-			case kIntegerType:
+			case kIntptrType:
 				t = toplevel()->toTraits(thisAtom);
 				break;
 			default:
 				return false;
 		}
-		return t->getTraitsBindings()->findBinding(name, core->publicNamespace) != BIND_NONE;
+		// NOTE use caller's public namespace
+		return t->getTraitsBindings()->findBinding(name, core->findPublicNamespace()) != BIND_NONE;
 	}
 
 	bool ObjectClass::_propertyIsEnumerable(Atom thisAtom, Stringp name)
@@ -144,12 +145,12 @@ namespace avmplus
 		AvmCore* core = this->core();
 		name = name ? core->internString(name) : (Stringp)core->knull;
 
-		if ((thisAtom&7) == kObjectType)
+		if (atomKind(thisAtom) == kObjectType)
 		{
 			ScriptObject* obj = AvmCore::atomToScriptObject(thisAtom);
 			return obj->getStringPropertyIsEnumerable(name);
 		}
-		else if ((thisAtom&7) == kNamespaceType)
+		else if (atomKind(thisAtom) == kNamespaceType)
 		{
 			// Special case:
 			// E4X 13.2.5.1, 13.2.5.2 specifies that prefix and uri
@@ -167,7 +168,7 @@ namespace avmplus
 		AvmCore* core = this->core();
 		name = name ? core->internString(name) : (Stringp)core->knull;
 
-		if ((thisAtom&7) == kObjectType)
+		if (atomKind(thisAtom) == kObjectType)
 		{
 			ScriptObject* obj = AvmCore::atomToScriptObject(thisAtom);
 			obj->setStringPropertyIsEnumerable(name, enumerable);
@@ -175,7 +176,9 @@ namespace avmplus
 		else
 		{
 			// cannot create properties on a sealed object.
-			Multiname multiname(core->publicNamespace, name);
+			// NOTE just use the unmarked version
+			Multiname multiname(core->getAnyPublicNamespace(), name);
+			// NOTE use default public
 			toplevel()->throwReferenceError(kWriteSealedError, &multiname, traits());
 		}
 	}		
@@ -212,17 +215,14 @@ namespace avmplus
 	{		
 		AvmCore* core = this->core();
 
-		if (AvmCore::istype(thisAtom, CLASS_TYPE))
+		if (AvmCore::isObject(thisAtom))
 		{
-			ClassClosure *cc = (ClassClosure *)AvmCore::atomToScriptObject(thisAtom);
-			Traits*		t = cc->ivtable()->traits;
-			Stringp s = core->concatStrings(core->newConstantStringLatin1("[class "), t->name);
-			return core->concatStrings(s, core->newConstantStringLatin1("]"));
+			return AvmCore::atomToScriptObject(thisAtom)->implToString();
 		}
 		else
 		{
 			Traits*		t = toplevel()->toTraits(thisAtom);
-			Stringp s = core->concatStrings(core->newConstantStringLatin1("[object "), t->name);
+			Stringp s = core->concatStrings(core->newConstantStringLatin1("[object "), t->name());
 			return core->concatStrings(s, core->newConstantStringLatin1("]"));
 		}
 	}

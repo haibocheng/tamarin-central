@@ -103,12 +103,13 @@ namespace avmplus
 		
 		void fixReplaceLastIndex(const char *src,
 								 int subjectLength,
-								 int lastIndex,
+								 int matchLen,
 								 int& newLastIndex,
 								 StringBuffer& resultBuffer);
 
 		int numBytesInUtf8Character(const uint8 *in);
-
+		
+		DECLARE_SLOTS_RegExpObject;
 	};
 }
 

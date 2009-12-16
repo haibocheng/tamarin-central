@@ -63,10 +63,9 @@ namespace avmplus
 	class Verifier
 	{
 	public:
-
 	    CodeWriter* coder;
 		AvmCore *core;
-		SortedIntMap<FrameState*>* blockStates;
+		GCSortedMap<const byte*, FrameState*, LIST_NonGCObjects> *blockStates;
 		FrameState *state;
 
 		int max_scope;
@@ -88,7 +87,7 @@ namespace avmplus
 		PoolObject *pool;
 		int labelCount;
 
-		Verifier(MethodInfo *info, Toplevel* toplevel
+		Verifier(MethodInfo *info, Toplevel* toplevel, AbcEnv* abc_env
 #ifdef AVMPLUS_VERBOSE
 			, bool secondTry=false
 #endif
@@ -102,25 +101,22 @@ namespace avmplus
 		 */
 		// Sun's C++ compiler wants "volatile" here because the definition has it
 		void verify(CodeWriter * volatile coder);
-		FrameState* getFrameState(sintptr targetpc);
+		FrameState* getFrameState(int pc_off);
 
 		// provide access to known jitters
 		#if defined FEATURE_NANOJIT
-		Toplevel* getToplevel (CodegenLIR* jit) {
-		    (void)jit;
-		    return toplevel;
-		}
+		Toplevel* getToplevel(CodegenLIR* jit);
         #endif
 
 	private:
 		Toplevel* toplevel;
-		FrameState* newFrameState();
+        AbcEnv*   abc_env;
 		Value& checkLocal(int local);
 		MethodInfo*  checkDispId(Traits* traits, uint32_t disp_id);
 		MethodInfo*  checkMethodInfo(uint32_t method_id);
 		Traits*            checkClassInfo(uint32_t class_id);
 		void checkTarget(const byte* target);
-		Atom checkCpoolOperand(uint32_t index, int requiredAtomType);
+		void checkCpoolOperand(uint32_t index, int requiredAtomType);
 		void checkConstantMultiname(uint32_t index, Multiname &m);
 		bool canAssign(Traits* lhs, Traits* rhs) const;
 		Traits* checkSlot(Traits* traits, int slot_id);
@@ -134,7 +130,6 @@ namespace avmplus
 		void parseExceptionHandlers();
 		void checkStack(uint32_t pop, uint32_t push);
 		void checkStackMulti(uint32_t pop, uint32_t push, Multiname* m);
-		void emitToString(AbcOpcode opcode, int index, const byte *pc);
 		void emitFindProperty(AbcOpcode opcode, Multiname& multiname, uint32_t imm30, const byte *pc);
 		void emitGetProperty(Multiname &multiname, int n, uint32_t imm30, const byte *pc);
 		void checkGetGlobalScope();
@@ -175,65 +170,43 @@ namespace avmplus
 #if defined FEATURE_CFGWRITER
 	class Block {
 	public:
-	  uint32_t label;
-	  sintptr begin;
-	  sintptr end;
+	  uint32_t label;	// ordinal number
+	  int32_t begin;	// offset from code_start
+	  int32_t end;		// offset from code_start
 	  Block* succ;
-	  List<uint32_t>* succs;
-	  List<uint32_t>* preds;
-	  int pred_count;
-	  Block (MMgc::GC *gc, uint32_t label, sintptr begin) 
-		: label(label), begin(begin), pred_count(0)
-		, succs(new (gc) List<uint32_t>())
-		, preds(new (gc) List<uint32_t>()) {}
-	  ~Block() {}
+	  List<uint32_t, LIST_NonGCObjects> succs;
+	  List<uint32_t, LIST_NonGCObjects> preds;
+	  int32_t pred_count;
+	  Block(uint32_t label, int32_t begin);
+	  ~Block();
 	};
 
 	class Edge {
 	public:
 	  uint32_t src;
 	  uint32_t snk;
-	  Edge(uint32_t src, uint32_t snk)
-		: src(src), snk(snk) {}
+	  Edge(uint32_t src, uint32_t snk);
 	};
 
-	class CFGWriter : public CodeWriter {
-		AvmCore *core;
-	    SortedIntMap<Block*>* blocks;
-	    SortedIntMap<Edge*>* edges;
+	class CFGWriter : public NullWriter {
+		MethodInfo* info;
+	    SortedMap<int, Block*, LIST_NonGCObjects> blocks;
+	    SortedMap<int, Edge*, LIST_NonGCObjects> edges;
 		uint32_t label;
 		uint32_t edge;
-		CodeWriter* coder;       // the next leg of the pipeline
 		Block* current;
 	public:
+		CFGWriter(MethodInfo* info, CodeWriter* coder);
+		~CFGWriter();
 
-		CFGWriter (AvmCore *core, CodeWriter* coder);
-		~CFGWriter ();
-
-		void write (FrameState* state, const byte* pc, AbcOpcode opcode);
-		void writeOp1(FrameState* state, const byte *pc, AbcOpcode opcode, uint32_t opd1, Traits *type = NULL);
-		void writeOp2 (FrameState* state, const byte *pc, AbcOpcode opcode, uint32_t opd1, uint32_t opd2, Traits* type = NULL);
-		void writePrologue(FrameState* state);
-		void writeEpilogue(FrameState* state);
+		// CodeWriter methods
+		void write(FrameState* state, const byte* pc, AbcOpcode opcode, Traits*);
+		void writeOp1(FrameState* state, const byte *pc, AbcOpcode opcode, uint32_t opd1, Traits *type);
+		void writeOp2(FrameState* state, const byte *pc, AbcOpcode opcode, uint32_t opd1, uint32_t opd2, Traits* type);
+		void writeEpilogue(FrameState*);
+		void cleanup();
 	};
 #endif // FEATURE_CFGWRITER
-}
-
-namespace nanojit {
-    class Fragment;
-    struct GuardRecord {
-        int calldepth;
-        Fragment *from, *target;
-        void *jmp, *origTarget;
-        GuardRecord *next, *outgoing;
-    };
-    #define GuardRecordSize(r) sizeof(GuardRecord)
-
-    struct SideExit {
-        int sid;
-        Fragment *target;
-    };
-    #define SideExitSize(x) sizeof(SideExit)
 }
 
 #endif /* __avmplus_Verifier__ */

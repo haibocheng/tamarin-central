@@ -66,6 +66,7 @@ namespace avmplus
 	{
 	private:
 		friend class HeapHashtable;
+		friend class HeapHashtableRC;
 		friend class WeakKeyHashtable;
 		friend class WeakValueHashtable;
 		
@@ -91,7 +92,7 @@ namespace avmplus
 		const static Atom DELETED = undefinedAtom;
 
 		/** kDefaultCapacity must be a power of 2 */
-		const static int kDefaultCapacity = 8;
+		const static int kDefaultCapacity = 2;
 
 		uint32_t getSize() const { return m_size; }
 		uint32_t getCapacity() const { return m_logCapacity ? 1UL<<(m_logCapacity-1) : 0; }
@@ -346,6 +347,35 @@ namespace avmplus
 		virtual bool contains(Atom name) const { return ht.contains(name); }
 		virtual bool weakKeys() const { return false; }
 		virtual bool weakValues() const { return false; }
+	};
+
+	// Holds RCObject values, not Atom values.  Otherwise like HeapHashtable.
+	class HeapHashtableRC : public MMgc::GCFinalizedObject
+	{
+	private:
+		InlineHashtable ht;
+		
+	public:
+		HeapHashtableRC(MMgc::GC* gc, int32_t capacity = InlineHashtable::kDefaultCapacity)
+		{ 
+			ht.initialize(gc, capacity); 
+		}
+		virtual ~HeapHashtableRC() { ht.destroy(); }
+	
+		inline void reset() { ht.reset(); }
+		inline uint32_t getCapacity() const { return ht.getCapacity(); }
+		inline uint32_t getSize() const { return ht.getSize(); }
+		inline int next(int index) { return ht.next(index); }
+		inline Atom keyAt(int index) { return ht.keyAt(index); }
+		inline MMgc::RCObject* valueAt(int index) { return untagAtom(ht.valueAt(index)); }
+		void add(Atom name, MMgc::RCObject* value) { ht.add(name, tagObject(value)); }
+		MMgc::RCObject* get(Atom name) { return untagAtom(ht.get(name)); }
+		MMgc::RCObject* remove(Atom name) { return untagAtom(ht.remove(name)); }
+		bool contains(Atom name) const { return ht.contains(name); }
+		
+	private:
+		inline Atom tagObject(MMgc::RCObject* obj) { return (Atom)obj | kObjectType; }
+		inline MMgc::RCObject* untagAtom(Atom a) { return (MMgc::RCObject*)atomPtr(a); }
 	};
 
 	/** 

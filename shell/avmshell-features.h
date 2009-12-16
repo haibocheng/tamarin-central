@@ -79,12 +79,16 @@
   #define AVMFEATURE_JIT               1
 #endif
 
+#ifndef AVMFEATURE_AOT
+  #define AVMFEATURE_AOT               0
+#endif
+
 #ifndef AVMFEATURE_ABC_INTERP
-  #define AVMFEATURE_ABC_INTERP        0
+  #define AVMFEATURE_ABC_INTERP        1
 #endif
 
 #ifndef AVMFEATURE_WORDCODE_INTERP
-  #define AVMFEATURE_WORDCODE_INTERP   1
+  #define AVMFEATURE_WORDCODE_INTERP   0
 #endif
 
 #if AVMFEATURE_WORDCODE_INTERP
@@ -103,12 +107,15 @@
   #define AVMFEATURE_SELFTEST          0
 #endif
 
-#ifndef AVMFEATURE_UTF32
-  #define AVMFEATURE_UTF32             0
-#endif
-
-#ifndef AVMFEATURE_EVAL
-  #define AVMFEATURE_EVAL              1
+// https://bugzilla.mozilla.org/show_bug.cgi?id=491866
+// eval is causing insteresting compilation errors that appear
+// to be caused by a compiler bug.
+#ifndef SOLARIS
+  #ifndef AVMFEATURE_EVAL
+    #define AVMFEATURE_EVAL              1
+  #endif
+#else
+  #define AVMFEATURE_EVAL              0
 #endif
 
 #ifndef AVMFEATURE_PROTECT_JITMEM
@@ -141,6 +148,43 @@
 
 #ifndef AVMFEATURE_STATIC_FUNCTION_PTRS
   #define AVMFEATURE_STATIC_FUNCTION_PTRS 1
+#endif
+
+#ifndef AVMFEATURE_INDIRECT_NATIVE_THUNKS
+  #define AVMFEATURE_INDIRECT_NATIVE_THUNKS 1
+#endif
+
+#if !defined(_DEBUG) && !defined(DEBUG)
+	// by default, nanojit enables NJ_VERBOSE mode when AVMPLUS_VERBOSE is on,
+	// which is enabled for Debug *and* Debugger builds. 
+	#define NJ_VERBOSE_DISABLED 1
+	#define NJ_PROFILE_DISABLED 1
+#endif
+
+#ifndef AVMFEATURE_OVERRIDE_GLOBAL_NEW
+  #define AVMFEATURE_OVERRIDE_GLOBAL_NEW 0
+#endif
+
+#ifndef AVMFEATURE_MEMORY_PROFILER
+#if AVMFEATURE_DEBUGGER
+	#if AVMSYSTEM_MAC && !(AVMSYSTEM_PPC && AVMSYSTEM_64BIT)
+		#define AVMFEATURE_MEMORY_PROFILER 1
+	#elif AVMSYSTEM_WIN32 && !AVMSYSTEM_ARM // note, does not require DEBUG
+		#define AVMFEATURE_MEMORY_PROFILER 1
+	#else
+		#define AVMFEATURE_MEMORY_PROFILER 0
+	#endif
+#else
+	#define AVMFEATURE_MEMORY_PROFILER 0
+#endif
+#endif
+
+#ifndef AVMFEATURE_API_VERSIONING
+    #define AVMFEATURE_API_VERSIONING 0
+#endif
+
+#ifndef AVMFEATURE_CACHE_GQCN
+  #define AVMFEATURE_CACHE_GQCN 1
 #endif
 
 #endif // __avmshell_features__

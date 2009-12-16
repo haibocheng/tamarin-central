@@ -46,6 +46,7 @@ avmplus_CXXSRCS := $(avmplus_CXXSRCS) \
   $(curdir)/ArrayObject.cpp \
   $(curdir)/AtomArray.cpp \
   $(curdir)/AvmCore.cpp \
+  $(curdir)/avm.cpp \
   $(curdir)/avmfeatures.cpp \
   $(curdir)/AvmLog.cpp \
   $(curdir)/avmplusDebugger.cpp \
@@ -116,6 +117,7 @@ avmplus_CXXSRCS := $(avmplus_CXXSRCS) \
   $(curdir)/Date.cpp \
   $(curdir)/AbcData.cpp \
   $(curdir)/AvmPlusScriptableObject.cpp \
+  $(curdir)/instr.cpp \
   $(NULL)
 
 ifdef ENABLE_DEBUG
@@ -126,3 +128,10 @@ endif
 
 #  $(curdir)/avmplus.cpp \
 #  $(curdir)/AtomConstants.cpp \
+
+$(avmplus_CXXSRCS): $(curdir)/builtin.h
+
+$(curdir)/builtin.h $(curdir)/builtin.cpp: $(curdir)/builtin.as
+	cd $(topsrcdir)/core; python builtin.py
+
+$(curdir)/AbcData.cpp: $(curdir)/builtin.cpp

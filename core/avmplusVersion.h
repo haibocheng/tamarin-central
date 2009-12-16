@@ -45,6 +45,20 @@
 // with the correct value before compilation.  Do not change this.
 #define AVMPLUS_BUILD_CODE			"cyclone"
 
+#ifdef DEBUGGER
+#define AVMPLUS_BIN_DEBUGGER_TAG "-debugger"
+#else
+#define AVMPLUS_BIN_DEBUGGER_TAG ""
+#endif
+
+#ifdef DEBUG
+#define AVMPLUS_BIN_TYPE_TAG  "debug"
+#else
+#define AVMPLUS_BIN_TYPE_TAG  "release"
+#endif
+
+#define AVMPLUS_BIN_TYPE  AVMPLUS_BIN_TYPE_TAG AVMPLUS_BIN_DEBUGGER_TAG
+
 // A possibly-obsolete build number, not used by the VM itself but
 // possibly by embedders.  It is supposed to count 1-n for development
 // builds, and restart at 1-n for release builds.
@@ -69,8 +83,8 @@
 
 #define AVMPLUS_MAJOR_VERSION		1				// original open source version
 #define AVMPLUS_MAJOR_DATE			"2007-04-01"	// close enough
-#define AVMPLUS_MINOR_VERSION		4
-#define AVMPLUS_MINOR_DATE			"2009-04-24"
+#define AVMPLUS_MINOR_VERSION		5
+#define AVMPLUS_MINOR_DATE			"2009-12-15"
 
 // The simple user-facing version number
 #define AVMPLUS_VERSION_USER		avmplus_stringify(AVMPLUS_MAJOR_VERSION) "." avmplus_stringify(AVMPLUS_MINOR_VERSION)

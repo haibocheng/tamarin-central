@@ -80,9 +80,7 @@ namespace avmplus
 	
 			Stringp s = core->string(arg);
 
-			Stringp startTag = s->substr(0, 2);
-			Stringp endTag = s->substr(s->length() - 3, 3);
-			if (startTag->equalsLatin1("<>") && endTag->equalsLatin1("</>"))
+			if (s->matchesLatin1("<>", 2, 0) && s->matchesLatin1("</>", 3, s->length()-3))
 				s = s->substr(2, s->length() - 5);
 
 			Namespace *defaultNamespace = toplevel->getDefaultNamespace();
@@ -108,9 +106,8 @@ namespace avmplus
 				// !!@ trying to emulate rhino behavior here
 				// Add the default namespace to our top element.
 				Namespace *ns = toplevel->getDefaultNamespace();
-				c->_addInScopeNamespace (core, ns);
-
-				xl->_append (c);
+				c->_addInScopeNamespace (core, ns, core->findPublicNamespace());
+				xl->_appendNode (c);
 			}
 			return xl->atom();
 		}

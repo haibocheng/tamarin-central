@@ -38,16 +38,6 @@
 #include "avmplus.h"
 #include "BigInteger.h"
 
-//on solairs gcc at least infinity and nan are not defined
-#if defined(__GNUC__)
-# if !defined(INFINITY)
-#  define INFINITY __builtin_inf()
-# endif
-# if !defined(NAN)
-#  define NAN acosh(0)
-# endif
-#endif
-
 //GCC only allows intrinsics if sse2 is enabled
 #if (defined(_MSC_VER) || (defined(__GNUC__) && defined(__SSE2__))) && (defined(AVMPLUS_IA32) || defined(AVMPLUS_AMD64))
     #include <emmintrin.h>
@@ -77,7 +67,7 @@ namespace avmplus
 	{
 		while (index < s->length())
 		{
-			utf32_t ch = s[index];
+			uint32_t ch = s[index];
 			if (!(ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' || ch == '\f' || ch == '\v' || 
 				 (ch >= 0x2000 && ch <=0x200b) || ch == 0x2028 || ch == 0x2029 || ch == 0x205f || ch == 0x3000 ))
 				break;
@@ -94,7 +84,7 @@ namespace avmplus
 		negative = false;
 		if (index >= s->length())
 			return index;
-		utf32_t ch = s[index];
+		uint32_t ch = s[index];
 		if (ch == '+') {
 			index++;
 		} else if (ch == '-') {
@@ -264,7 +254,7 @@ namespace avmplus
 	{
 		if (s->length() - index < 2 || s[index] != '0')
 			return false;
-		utf32_t ch = s[index+1];
+		uint32_t ch = s[index+1];
 		return (ch == 'x' || ch == 'X');
 	}
 
@@ -464,9 +454,9 @@ namespace avmplus
 		return MathUtils::floor(value + 0.5);
 	}
 	
-	// MathUtils::toInt is the ToInteger algorithm from
-	// ECMA-262 section 9.4
-	double MathUtils::toInt(double value)
+	// apparently SunPro compiler doesn't like combining REALLY_INLINE with static functions.
+	/*static*/
+	REALLY_INLINE int32_t real_to_int(double value)
 	{
 #if defined(WIN32) && defined(AVMPLUS_AMD64)
 		int32_t intValue = _mm_cvttsd_si32(_mm_set_sd(value));
@@ -477,8 +467,16 @@ namespace avmplus
 #elif defined(_MAC) && (defined(AVMPLUS_IA32) || defined(AVMPLUS_AMD64))
 		int32_t intValue = _mm_cvttsd_si32(_mm_set_sd(value));
 #else
-		int32_t intValue = real2int(value);
+		int32_t intValue = MathUtils::real2int(value);
 #endif
+		return intValue;
+	}
+
+	// MathUtils::toInt is the ToInteger algorithm from
+	// ECMA-262 section 9.4
+	double MathUtils::toInt(double value)
+	{
+		int32_t intValue = real_to_int(value);
 
 		if ((value == (double)(intValue)) && ((uint32_t)intValue != 0x80000000))
 			return value;
@@ -494,6 +492,44 @@ namespace avmplus
 		} else {
 			return MathUtils::floor(value);
 		}
+	}
+
+	int32_t MathUtils::toIntClamp(double value, int32_t clampMagnitude)
+	{
+		AvmAssert(clampMagnitude >= 0);
+		
+		if (MathUtils::isNaN(value)) 
+			return 0;
+	
+		int32_t const inf = MathUtils::isInfinite(value);
+		if (inf > 0)
+			return clampMagnitude;
+		else if (inf < 0)
+			return -clampMagnitude;
+
+		//
+		// clamp first, so we know the double is in an integer range.
+		// 
+		double const clampMag = (double)clampMagnitude;
+		if (value > clampMag)
+			value = clampMag;
+		else if (value < -clampMag)
+			value = -clampMag;
+
+		int32_t intValue = real_to_int(value);
+
+		if (value != (double)(intValue))
+		{
+			// alas, have to round, then reconvert.
+			if (value < 0) 
+				value = -MathUtils::floor(-value);
+			else 
+				value = MathUtils::floor(value);
+
+			intValue = real_to_int(value);
+		}
+	
+		return intValue;
 	}
 
 	//
@@ -814,8 +850,8 @@ namespace avmplus
 		}
 
 		MMgc::GC::AllocaAutoPtr _tmp;
-		char* tmp = (char*)VMPI_alloca(core, _tmp, kMinSizeForDouble_toString);
-		char *src = tmp + kMinSizeForDouble_toString - 1;
+		char* tmp = (char*)VMPI_alloca(core, _tmp, kMinSizeForDouble_base2_toString);
+		char *src = tmp + kMinSizeForDouble_base2_toString - 1;
 		char *srcEnd = src;
 
 		bool negative=false;
@@ -840,7 +876,7 @@ namespace avmplus
 
 				*src-- = (char)((j < 10) ? ((int32_t)j + '0') : ((int32_t)j + ('a' - 10)));
 
-				AvmAssert(src > tmp);
+				AvmAssert(src >= tmp || 0 == uVal);
 			}
 
 			if (negative)
@@ -888,7 +924,7 @@ namespace avmplus
 		int32_t i, len = 0;
 
 		MMgc::GC::AllocaAutoPtr _buffer;
-		char* buffer = (char*)VMPI_alloca(core, _buffer, kMinSizeForDouble_toString);
+		char* buffer = (char*)VMPI_alloca(core, _buffer, kMinSizeForDouble_base10_toString);
 		char *s = buffer;
 		bool negative = false;
 
@@ -901,7 +937,7 @@ namespace avmplus
 		}
 
 		// initialize d2a engine
-		D2A *d2a = new D2A(value, mode, precision);
+		D2A *d2a = mmfx_new(D2A(value, mode, precision));
 		int32_t exp10 = d2a->expBase10()-1;
 		
 		// Sentinel is used for rounding
@@ -1174,7 +1210,7 @@ namespace avmplus
 		_asm fldcw [oldcw];
 		#endif
 
-		delete d2a;
+		mmfx_delete(d2a);
 
 		return core->newStringLatin1(s, len);
 	}
@@ -1191,7 +1227,7 @@ namespace avmplus
 		int32_t numDigits = 0;
 		int32_t exp10 = 0;
 		double result = 0;
-		utf32_t ch = 0;
+		uint32_t ch = 0;
 
 		StringIndexer s(inStr);
 		int32_t index = skipSpaces(s, 0);

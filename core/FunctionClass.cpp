@@ -102,15 +102,7 @@ namespace avmplus
 	Atom FunctionObject::AS3_call(Atom thisArg, Atom *argv, int argc)
 	{
 		thisArg = get_coerced_receiver(thisArg);
-
-		if (argc > 0) 
-		{
-			return _call->coerceEnter(thisArg, argc, argv);
-		}
-		else
-		{
-			return _call->coerceEnter(thisArg);
-		}
+		return _call->coerceEnter(thisArg, argc, argv);
 	}
 
 	/**
@@ -127,11 +119,11 @@ namespace avmplus
 		{
 			AvmCore* core = this->core();
 
+			// FIXME: why not declare argArray as Array in Function.as?
 			if (!AvmCore::istype(argArray, ARRAY_TYPE))
 				toplevel()->throwTypeError(kApplyError);
 
 			return _call->coerceEnter(thisArg, (ArrayObject*)AvmCore::atomToScriptObject(argArray));
-			
 		}
 		else
 		{
@@ -170,6 +162,11 @@ namespace avmplus
 		return _call->coerceEnter(argc, argv);
 	}
 
+	CodeContext* FunctionObject::getFunctionCodeContext() const 
+	{ 
+		return _call->scope()->abcEnv()->codeContext(); 
+	}
+
 	int FunctionObject::get_length()
 	{
 		MethodSignaturep ms = _call->method->getMethodSignature();
@@ -186,5 +183,12 @@ namespace avmplus
 		}
 		MethodSignaturep ms = _call->method->getMethodSignature();
 		return toplevel()->coerce(a, ms->paramTraits(0));
+	}
+
+	Stringp FunctionObject::implToString() const
+	{
+		AvmCore* core = this->core();
+		Stringp s = core->concatStrings(core->newConstantStringLatin1("[object Function-"), core->intToString(_call->method->method_id()));
+		return core->concatStrings(s, core->newConstantStringLatin1("]"));
 	}
 }

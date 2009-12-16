@@ -65,6 +65,9 @@ const char * const avmfeatures = ""
   #if AVMSYSTEM_DOUBLE_MSW_FIRST
     "AVMSYSTEM_DOUBLE_MSW_FIRST;"
   #endif
+  #if AVMSYSTEM_ARM_FPU
+    "AVMSYSTEM_ARM_FPU;"
+  #endif
   #if AVMSYSTEM_IA32
     "AVMSYSTEM_IA32;"
   #endif
@@ -80,6 +83,9 @@ const char * const avmfeatures = ""
   #if AVMSYSTEM_SPARC
     "AVMSYSTEM_SPARC;"
   #endif
+  #if AVMSYSTEM_MIPS
+    "AVMSYSTEM_MIPS;"
+  #endif
   #if AVMSYSTEM_UNIX
     "AVMSYSTEM_UNIX;"
   #endif
@@ -88,6 +94,9 @@ const char * const avmfeatures = ""
   #endif
   #if AVMSYSTEM_WIN32
     "AVMSYSTEM_WIN32;"
+  #endif
+  #if AVMSYSTEM_SYMBIAN
+    "AVMSYSTEM_SYMBIAN;"
   #endif
   #if AVMFEATURE_DEBUGGER
     "AVMFEATURE_DEBUGGER;"
@@ -101,6 +110,9 @@ const char * const avmfeatures = ""
   #if AVMFEATURE_JIT
     "AVMFEATURE_JIT;"
   #endif
+  #if AVMFEATURE_AOT
+    "AVMFEATURE_AOT;"
+  #endif
   #if AVMFEATURE_ABC_INTERP
     "AVMFEATURE_ABC_INTERP;"
   #endif
@@ -112,9 +124,6 @@ const char * const avmfeatures = ""
   #endif
   #if AVMFEATURE_SELFTEST
     "AVMFEATURE_SELFTEST;"
-  #endif
-  #if AVMFEATURE_UTF32
-    "AVMFEATURE_UTF32;"
   #endif
   #if AVMFEATURE_EVAL
     "AVMFEATURE_EVAL;"
@@ -142,6 +151,21 @@ const char * const avmfeatures = ""
   #endif
   #if AVMFEATURE_STATIC_FUNCTION_PTRS
     "AVMFEATURE_STATIC_FUNCTION_PTRS;"
+  #endif
+  #if AVMFEATURE_INDIRECT_NATIVE_THUNKS
+    "AVMFEATURE_INDIRECT_NATIVE_THUNKS;"
+  #endif
+  #if AVMFEATURE_OVERRIDE_GLOBAL_NEW
+    "AVMFEATURE_OVERRIDE_GLOBAL_NEW;"
+  #endif
+  #if AVMFEATURE_MEMORY_PROFILER
+    "AVMFEATURE_MEMORY_PROFILER;"
+  #endif
+  #if AVMFEATURE_CACHE_GQCN
+    "AVMFEATURE_CACHE_GQCN;"
+  #endif
+  #if AVMFEATURE_API_VERSIONING
+    "AVMFEATURE_API_VERSIONING;"
   #endif
 ;
 

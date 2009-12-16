@@ -57,8 +57,11 @@ MMgc_CXXSRCS := $(MMgc_CXXSRCS) \
   $(curdir)/GCLog.cpp \
   $(curdir)/GCMemoryProfiler.cpp \
   $(curdir)/GCObject.cpp \
+  $(curdir)/GCStack.cpp \
   $(curdir)/GCTests.cpp \
   $(curdir)/GCThreads.cpp \
+  $(curdir)/ZCT.cpp \
+  $(curdir)/GCGlobalNew.cpp \
   $(NULL)
 
 ifeq (arm,$(TARGET_CPU))

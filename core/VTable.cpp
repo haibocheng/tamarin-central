@@ -37,38 +37,323 @@
 
 
 #include "avmplus.h"
+//#define DOPROF
+//#include "vprof.h"
 
 namespace avmplus
 {
+
+#if defined FEATURE_NANOJIT
 	
-	VTable::VTable(Traits* _traits, VTable* _base, ScopeChain* scope, AbcEnv* _abcEnv, Toplevel* toplevel) :
-		_scope(scope),
+	/*
+		Research suggests that linear searches are best for up to 4 entries, binary
+		search best for 4...10, and lookup-table best for larger sizes. Lookup tables
+		are impractical here, since our iid values aren't consecutive but rather
+		arbitrary integers, so we just use linear-and-binary. Furthermore, profiling
+		suggested that separate linear search wasn't a measurable gain, so we
+		always do a binary search, in the name of simplicity.
+	
+		http://www.sagecertification.org/events/javavm02/full_papers/zendra/zendra_html/index.html
+	*/
+	
+	// AvmCore::bindingToMethodId will assert inapproppriately
+	static inline uint32_t getRawDispID(Binding b) { return  uint32_t(uintptr_t(b))>>3; }
+	
+	static void sortImtThunkEntries(ImtThunkEntry* map, uint32_t count)
+	{
+		// intervals suggested by http://www.research.att.com/~njas/sequences/A108870
+		// we'll never get anywhere near the upper limits but it's probably cheaper than extending algorithmically
+		static const uint32_t k_shellsort_intervals[] = { 1, 4, 9, 20, 46, 103, 233, 525, 1182, 2660, 5985, 13467, 30301, 
+											68178, 153401, 345152, 776591, 1747331, 3931496, 8845866, 19903198, 
+											44782196, 100759940, 226709866, 510097200, 1147718700 };
+		
+		// simple ShellSort -- the list rarely gets larger than 100 or so, so this is efficient and compact
+		if (count <= 1)
+			return;
+
+		ImtThunkEntry* beg = map;
+		ImtThunkEntry* end = map + count;	// one past end!
+
+		int32_t interval_idx = 0;
+		while (count > k_shellsort_intervals[interval_idx+1])
+			++interval_idx;
+
+		while (interval_idx >= 0)
+		{
+			const int32_t interval = k_shellsort_intervals[interval_idx--];
+			for (ImtThunkEntry* i = beg + interval; i < end; i++) 
+			{
+				ImtThunkEntry temp = *i;
+				ImtThunkEntry* j = i;
+				ImtThunkEntry* nj = j - interval;
+				while ((nj >= beg) && nj->iid > temp.iid)
+				{
+					AvmAssert(j >= beg && j < end);
+					AvmAssert(nj >= beg && nj < end);
+					*j = *nj;
+					j = nj;
+					nj = j - interval;
+				}
+				AvmAssert(j >= beg && j < end);
+				*j = temp;
+		   }
+		}
+	}
+	
+	class ImtEntry: public MMgc::GCObject
+	{
+	public:
+		inline ImtEntry(ImtEntry* n, MethodInfo* v, uint32_t d) : next(n), iid(v->iid()), disp_id(d) { }
+		ImtEntry* const next;
+		uintptr_t const iid;
+		uintptr_t const disp_id;
+	};
+
+	static ImtEntry* buildImtEntries(VTable* vtable, uint32_t slot, uint32_t& count)
+	{
+		ImtEntry* map = NULL;
+		count = 0;
+		
+		MMgc::GC* gc = vtable->traits->core->GetGC(); 
+		Traitsp traits = vtable->traits;
+		AvmAssert(!traits->isInterface());
+		AvmAssert(traits->core->IsJITEnabled());
+		
+		// first check to see if we added any interfaces. if not, we can just inherit.
+		// do this first, since it's pretty common and allows us to skip lots of hashtable lookups
+		// and memory allocations.
+		if (!traits->implementsNewInterfaces())
+			return NULL;
+		
+		TraitsBindingsp tb = traits->getTraitsBindings();
+		for (InterfaceIterator ifc_iter(traits); ifc_iter.hasNext();)
+		{
+			Traits* ifc = ifc_iter.next();
+			
+			TraitsBindingsp ifcd = ifc->getTraitsBindings();
+			StTraitsBindingsIterator iter(ifcd);
+			while (iter.next())
+			{
+				const Stringp name = iter.key();
+				if (name == NULL)
+					continue;
+
+				const Namespacep ns = iter.ns();
+				const Binding iBinding = iter.value();
+
+				// taking some liberties here in the name of compact code...
+				// the opaque AvmCore accessors aren't flexible enough here,
+				// rely on knowledge of current Binding structure
+				const uint32_t iDispID = getRawDispID(iBinding);
+				const BindingKind ibk = AvmCore::bindingKind(iBinding);
+				Binding cBinding = BIND_NONE;
+				
+				MethodInfo* v0 = ((1<<ibk) & ((1<<BKIND_METHOD)|(1<<BKIND_GET)|(1<<BKIND_GETSET))) ? 
+									ifcd->getMethod(iDispID) :
+									NULL;
+
+				if (v0 && uint32_t(v0->iid() % VTable::IMT_SIZE) == slot)
+				{
+					if (cBinding == BIND_NONE)
+						cBinding = tb->findBinding(name, ns);
+					AvmAssert(cBinding != BIND_NONE);
+					map = new (gc) ImtEntry(map, v0, getRawDispID(cBinding));
+					++count;
+				}
+
+				MethodInfo* v1 = ((1<<ibk) & ((1<<BKIND_SET)|(1<<BKIND_GETSET))) ? 
+									ifcd->getMethod(iDispID+1) :
+									NULL;
+				if (v1 && uint32_t(v1->iid() % VTable::IMT_SIZE) == slot)
+				{
+					if (cBinding == BIND_NONE)
+						cBinding = tb->findBinding(name, ns);
+					AvmAssert(cBinding != BIND_NONE);
+					map = new (gc) ImtEntry(map, v1, getRawDispID(cBinding)+1);
+					++count;
+				}
+			} // for j
+		}
+		
+		AvmAssert(map != NULL);
+		return map;
+	}
+
+	/*static*/ GprImtThunkProcRetType VTable::dispatchImt(ImtThunkEnv* ite, int argc, uint32* ap, uintptr_t iid)
+	{
+		AvmAssert(ite->imtMapCount > 1);
+		const ImtThunkEntry* const m = ite->entries();
+		uint32_t lo = 0;
+		uint32_t hi = ite->imtMapCount;
+		while (lo < hi)
+		{
+			uint32_t const mid = (lo + hi) >> 1;
+			if (m[mid].iid < iid)
+			{
+				lo = mid + 1;
+			}
+			else
+			{
+				hi = mid;
+			}
+		}
+		AvmAssert((lo < ite->imtMapCount) && (m[lo].iid == iid));
+   		ScriptObject* const receiver = *(ScriptObject**)ap;
+		MethodEnv* const env = receiver->vtable->methods[m[lo].disp_id];
+		return (*env->implGPR())(env, argc, ap);
+	}
+
+	/*static*/ GprImtThunkProcRetType VTable::resolveImt(ImtThunkEnv* ite, int argc, uint32* ap, uintptr_t iid)
+	{
+		const uint32_t slot = iid % IMT_SIZE;
+
+		VTable* self = ite->vtable;
+		
+		self->resolveImtSlot(slot);
+
+		ite = self->imt[slot]; // get the fresh, new one
+
+		return (*ite->implImtGPR())(ite, argc, ap, iid);
+	}
+
+	// Copy the imt thunk from the base vtable - callers must make sure
+	// that the stub can be copied from the base class - i.e. resolveImtSlotFromBase
+	// or resolveImtSlotSelf must have already been called successfully on the base vtable.
+	void VTable::resolveImtSlotFromBase(uint32_t slot)
+	{
+		AvmCore* core = traits->core;
+		MMgc::GC* gc = core->GetGC();
+
+		ImtThunkEnv* ite = base->imt[slot];
+		// copy down imt stub from base class
+		AvmAssert(ite != NULL);
+
+		// if base->imt[i] is really an IMT thunk, use it.
+		// BUT, it might be a plain MethodEnv* from a single-entry case, in which case
+		// we want to use our own MethodEnv at the same disp-id. Alas, we don't have the disp-id 
+		// handy at this point, since we didn't build the ImtEntry chain. Rather than build it in 
+		// all cases, let's compare vs our parent's method list; linear search, but I'm guessing that's
+		// still a net win vs. doing the ImtEntry chain building. (Our base's TB is most likely still
+		// in the cache since we used it inside buildImtEntries.)
+		TraitsBindingsp tb = base->traits->getTraitsBindings();
+		for (uint32_t j = 0; j < tb->methodCount; ++j)
+		{
+			if (ite == (ImtThunkEnv*)base->methods[j])
+			{
+				ite = (ImtThunkEnv*)this->methods[j];
+				break;
+			}
+		}
+		WB(gc, this, &imt[slot], ite);
+	}
+
+	// returns false if we need to copy the imt stub from base,
+	// otherwise returns true
+	bool VTable::resolveImtSlotSelf(uint32_t slot)
+	{
+		AvmAssert(this->linked);
+		AvmAssert(this->base != NULL); // only Object has null base, and it has no Interfaces
+		AvmAssert(!traits->isInterface());
+		AvmAssert(traits->core->IsJITEnabled());
+		
+		ImtThunkEnv* ite;
+		uint32_t imtMapCount = 0;
+
+		ImtEntry* imtMap = buildImtEntries(this, slot, imtMapCount);
+		if (!imtMap)
+		{
+			return false;
+		}
+		else
+		{
+			AvmCore* core = traits->core;
+			MMgc::GC* gc = core->GetGC();
+
+			AvmAssert(imtMapCount > 0);
+			if (imtMapCount == 1)
+			{
+				ite = (ImtThunkEnv*) this->methods[imtMap->disp_id];
+				gc->Free(imtMap);
+			}
+			else
+			{
+				ite = new (gc, imtMapCount * sizeof(ImtThunkEntry)) ImtThunkEnv(VTable::dispatchImt, imtMapCount);
+				//_nvprof("IMT ",MMgc::GC::Size(ite));
+				ImtThunkEntry* m = ite->entries();
+				ImtEntry* e = imtMap;
+				while (e)
+				{
+					m->iid = e->iid;
+					m->disp_id = e->disp_id;
+					++m;
+					ImtEntry* t = e;
+					e = e->next;
+					gc->Free(t);
+				}
+				sortImtThunkEntries(ite->entries(), ite->imtMapCount);
+			}
+			WB(gc, this, &imt[slot], ite);
+		}
+		return true;
+	}
+
+	void VTable::resolveImtSlot(uint32_t slot)
+	{
+		AvmCore* core = traits->core;
+		MMgc::GC* gc = core->GetGC();
+
+		if( this->resolveImtSlotSelf(slot) )
+			return;
+
+		List<VTable*> work_stack(gc);
+
+		work_stack.add(this);
+
+		// Walk up the base VTables until we find one where the slot
+		// can be resolved without copying it from its base
+		VTable* cur = this->base;
+		while(cur->imt[slot]->implImtGPR() == VTable::resolveImt 
+			&& !cur->resolveImtSlotSelf(slot) ) 
+		{
+			work_stack.add(cur);
+			cur = cur->base;
+		}
+
+		// work backwards through the base types, copying
+		// the imt stub down as we go
+		uint32 size = work_stack.size();
+		for(uint32 i = 0; i < size; ++i)
+		{
+			cur = work_stack[size-i-1];
+			cur->resolveImtSlotFromBase(slot);
+		}
+	}
+	
+#endif // FEATURE_NANOJIT
+	
+	VTable::VTable(Traits* traits, VTable* _base, Toplevel* toplevel) :
 		_toplevel(toplevel),
-		abcEnv(_abcEnv),
 		init(NULL),
 		base(_base),
 		ivtable(NULL),
-		traits(_traits),
+		traits(traits),
 		linked(false)
 	{
 		AvmAssert(traits != NULL);
-		AVMPLUS_TRAITS_MEMTRACK_ONLY( tmt_add_inst(TMT_vtable, this); )
 	}
 
-#ifdef AVMPLUS_TRAITS_MEMTRACK 
-	VTable::~VTable()
+	void VTable::resolveSignatures(ScopeChain* scope)
 	{
-		AVMPLUS_TRAITS_MEMTRACK_ONLY( tmt_sub_inst(TMT_vtable, this); )
-	}
-#endif
+		AvmAssert(scope != NULL);
 
-	void VTable::resolveSignatures()
-	{
 		if( this->linked )
 			return;
 		linked = true;
 		if (!traits->isResolved())
+		{
 			traits->resolveSignatures(toplevel());
+			traits->init_declaringScopes(scope->scopeTraits());
+		}
 
 #if defined(DEBUG) || defined(_DEBUG)
 		// have to use local variables for CodeWarrior
@@ -83,7 +368,7 @@ namespace avmplus
 
 		if (traits->init && !this->init)
 		{
-			this->init = makeMethodEnv(traits->init);
+			this->init = makeMethodEnv(traits->init, scope);
 		}
 
 		// populate method table
@@ -105,11 +390,11 @@ namespace avmplus
 			if (method != NULL)
 			{
 				//this->methods[i] = new (gc) MethodEnv(method, this);
-				WB(gc, this, &methods[i], makeMethodEnv(method));
+				WB(gc, this, &methods[i], makeMethodEnv(method, scope));
 				continue;
 			}
 			#ifdef AVMPLUS_VERBOSE
-			if (traits->pool->verbose)
+			if (traits->pool->isVerbose(VB_traits))
 			{
 				// why would the compiler assign sparse disp_id's?
 				traits->core->console << "WARNING: empty disp_id " << i << " on " << traits << "\n";
@@ -123,40 +408,24 @@ namespace avmplus
 			traits->isDictionary = base->traits->isDictionary;
 
 #if defined FEATURE_NANOJIT
+		if (traits->core->IsJITEnabled())
 		{
-			for (uint32_t i=0; i < Traits::IMT_SIZE; i++)
+			ImtThunkEnv* ite = new (gc) ImtThunkEnv(VTable::resolveImt, this);
+			for (uint32_t i=0; i < IMT_SIZE; i++)
 			{
-				Binding b = traits->getIMT()[i];
-				if (AvmCore::isMethodBinding(b))
-				{
-					//imt[i] = methods[AvmCore::bindingToMethodId(b)];
-					WB(gc, this, &imt[i], methods[AvmCore::bindingToMethodId(b)]);
-				}
-				else if (AvmCore::bindingKind(b) == BKIND_ITRAMP)
-				{
-					if (base && b == traits->base->getIMT()[i])
-					{
-						// copy down imt stub from base class
-						//imt[i] = base->imt[i];
-						WB(gc, this, &imt[i], base->imt[i]);
-					}
-					else
-					{
-						// create new imt stub
-						MethodInfo *mi = AvmCore::getITrampAddr(b);
-						MethodEnv* e = new (gc) MethodEnv(MethodEnv::kTrampStub, mi, this);
-						WB(gc, this, &imt[i], e);
-					}
-				}
+				// they all share the same ImtThunkEnv for now 
+				// (lazily replaced in resolveImt by an inherited or new one)
+				WB(gc, this, &imt[i], ite);
 			}
 		}
 #endif
 	}
 
-	MethodEnv *VTable::makeMethodEnv(MethodInfo *func)
+	MethodEnv* VTable::makeMethodEnv(MethodInfo* func, ScopeChain* scope)
 	{
-		AvmCore *core = traits->core;
-		MethodEnv *methodEnv = new (core->GetGC()) MethodEnv(func, this);
+		AvmCore* core = this->core();
+		AbcEnv* abcEnv = scope->abcEnv();
+		MethodEnv* methodEnv = new (core->GetGC()) MethodEnv(func, scope);
 		// register this env in the callstatic method table
 		int method_id = func->method_id();
 		if (method_id != -1)
@@ -167,7 +436,7 @@ namespace avmplus
 				abcEnv->setMethod(method_id, methodEnv);
 			}
 			#ifdef AVMPLUS_VERBOSE
-			else if (func->pool()->verbose)
+			else if (func->pool()->isVerbose(VB_traits))
 			{
 				core->console << "WARNING: tried to re-register global MethodEnv for " << func << "\n";
 			}
@@ -210,7 +479,7 @@ namespace avmplus
 	{
 		Toplevel* toplevel = this->toplevel();
 		AvmCore* core = toplevel->core();
-		Namespacep traitsNs = this->traits->ns;
+		Namespacep traitsNs = this->traits->ns();
 		PoolObject* traitsPool = this->traits->pool;
 
 		Stringp classname = core->internString(fullname->appendLatin1("$"));
@@ -232,17 +501,20 @@ namespace avmplus
 		ctraits->resolveSignatures(toplevel);
 
 		VTable* objVecVTable = toplevel->objectVectorClass->vtable;
-		AbcEnv* objVecAbcEnv = objVecVTable->abcEnv;
+		AbcEnv* objVecAbcEnv = toplevel->vectorobj_cscope->abcEnv();
 		Toplevel* objVecToplevel = objVecVTable->toplevel();
 		VTable* objVecIVTable = objVecVTable->ivtable;
 
-		VTable* cvtab = core->newVTable(ctraits, objVecToplevel->class_ivtable, objVecVTable->scope(), objVecAbcEnv, objVecToplevel); 
-		VTable* ivtab = core->newVTable(itraits, objVecIVTable, objVecIVTable->scope(), objVecAbcEnv, objVecToplevel);
+		VTable* cvtab = core->newVTable(ctraits, objVecToplevel->class_ivtable, objVecToplevel); 
+		ScopeChain* cvtab_cscope = toplevel->vectorobj_cscope->cloneWithNewVTable(core->GetGC(), cvtab, objVecAbcEnv);
+
+		VTable* ivtab = core->newVTable(itraits, objVecIVTable, objVecToplevel);
+		ScopeChain* ivtab_iscope = toplevel->vectorobj_iscope->cloneWithNewVTable(core->GetGC(), ivtab, objVecAbcEnv);
 		cvtab->ivtable = ivtab;
 		ivtab->init = objVecIVTable->init;
 
-		cvtab->resolveSignatures();
-		ivtab->resolveSignatures();
+		cvtab->resolveSignatures(cvtab_cscope);
+		ivtab->resolveSignatures(ivtab_iscope);
 		
 		return cvtab;
 	}

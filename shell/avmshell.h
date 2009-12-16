@@ -39,30 +39,73 @@
 #define __avmshell__
 
 #include "avmplus.h"
-#include "Selftest.h"
-#include "Platform.h"
-#include "File.h"
 
-using namespace avmplus;
+#if defined AVMPLUS_MAC || defined AVMPLUS_UNIX
+  // Support for the -workers switch and distributing files across
+  // multiple AvmCores on multiple threads.  Only the code in the
+  // shell depends on this setting; the AVM core code works out of
+  // the box.
+  //
+  // Requires pthreads.
+  #define VMCFG_WORKERTHREADS
+#endif
 
+#if defined VMCFG_TESTING
+  // We simulate Flash's use of API versioning for testing only.
+  #define VMCFG_TEST_VERSIONING
+#endif
 
+#if !defined(UNDER_CE) && !defined(AVM_SHELL_NO_PROJECTOR)
+#  define AVMSHELL_PROJECTOR_SUPPORT
+#endif
+
+#define INT32_T_MAX		0x7FFFFFFF	//max value for a 32-bit integer
+#define UINT32_T_MAX	0xFFFFFFFF	//max value for a 32-bit unsigned integer
+
+#ifdef _MSC_VER
+#pragma warning(disable:4996)		// 'scanf' was declared deprecated
+#endif
+
+// forward declarations for shell_toplevel.h
 namespace avmshell
 {
-	class ByteArrayObject;
-	class ByteArray;
-	// avmplus and NSPR both typedef some basic types: we must disambiguate
-	//using avmplus::uintptr;
-	//using avmplus::uint64;
-	//using avmplus::uint32;
-	//using avmplus::uint16;
-	//using avmplus::uint8;
-	//using avmplus::wchar;
+	class SystemClass;
 }
+namespace avmplus
+{
+	class SampleObject;
+	class StackFrameObject;
+	class NewObjectSampleObject;
+	class TraceClass;
+}
+
+#include "shell_toplevel.h"
+
+using namespace avmplus;
 
 namespace avmplus
 {
 	class Dictionary;
 }
+
+#ifdef VMCFG_AOT
+#include "../aot/AOTCompiler.h"
+#endif
+
+namespace avmshell
+{
+	class ByteArray;
+	class Shell;
+	class ShellCodeContext;
+	class ShellCore;
+	class ShellCoreImpl;
+	class ShellSettings;
+	class ShellToplevel;
+}
+
+#include "Selftest.h"
+#include "Platform.h"
+#include "File.h"
 
 #include "FileInputStream.h"
 #include "ConsoleOutputStream.h"
@@ -76,77 +119,62 @@ namespace avmplus
 #include "DictionaryGlue.h"
 #include "SamplerScript.h"
 #include "JavaGlue.h"
-
-#define INT32_T_MAX		0x7FFFFFFF	//max value for a 32-bit integer
-#define UINT32_T_MAX	0xFFFFFFFF	//max value for a 32-bit unsigned integer
-
-#ifdef _MSC_VER
-#pragma warning(disable:4996)
-#endif
-
-namespace avmplus
-{
-	namespace NativeID
-	{
-        #include "shell_toplevel.h"
-    }
-}
+#include "ShellCore.h"
 
 namespace avmshell
 { 
+	// The stack margin is the amount of stack that should be available to native
+	// code that does not itself check for stack overflow.  The execution engines
+	// in the VM will reserve this amount of stack.
+	
+#ifdef AVMPLUS_64BIT
+	const size_t kStackMargin = 262144;
+#elif (defined AVMPLUS_WIN32 && defined UNDER_CE) || defined AVMPLUS_SYMBIAN
+	// FIXME: all embedded platforms, but we have no way of expressing that now
+	const size_t kStackMargin = 32768;
+#else
+	const size_t kStackMargin = 131072;
+#endif
+	
+	// The fallback stack size is probably not safe but is used by the shell code
+	// if it fails to obtain the stack size from the operating system.
+	// 512KB is the traditional value.
+
+	const size_t kStackSizeFallbackValue = 512*1024;
+
 	// exit codes
 	enum {
 		OUT_OF_MEMORY = 128,
 	};
 	
-	class ShellCodeContext : public CodeContext
-	{
-	  public:
-		DWB(DomainEnv*) m_domainEnv;
-		virtual ~ShellCodeContext() {}
-		virtual DomainEnv *domainEnv() const { return m_domainEnv; }
-	};
-
 	// swf support, impl code in swf.cpp
 	bool isSwf(ScriptBuffer);
 	void handleSwf(const char *, ScriptBuffer, DomainEnv*, Toplevel*&, CodeContext*);
 
-	
-	// Structure for command line arguments.
+#ifdef VMCFG_AOT
+	// AOT support, impl code in aot.cpp
+    void handleAOT(AvmCore*, Domain*, DomainEnv*, Toplevel*&, CodeContext*);
+#endif
 
-	struct ShellSettings 
+	class ShellSettings : public ShellCoreSettings
 	{
+	public:
 		ShellSettings();
-		int filenamesPos;
-		int endFilenamePos;
-		bool nodebugger;
+		
+		char* programFilename;			// name of the executable, or NULL
+		char** filenames;				// non-terminated array of file names, never NULL
+		int numfiles;					// number of entries in 'filenames'
+		bool do_selftest;
 		bool do_repl;
 		bool do_log;
-		bool do_verbose;	// copy to config
-		bool enter_debugger_on_launch;
-		bool do_selftest;
-		const char* st_component;
-		const char* st_category;
-		const char* st_name;
-		char st_mem[200];		// Ought to be enough for anyone
-		AvmCore::CacheSizes cacheSizes;	// defaults to unlimited
+		bool do_projector;
 		int numthreads;
 		int numworkers;
-		bool interrupts;	// copy to config
-		bool verifyall;		// copy to config
-		bool sse2;			// copy to config
-		bool greedy;		// copy to each GC
-		bool nogc;			// copy to each GC
-		bool incremental;	// copy to each GC
-		int langID;			// copy to ShellCore?
-		bool bbgraph;		// copy to config
-		bool cseopt;		// copy to config
-		Runmode runmode;	// copy to config
-		bool do_projector;
+		int repeats;
+		uint32_t stackSize;
+		char st_mem[200];				// Selftest scratch memory.  200 chars ought to be enough for anyone
 	};
-
-	class ShellCore;
-
+	
 	/**
 	 * Shell driver and command line parser.
 	 */
@@ -155,93 +183,39 @@ namespace avmshell
 		static int run(int argc, char *argv[]);
 
 	private:
+		static void singleWorker(ShellSettings& settings);
+		static void singleWorkerHelper(ShellCore* shell, ShellSettings& settings);
+#ifdef VMCFG_WORKERTHREADS
+		static void multiWorker(ShellSettings& settings);
+#endif
 		static void repl(ShellCore* shellCore);
 		static void initializeLogging(const char* basename);
 		static void parseCommandLine(int argc, char* argv[], ShellSettings& settings);
 		static void usage();
 	};
 	
-	
+
 	/**
-	 * A structure around the avmplus core.  This can be used to execute and debug .abc files
-	 * from the command line, by help from the Shell driver.
+	 * A subclass of ShellCore that provides an implementation of setStackLimit().
 	 */
-	class ShellCore : public AvmCore
-	{
-	friend class Shell;
+	class ShellCoreImpl : public ShellCore {
 	public:
-		bool setup(int argc, char *argv[], ShellSettings& settings);
-		int execute(const char* filename, ShellSettings& settings);
-		void executeProjector(char *executablePath, int& exitCode);
+		/**
+		 * @param gc          The garbage collector for this core
+		 * @param mainthread  True if this core is being used on the main thread and not on a spawned
+		 *                    thread.  It must be one or the other; a core created on a spawned thread
+		 *                    cannot be used on the main thread or vice versa.
+		 */
+		ShellCoreImpl(MMgc::GC* gc, ShellSettings& settings, bool mainthread);
 		
-		void interrupt(MethodEnv *env);
-		void stackOverflow(MethodEnv *env);
-
-		void setEnv(Toplevel *toplevel, int argc, char *argv[]);
-
-		virtual Toplevel* createToplevel(AbcEnv* abcEnv);
-		Toplevel* initShellBuiltins();
-
-		SystemClass* systemClass;
-		PoolObject* shellPool;
-
-	protected:
-		ShellCore(MMgc::GC *gc);
+		/**
+		 * Set AvmCore::minstack appropriately for the current thread.
+		 */
+		virtual void setStackLimit();
 		
-		void initShellPool();
-
-		static void interruptTimerCallback(void* data);
-		
-		int handleArbitraryExecutableContent(ScriptBuffer& code, const char * filename);
-#ifdef VMCFG_EVAL
-		void evaluateAtToplevel(String* input, bool record_time);
-		String* decodeBytesAsUTF16String(uint8_t* bytes, uint32_t nbytes, bool terminate=false);
-		virtual String* readFileForEval(String* referencing_filename, String* filename);
-#endif // VMCFG_EVAL
-
 	private:
-		OutputStream *consoleOutputStream;
-		bool gracePeriod;
-		bool inStackOverflow;
-		int allowDebugger;
-		Toplevel* shell_toplevel;
-		Domain* shell_domain;
-		DomainEnv* shell_domainEnv;
-	
-#ifdef DEBUGGER
-	protected:
-		virtual avmplus::Debugger* createDebugger() { AvmAssert(allowDebugger >= 0); return allowDebugger ? new (GetGC()) DebugCLI(this) : NULL; }
-		virtual avmplus::Profiler* createProfiler() { AvmAssert(allowDebugger >= 0); return allowDebugger ? new (GetGC()) Profiler(this) : NULL; }
-	private:
-		inline DebugCLI* debugCLI() { return (DebugCLI*)debugger(); }
-#endif
-	};
-
-
-	class ShellToplevel : public Toplevel
-	{
-	public:
-		ShellToplevel(AbcEnv* abcEnv);
-
-		ShellCore* core() const {
-			return (ShellCore*)Toplevel::core();
-		}
-
-		virtual ClassClosure *getBuiltinExtensionClass(int class_id) 
-		{ 
-            return shellClasses[class_id] ? shellClasses[class_id] : resolveShellClass(class_id);
-		}
-
-	private:
-
-		ClassClosure* resolveShellClass(int class_id)
-		{
-			ClassClosure* cc = findClassInPool(class_id, core()->shellPool);
-			WBRC(core()->GetGC(), shellClasses, &shellClasses[class_id], cc);
-			return cc;
-		}
-
-		DWB(ClassClosure**) shellClasses;
+		ShellSettings& settings;
+		bool mainthread;
 	};
 }
 

@@ -40,79 +40,83 @@
 
 namespace avmplus
 {
-	Domain::Domain(AvmCore *_core, Domain* base) : base(base)
-		  , core(_core)
-		  , globalMemoryBase(m_gmInfo.globalMemoryScratch)
-		  , globalMemorySize(sizeof(m_gmInfo.globalMemoryScratch))
+	Domain::Domain(AvmCore* core, Domain* base) : 
+            m_base(base),
+		    m_core(core),
+            m_namedTraits(new (core->GetGC()) MultinameHashtable()),
+            m_namedScripts(new (core->GetGC()) MultinameHashtable()),
+	        m_globalMemoryScratch(mmfx_new0(Scratch)),
+            m_globalMemoryBase(m_globalMemoryScratch->scratch),
+		    m_globalMemorySize(GLOBAL_MEMORY_MIN_SIZE)
 	{
-		m_gmInfo.globalMemory = NULL;
-		// should be able to contain largest read or write (currently double)
-		AvmAssert(sizeof(m_gmInfo.globalMemoryScratch) >= sizeof(double));
-		namedTraits  = new (_core->GetGC()) MultinameHashtable();
-		namedScripts = new (_core->GetGC()) MultinameHashtable();
 	}
 
-	Traits* Domain::getNamedTraits(Stringp name, Namespacep ns, bool recursive/*=true*/) const
+	Domain::~Domain()
+	{
+        mmfx_delete(m_globalMemoryScratch);
+	}
+
+	Traits* Domain::getNamedTraits(Stringp name, Namespacep ns, bool recursive/*=true*/)
 	{
 		Traits *traits = NULL;
-		if (recursive && base) {
-			traits = base->getNamedTraits(name, ns, true);
+		if (recursive && m_base) {
+			traits = m_base->getNamedTraits(name, ns, true);
 		}
 		if (!traits) {
-			traits = (Traits*) namedTraits->get(name, ns);
+			traits = (Traits*) m_namedTraits->get(name, ns);
 		}
 		return traits;
 	}
 
-	Traits* Domain::getNamedTraits(const Multiname *multiname, bool recursive/*=true*/) const
+	Traits* Domain::getNamedTraits(const Multiname *multiname, bool recursive/*=true*/)
 	{
 		Traits *traits = NULL;
-		if (recursive && base) {
-			traits = base->getNamedTraits(multiname, true);
+		if (recursive && m_base) {
+			traits = m_base->getNamedTraits(multiname, true);
 		}
 		if (!traits) {
-			traits = (Traits*) namedTraits->getMulti(multiname);
+			traits = (Traits*) m_namedTraits->getMulti(multiname);
 		}
 		return traits;
 	}
 	
-	MethodInfo* Domain::getNamedScript(Stringp name, Namespacep ns) const
+	MethodInfo* Domain::getNamedScript(Stringp name, Namespacep ns)
 	{
 		MethodInfo* f = NULL;
-		if (base) {
-			f = base->getNamedScript(name, ns);
+		if (m_base) {
+			f = m_base->getNamedScript(name, ns);
 		}
 		if (!f) {
-			f = (MethodInfo*)namedScripts->get(name, ns);
+			f = (MethodInfo*)m_namedScripts->get(name, ns);
 		}
 		return f;
 	}
 
-	MethodInfo* Domain::getNamedScript(const Multiname *multiname) const
+	MethodInfo* Domain::getNamedScript(const Multiname *multiname)
 	{
 		MethodInfo* f = NULL;
-		if (base) {
-			f = base->getNamedScript(multiname);
+		if (m_base) {
+			f = m_base->getNamedScript(multiname);
 		}
 		if (!f) {
-			f = (MethodInfo*)namedScripts->getMulti(multiname);
+			f = (MethodInfo*)m_namedScripts->getMulti(multiname);
 		}
 		return f;
 	}
 
-	bool Domain::setGlobalMemory(ScriptObject *mem) const
+	bool Domain::set_globalMemory(ScriptObject* providerObject)
 	{
-		if(!mem)
+		if (!providerObject || !providerObject->getGlobalMemoryProvider())
 		{
 			// null obj -- use scratch
-			if(m_gmInfo.globalMemory) // unsubscribe from current if any
-				globalMemoryUnsubscribe(m_gmInfo.globalMemory);
+			if (m_globalMemoryProviderObject) // unsubscribe from current if any
+				globalMemoryUnsubscribe(m_globalMemoryProviderObject);
 			// remember NULL obj
-			m_gmInfo.globalMemory = NULL;
+			m_globalMemoryProviderObject = NULL;
 			// point at scratch mem
-			notifyGlobalMemoryChanged(m_gmInfo.globalMemoryScratch, sizeof(m_gmInfo.globalMemoryScratch));
+			notifyGlobalMemoryChanged(m_globalMemoryScratch->scratch, GLOBAL_MEMORY_MIN_SIZE);
 		}
-		else if(!globalMemorySubscribe(mem))
+		else if (!globalMemorySubscribe(providerObject))
 		{
 			// failed... do nothing
 			return false;
@@ -121,268 +125,141 @@ namespace avmplus
 		{
 			// success on globalMemorySubscribe would have led to notifyGlobalMemoryChanged
 			// success... unsubscribe from original
-			if(m_gmInfo.globalMemory)
-				globalMemoryUnsubscribe(m_gmInfo.globalMemory);
+			if (m_globalMemoryProviderObject)
+				globalMemoryUnsubscribe(m_globalMemoryProviderObject);
 			// remember the new one
-			m_gmInfo.globalMemory = mem;
+			m_globalMemoryProviderObject = providerObject;
 		}
 		return true;
 	}
 
-	// record that this unsigned char ** refers to a pointer to the
+	// record that this uint8_t** refers to a pointer to the
 	// global memory backing store
-	void Domain::addGlobalMemoryBaseRef(unsigned char **baseRef) const
+	void Domain::addGlobalMemoryBaseRef(uint8_t** baseRef)
 	{
 		AvmAssert(baseRef != NULL);
 
 		// find the not slot in a given chunk
-		int mod = m_gmInfo.globalMemoryBaseRefNum % GMInfo::REFS_PER_CHUNK;
+		uint32_t mod = m_globalMemoryBaseRefNum % REFS_PER_CHUNK;
 
-		GMInfo::BaseRefChunk *refs;
+		BaseRefChunk* refs;
 
 		// if the slot is zero, we need a new chunk
-		if(!mod)
+		if (!mod)
 		{
-			refs = new (core->GetGC()) GMInfo::BaseRefChunk();
-			refs->next = m_gmInfo.globalMemoryBaseRefs;
-			m_gmInfo.globalMemoryBaseRefs = refs;
+			refs = new (core()->GetGC()) BaseRefChunk();
+			refs->next = m_globalMemoryBaseRefs;
+			m_globalMemoryBaseRefs = refs;
 		}
 		else
-			refs = m_gmInfo.globalMemoryBaseRefs;
+        {
+			refs = m_globalMemoryBaseRefs;
+        }
 		// put it in the right slot
 		refs->refs[mod] = baseRef;
 		// and remember we added one
-		m_gmInfo.globalMemoryBaseRefNum++;
+		m_globalMemoryBaseRefNum++;
 	}
 
 	// same as addGlobalMemoryBaseRef but for references to the
 	// size of the global memory object
-	void Domain::addGlobalMemorySizeRef(uint32 *sizeRef) const
+	void Domain::addGlobalMemorySizeRef(uint32_t* sizeRef)
 	{
 		AvmAssert(sizeRef != NULL);
 
-		int mod = m_gmInfo.globalMemorySizeRefNum % GMInfo::REFS_PER_CHUNK;
+		uint32_t mod = m_globalMemorySizeRefNum % REFS_PER_CHUNK;
 
-		GMInfo::SizeRefChunk *refs;
+		SizeRefChunk* refs;
 
-		if(!mod)
+		if (!mod)
 		{
-			refs = new (core->GetGC()) GMInfo::SizeRefChunk();
-			refs->next = m_gmInfo.globalMemorySizeRefs;
-			m_gmInfo.globalMemorySizeRefs = refs;
+			refs = new (core()->GetGC()) SizeRefChunk();
+			refs->next = m_globalMemorySizeRefs;
+			m_globalMemorySizeRefs = refs;
 		}
 		else
-			refs = m_gmInfo.globalMemorySizeRefs;
+			refs = m_globalMemorySizeRefs;
 		refs->refs[mod] = sizeRef;
-		m_gmInfo.globalMemorySizeRefNum++;
+		m_globalMemorySizeRefNum++;
 	}
-
-	// junk to toggle protection on code while
-	// updating global memory stuff
-	// TODO get rid of ifdefs (some/most of this
-	// functionality lives in GCHeap at various
-	// levels)
-	class ProtectionHelper
-	{
-	private:
-
-	#if defined(AVMPLUS_WIN32)
-		typedef DWORD PROT_TYPE;
-		typedef size_t PROT_SIZE;
-	#elif (defined(AVMPLUS_MAC) || defined(AVMPLUS_UNIX) || defined(AVMPLUS_SYMBIAN))
-		typedef int PROT_TYPE;
-		typedef size_t PROT_SIZE;
-	#else
-		#error "PROT_TYPE and PROT_SIZE must be defined for this platform"
-	#endif
-
-		void*			m_lastPage;			// pointer to first page we have currently toggled
-		PROT_TYPE		m_lastPageProt;		// old protection of pages currently toggled
-		PROT_SIZE		m_lastPageSize;		// size of memory current toggled (divisible by page size)
-		const PROT_SIZE	m_pageSize;
-	#if (defined(AVMPLUS_MAC) || defined(AVMPLUS_UNIX) || defined(AVMPLUS_SYMBIAN))
-		void*			m_codeMin;
-		void*			m_codeMax;
-	#endif
-	
-	private:
-		void* GetPage(void *p, sintptr off)
-		{
-			return (void *)(~(m_pageSize-1) & (off + (sintptr)p));
-		}
-
-	public:
-
-		ProtectionHelper() : 
-			m_lastPage(NULL), 
-			m_lastPageProt(0), 
-			m_lastPageSize(0), 
-			m_pageSize(MMgc::GCHeap::GetGCHeap()->kNativePageSize)
-#if (defined(AVMPLUS_MAC) || defined(AVMPLUS_UNIX) || defined(AVMPLUS_SYMBIAN))
-			, m_codeMin(NULL)
-			, m_codeMax(NULL)
-#endif
-		{
-		}
-
-		// flush the instruction cache
-		void FlushCache()
-		{
-		#if defined(AVMPLUS_WIN32)
-			FlushInstructionCache(GetCurrentProcess(), NULL, 0);
-		#elif (defined(AVMPLUS_MAC) || defined(AVMPLUS_UNIX))
-			if (m_codeMin)
-			{
-				AvmAssert(m_codeMax != NULL);
-				msync((maddr_ptr)m_codeMin, (char*)m_codeMax - (char*)m_codeMin + m_pageSize, MS_INVALIDATE);
-			}
-		#elif defined(AVMPLUS_SYMBIAN)
-			// nothing
-		#else
-			#pragma warning flush instruction cache?
-		#endif
-		}
-
-		// if p != NULL, ensure that [p, p+r) is writeable
-		// (and maybe restore previous state for previous protect change)
-		// if p == NULL, restore previous state
-		// ([m_lastPage, m_lastPage + m_lastPageSize) to m_lastPageProt protection)
-		void MakeWriteable(void* p, uint32 r)
-		{
-			AvmAssert(r < m_pageSize);
-			void* page = GetPage(p, 0);
-			void* page1 = GetPage(p, r - 1); // might span a page
-			size_t size = (page == page1) ? m_pageSize : 2 * m_pageSize;
-
-			#if (defined(AVMPLUS_MAC) || defined(AVMPLUS_UNIX))
-			if (!page)
-			{
-				m_codeMin = m_codeMax = NULL;
-			}
-			else
-			{
-				if (!m_codeMin)
-					m_codeMin = page;
-				if (page > m_codeMax)
-					m_codeMax = (char*)page - m_pageSize + size;
-			}
-			#endif
-
-			if (page != m_lastPage || size != m_lastPageSize)
-			{
-				if (m_lastPage)
-				{
-				#ifdef AVMPLUS_WIN32
-				#ifndef UNDER_CE
-					DWORD dwIgnore;
-					VirtualProtectEx(GetCurrentProcess(), m_lastPage, m_lastPageSize, m_lastPageProt, &dwIgnore);
-				#else
-					AvmAssert(0);
-				#endif
-				#elif !defined(AVMPLUS_SYMBIAN)
-					int result = mprotect((maddr_ptr)m_lastPage, m_lastPageSize, m_lastPageProt);
-					AvmAssert(result == 0);
-					(void)result;
-				#else
-					AvmAssert(0);
-				#endif
-					m_lastPage =  NULL;
-					m_lastPageSize = 0;
-				}
-				if (page)
-				{
-				#ifdef AVMPLUS_WIN32
-				#ifndef UNDER_CE
-					VirtualProtectEx(GetCurrentProcess(), page, size, PAGE_READWRITE, &m_lastPageProt);
-				#else
-					AvmAssert(0);
-				#endif
-				#elif !defined(AVMPLUS_SYMBIAN)
-					int result = mprotect((maddr_ptr)page, size, PROT_READ | PROT_WRITE);
-					AvmAssert(result == 0);
-					(void)result;
-					m_lastPageProt = PROT_READ | PROT_EXEC;
-				#endif
-					m_lastPage = page;
-					m_lastPageSize = size;
-				}
-			}
-		}
-	};
 
 	// memory changed so go through and update all reference to both the base
 	// and the size of the global memory
-	void Domain::notifyGlobalMemoryChanged(unsigned char *newBase, uint32 newSize) const
+	void Domain::notifyGlobalMemoryChanged(uint8_t* newBase, uint32_t newSize)
 	{
 		AvmAssert(newBase != NULL); // real base address
 		AvmAssert(newSize >= GLOBAL_MEMORY_MIN_SIZE); // big enough
 
 		// ensure a real change happened...
-		if(newBase != globalMemoryBase || newSize != globalMemorySize)
+		if (newBase != m_globalMemoryBase || newSize != m_globalMemorySize)
 		{
-			ProtectionHelper protHelper;
-
 			// if a real change happened to backing store base address...
-			if(newBase != globalMemoryBase)
+			if (newBase != m_globalMemoryBase)
 			{
-				GMInfo::BaseRefChunk *baseRefs = m_gmInfo.globalMemoryBaseRefs;
+				BaseRefChunk *baseRefs = m_globalMemoryBaseRefs;
 
 				// go through each reference
-				for(uint32 n = 0; n < m_gmInfo.globalMemoryBaseRefNum; n++)
+				for(uint32_t n = 0; n < m_globalMemoryBaseRefNum; n++)
 				{
 					// get the slot
-					int mod = n % GMInfo::REFS_PER_CHUNK;
+					int mod = n % REFS_PER_CHUNK;
 
 					// if it's zero, get the NEXT slot
 					// this means we start with the SECOND chunk
-					if(!mod)
+					if (!mod)
 					{
 						baseRefs = baseRefs->next;
 						// and when we get to the end, THEN do the first chunk
-						if(!baseRefs)
-							baseRefs = m_gmInfo.globalMemoryBaseRefs;
+						if (!baseRefs)
+							baseRefs = m_globalMemoryBaseRefs;
 					}
-					unsigned char** p = (baseRefs->refs[mod]);
-					// make it writeable
-					protHelper.MakeWriteable(p, sizeof(unsigned char *));
+					uint8_t** p = (baseRefs->refs[mod]);
 					// and do a difference instead of a simple write
 					// as it may be offset from the base
-					*p = *p - globalMemoryBase + newBase;
+                    // printf("update base %p: %p -> %p\n",p,*p,*p - m_globalMemoryBase + newBase);
+					*p = *p - m_globalMemoryBase + newBase;
 				}
 			}
 
 			// same as above but for size
-			if(newSize != globalMemorySize)
+			if (newSize != m_globalMemorySize)
 			{
-				GMInfo::SizeRefChunk* sizeRefs = m_gmInfo.globalMemorySizeRefs;
+				SizeRefChunk* sizeRefs = m_globalMemorySizeRefs;
 
-				for(uint32 n = 0; n < m_gmInfo.globalMemorySizeRefNum; n++)
+				for(uint32_t n = 0; n < m_globalMemorySizeRefNum; n++)
 				{
-					int mod = n % GMInfo::REFS_PER_CHUNK;
+					int mod = n % REFS_PER_CHUNK;
 
-					if(!mod) // start with SECOND chunk
+					if (!mod) // start with SECOND chunk
 					{
 						sizeRefs = sizeRefs->next;
 						// and when we get to the end, THEN do the first chunk
-						if(!sizeRefs)
-							sizeRefs = m_gmInfo.globalMemorySizeRefs;
+						if (!sizeRefs)
+							sizeRefs = m_globalMemorySizeRefs;
 					}
-					uint32* p = (sizeRefs->refs[mod]);
-					protHelper.MakeWriteable(p, sizeof(uint32));
-					*p = *p - globalMemorySize + newSize;
+					uint32_t* p = (sizeRefs->refs[mod]);
+                    // printf("update size %p: %d -> %d\n",p,*p,*p - m_globalMemorySize + newSize);
+					*p = *p - m_globalMemorySize + newSize;
 				}
 			}
 
-			// remove and writeability changes
-			protHelper.MakeWriteable(NULL, 1);
 			// record the new base and size
-			globalMemoryBase = newBase;
-			globalMemorySize = newSize;
-
-			// and flush the instruction cache
-			protHelper.FlushCache();
+			m_globalMemoryBase = newBase;
+			m_globalMemorySize = newSize;
 		}
 	}
+
+ 	bool Domain::globalMemorySubscribe(ScriptObject* providerObject) 
+ 	{
+        GlobalMemoryProvider* provider = providerObject->getGlobalMemoryProvider();
+        return provider ? provider->addSubscriber(this) : false;
+ 	}
+ 
+ 	bool Domain::globalMemoryUnsubscribe(ScriptObject* providerObject)
+ 	{
+        GlobalMemoryProvider* provider = providerObject->getGlobalMemoryProvider();
+        return provider ? provider->removeSubscriber(this) : false;
+ 	}
 }
 
 

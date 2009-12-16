@@ -43,9 +43,22 @@ from os import path
 from math import floor
 from sys import stderr
 
-parser = OptionParser(usage="usage: %prog [--uniquethunks] [importfile [, importfile]...] file...")
+import sys
+
+haveSecrets = False
+try:
+	import nativegen_secret as secrets
+	haveSecrets = True
+except ImportError:
+	pass
+
+parser = OptionParser(usage="usage: %prog [--directthunks] [importfile [, importfile]...] file...")
 parser.add_option("-n", "--nativemapname", help="no longer supported")
-parser.add_option("-u", "--uniquethunks", help="generate a unique thunk for every native method (don't recycle thunks with similar signatures)")
+parser.add_option("-u", "--directthunks", action="store_true", default=False, help="generate a unique (direct) thunk for every native method (don't recycle thunks with similar signatures)")
+parser.add_option("-v", "--thunkvprof", action="store_true", default=False)
+parser.add_option("-e", "--externmethodandclassetables", action="store_true", default=False, help="generate extern decls for method and class tables")
+parser.add_option("--native-id-namespace", dest="nativeIDNS", default="avmplus::NativeID", help="Specifies the C++ namespace in which all generated should be in.")
+parser.add_option("--root-implementation-namespace", dest="rootImplNS", default="avmplus", help="Specifies the C++ namespace in under which all implementation classes can be found.")
 opts, args = parser.parse_args()
 
 if not args:
@@ -54,7 +67,7 @@ if not args:
 
 if opts.nativemapname:
 	raise Error("--nativemapname is no longer supported")
-	
+
 NEED_ARGUMENTS		= 0x01
 NEED_ACTIVATION		= 0x02
 NEED_REST			= 0x04
@@ -150,7 +163,6 @@ MPL_HEADER = "/* ***** BEGIN LICENSE BLOCK *****\n" \
             " * the terms of any one of the MPL, the GPL or the LGPL.\n" \
             " *\n" \
             " * ***** END LICENSE BLOCK ***** */" 
-
 
 # Python 2.5 and earlier didn't reliably handle float("nan") and friends uniformly
 # across all platforms. This is a workaround that appears to be more reliable.
@@ -284,8 +296,34 @@ class Multiname:
 		self.nsset = nsset
 		self.name = name
 	def __str__(self):
-		assert(0)
-		return "FOO"
+		nsStrings = map(lambda ns: u'"' + ns.decode("utf8") + u'"', self.nsset)
+		stringForNSSet = u'[' + u', '.join(nsStrings) + u']'
+		return stringForNSSet + u'::' + unicode(self.name.decode("utf8"))
+
+def stripVersion(ns):
+	# version markers are 3 bytes beginning with 0xE0 or greater
+	if len(ns.uri) < 3:
+	    return ns
+	if ns.uri[len(ns.uri)-3] > chr(0xE0):
+	    ns.uri = ns.uri[0:len(ns.uri)-3]
+	return ns
+
+def isVersionedNamespace(ns):
+	# version markers are 3 bytes beginning with 0xE0 or greater
+	if len(ns.uri) < 3:
+	    return False
+	if ns.uri[len(ns.uri)-3] > chr(0xE0):
+	    ns.uri = ns.uri[0:len(ns.uri)-3]
+	    return True
+	return False
+
+def isVersionedName(name):
+	if isinstance(name, QName):
+            return isVersionedNamespace(name.ns)
+	for ns in name.nsset:
+            if isVersionedNamespace(ns):
+                return True
+        return False
 
 class TypeName:
 	name = ""
@@ -294,7 +332,18 @@ class TypeName:
 		self.name = name
 		self.types = types
 	def __str__(self):
-		return str(self.name)
+		# @todo horrible special-casing, improve someday
+		s = str(self.name)
+		t = str(self.types[0])
+		if t == "int":
+			s += "$int"
+		elif t == "uint":
+			s += "$uint"
+		elif t == "Number":
+			s += "$double"
+		else:
+			s += "$object"
+		return s
 
 class MetaData:
 	name = ""
@@ -328,6 +377,7 @@ class MethodInfo(MemberInfo):
 	final = False
 	override = False
 	receiver = None
+	unbox_this = -1 # -1 == undetermined, 0 = no, 1 = yes
 
 	def isNative(self):
 		return (self.flags & NATIVE) != 0
@@ -339,7 +389,6 @@ class MethodInfo(MemberInfo):
 		return (self.flags & HAS_OPTIONAL) != 0
 
 	def assign_names(self, traits, prefix):
-		
 		self.receiver = traits
 		
 		if not self.isNative():
@@ -351,7 +400,7 @@ class MethodInfo(MemberInfo):
 		assert(isinstance(self.name, QName))
 		self.native_id_name = prefix + ns_prefix(self.name.ns, False) + self.name.name
 		self.native_method_name = self.name.name
-
+		
 		if self.kind == TRAIT_Getter:
 			self.native_id_name += "_get"
 			self.native_method_name = "get_" + self.native_method_name
@@ -375,12 +424,14 @@ class MethodInfo(MemberInfo):
 class SlotInfo(MemberInfo):
 	type = ""
 	value = ""
+	fileOffset = -1
 
 class NativeInfo:
 	class_name = None
 	instance_name = None
 	gen_method_map = False
 	method_map_name = None
+	constSetters = False
 	
 	def set_class(self, name):
 		if self.class_name != None:
@@ -435,6 +486,7 @@ class Traits:
 	metadata = None
 	ni = None
 	niname = None
+	nextSlotId = 0
 	def __init__(self, name):
 		self.names = {}
 		self.slots = []
@@ -496,7 +548,6 @@ class ByteArray:
 			return result
 		result = (result & 0x0fffffff) | (self.readU8() << 28)
 		return result
-		
 
 class Abc:
 	data = None
@@ -518,7 +569,11 @@ class Abc:
 	scriptName = ""
 	publicNs = Namespace("", CONSTANT_Namespace)
 	anyNs = Namespace("*", CONSTANT_Namespace)
+
 	magic = 0
+	
+	qnameToName = {}
+	nameToQName = {}
 		
 	def __init__(self, data, scriptName):
 		self.scriptName = scriptName
@@ -580,7 +635,7 @@ class Abc:
 								if not m.isNative():
 									raise Error("native(\"function-name\") can only be used on native functions" + str(m.name))
 								m.receiver = None
-								m.native_method_name = md.attrs[""]	# override 
+								m.native_method_name = md.attrs[""]     # override 
 								m.native_id_name = "native_script_function_" + ns_prefix(m.name.ns, False) + m.name.name
 								#m.native_id_name = "native_script_function_" + to_cname(m.native_method_name)
 								m.gen_method_map = True
@@ -669,7 +724,6 @@ class Abc:
 							CONSTANT_ExplicitNamespace,
 							CONSTANT_StaticProtectedNs]:
 				self.namespaces[i] = Namespace(self.strings[self.data.readU30()], nskind)
-
 			elif nskind in [CONSTANT_PrivateNs]:
 				self.data.readU30() # skip
 				self.namespaces[i] = Namespace("private", CONSTANT_PrivateNs)
@@ -761,10 +815,12 @@ class Abc:
 	def parseInstanceInfos(self):
 		count = self.data.readU30()
 		self.instances = [ None ] * count
+		instancesDict = {}
 		for i in range (0, count):
 			tname = self.names[self.data.readU30()]
 			t = Traits(tname)
 			self.instances[i] = t
+			instancesDict[id(tname)] = t
 			t.base = self.names[self.data.readU30()]
 			t.flags = self.data.readU8()
 			if (t.flags & 4) != 0:
@@ -780,22 +836,50 @@ class Abc:
 			t.init.name = t.name
 			t.init.kind = TRAIT_Method
 			t.init.id = methid
-			self.parseTraits(t)
+			self.parseTraits(t, instancesDict.get(id(t.base), None))
 	
-	def parseTraits(self, t):
+	@staticmethod
+	def __qname(name):
+		if isinstance(name, QName):
+			return name
+		if len(name.nsset) == 0:
+			return QName(Namespace("", CONSTANT_Namespace), name.name)
+		return QName(stripVersion(name.nsset[0]), name.name)
+	
+	def qname(self, name):
+		if (not self.nameToQName.has_key(id(name))):
+			try:
+				result = self.__qname(name)
+			except:
+				print dir(name)
+				raise
+			self.qnameToName[id(result)] = name
+			self.nameToQName[id(name)] = result
+			return result
+		return self.nameToQName[id(name)]
+	
+	def parseTraits(self, t, baseTraits=None):
+		lastBaseTraitsSlotId = 0 if baseTraits is None else baseTraits.nextSlotId
 		namecount = self.data.readU30()
 		t.members = [ None ] * namecount
 		for i in range(0, namecount):
-			name = self.names[self.data.readU30()]
+			name_index = self.data.readU30()
+			name = self.names[name_index]
+			name = self.qname(name)
+			bindingOffset = self.data.pos
 			tag = self.data.readU8()
 			kind = tag & 0xf
 			member = None
 			if kind in [TRAIT_Slot, TRAIT_Const, TRAIT_Class]:
 				member = SlotInfo()
-				member.id = self.data.readU30()
-				while len(t.slots) <= member.id:
+				member.fileOffset = bindingOffset
+				memberId = self.data.readU30()
+				member.id = (memberId - 1) if memberId != 0 else (len(t.slots) + lastBaseTraitsSlotId)
+				memberIndex = member.id - lastBaseTraitsSlotId
+				while len(t.slots) <= memberIndex:
 					t.slots.append(None)
-				t.slots[member.id] = member
+				t.slots[member.id - lastBaseTraitsSlotId] = member
+				t.nextSlotId = max(t.nextSlotId, member.id + 1)
 				if kind in [TRAIT_Slot, TRAIT_Const]:
 					member.type = self.names[self.data.readU30()]
 					index = self.data.readU30()
@@ -846,6 +930,12 @@ class Abc:
 						ni.gen_method_map = True
 						if v != "auto":
 							ni.method_map_name = v
+					if md.attrs.has_key("constsetters"):
+						v = md.attrs.get("constsetters")
+						if (v == "true"):
+							ni.constSetters = True
+						elif (v != "false"):
+							raise Error(u'native metadata specified illegal value, "%s" for constsetters field.	 Value must be "true" or "false".' % unicode(v))
 					if (ni.class_name == None) and (ni.instance_name == None):
 						raise Error("native metadata must specify (cls,instance)")
 
@@ -932,6 +1022,163 @@ class IndentingPrintWriter:
 		self.f.write("\n")
 		self.do_indent = True
 
+
+def outputBasicSlotDecl(output, slotDict):
+	output.println(u'%(type)s m_%(name)s;' % slotDict)
+	
+def outputWBRCSlotDecl(output, slotDict):
+	output.println(u'DRCWB(%(type)s) m_%(name)s;' % slotDict)
+
+def outputWBAtomSlotDecl(output, slotDict):
+	output.println(u'ATOM_WB m_%(name)s;' % slotDict)
+
+CTYPE_TO_SLOT_DECL = {
+	ctype_from_enum(CTYPE_OBJECT, True) : outputWBRCSlotDecl,
+	ctype_from_enum(CTYPE_ATOM, False) : outputWBAtomSlotDecl,
+	ctype_from_enum(CTYPE_VOID, True) : lambda output, slotDict: None,
+	ctype_from_enum(CTYPE_BOOLEAN, True) : outputBasicSlotDecl,
+	ctype_from_enum(CTYPE_INT, True) : outputBasicSlotDecl,
+	ctype_from_enum(CTYPE_UINT, True) : outputBasicSlotDecl,
+	ctype_from_enum(CTYPE_DOUBLE, True) : outputBasicSlotDecl,
+	ctype_from_enum(CTYPE_STRING, True) : outputWBRCSlotDecl,
+	ctype_from_enum(CTYPE_NAMESPACE, True) : outputWBRCSlotDecl
+}
+
+def outputBasicGetMethodDecl(output, slotDict):
+	output.println(u'REALLY_INLINE %(type)s get_%(name)s() const { return m_%(name)s; }' % slotDict)
+
+def outputWBRCGetMethodDecl(output, slotDict):
+	output.println(u'REALLY_INLINE %(type)s get_%(name)s() const { return m_%(name)s; }' % slotDict)
+
+def outputWBAtomGetMethodDecl(output, slotDict):
+	output.println(u'REALLY_INLINE %(type)s get_%(name)s() const { return m_%(name)s; }' % slotDict)
+
+CTYPE_TO_GET_METHOD_DECL = {
+	ctype_from_enum(CTYPE_OBJECT, True) : outputWBRCGetMethodDecl,
+	ctype_from_enum(CTYPE_ATOM, False) : outputWBAtomGetMethodDecl,
+	ctype_from_enum(CTYPE_VOID, True) : lambda output, slotDict: None,
+	ctype_from_enum(CTYPE_BOOLEAN, True) : outputBasicGetMethodDecl,
+	ctype_from_enum(CTYPE_INT, True) : outputBasicGetMethodDecl,
+	ctype_from_enum(CTYPE_UINT, True) : outputBasicGetMethodDecl,
+	ctype_from_enum(CTYPE_DOUBLE, True) : outputBasicGetMethodDecl,
+	ctype_from_enum(CTYPE_STRING, True) : outputWBRCGetMethodDecl,
+	ctype_from_enum(CTYPE_NAMESPACE, True) : outputWBRCGetMethodDecl
+}
+
+def outputBasicSetMethodDecl(output, slotDict):
+	output.println(u'void set_%(name)s(%(type)s newVal);' % slotDict)
+
+def outputWBRCSetMethodDecl(output, slotDict):
+	output.println(u'void set_%(name)s(%(native)s* obj, %(type)s newVal);' % slotDict)
+
+def outputWBAtomSetMethodDecl(output, slotDict):
+	output.println(u'void set_%(name)s(%(native)s* obj, %(type)s newVal);' % slotDict)
+
+CTYPE_TO_SET_METHOD_DECL = {
+	ctype_from_enum(CTYPE_OBJECT, True) : outputWBRCSetMethodDecl,
+	ctype_from_enum(CTYPE_ATOM, False) : outputWBAtomSetMethodDecl,
+	ctype_from_enum(CTYPE_VOID, True) : lambda output, slotDict: None,
+	ctype_from_enum(CTYPE_BOOLEAN, True) : outputBasicSetMethodDecl,
+	ctype_from_enum(CTYPE_INT, True) : outputBasicSetMethodDecl,
+	ctype_from_enum(CTYPE_UINT, True) : outputBasicSetMethodDecl,
+	ctype_from_enum(CTYPE_DOUBLE, True) : outputBasicSetMethodDecl,
+	ctype_from_enum(CTYPE_STRING, True) : outputWBRCSetMethodDecl,
+	ctype_from_enum(CTYPE_NAMESPACE, True) : outputWBRCSetMethodDecl
+}
+
+def outputBasicSetMethodBody(output, slotDict):
+	output.println(u'REALLY_INLINE void %(struct)s::set_%(name)s(%(type)s newVal) { m_%(name)s = newVal; }' % slotDict)
+
+def outputWBRCSetMethodBody(output, slotDict):
+	output.println(u'REALLY_INLINE void %(struct)s::set_%(name)s(%(native)s* obj, %(type)s newVal)' % slotDict)
+	output.println(u'{')
+	output.indent += 1
+	output.println(u'm_%(name)s.set(((ScriptObject*)obj)->gc(), obj, newVal);' % slotDict)
+	output.indent -= 1
+	output.println('}')
+
+def outputWBAtomSetMethodBody(output, slotDict):
+	output.println(u'REALLY_INLINE void %(struct)s::set_%(name)s(%(native)s* obj, %(type)s newVal)' % slotDict)
+	output.println(u'{')
+	output.indent += 1
+	output.println(u'm_%(name)s.set(((ScriptObject*)obj)->gc(), obj, newVal);' % slotDict)
+	output.indent -= 1
+	output.println('}')
+
+CTYPE_TO_SET_METHOD_BODY = {
+	ctype_from_enum(CTYPE_OBJECT, True) : outputWBRCSetMethodBody,
+	ctype_from_enum(CTYPE_ATOM, False) : outputWBAtomSetMethodBody,
+	ctype_from_enum(CTYPE_VOID, True) : lambda output, slotDict: None,
+	ctype_from_enum(CTYPE_BOOLEAN, True) : outputBasicSetMethodBody,
+	ctype_from_enum(CTYPE_INT, True) : outputBasicSetMethodBody,
+	ctype_from_enum(CTYPE_UINT, True) : outputBasicSetMethodBody,
+	ctype_from_enum(CTYPE_DOUBLE, True) : outputBasicSetMethodBody,
+	ctype_from_enum(CTYPE_STRING, True) : outputWBRCSetMethodBody,
+	ctype_from_enum(CTYPE_NAMESPACE, True) : outputWBRCSetMethodBody
+}
+
+def outputBasicSetMethodMacroThunk(output, slotDict):
+	output.println(u'REALLY_INLINE void set_%(name)s(%(type)s newVal) { %(instance)s.set_%(name)s(newVal); } \\' % slotDict)
+
+def outputWBRCSetMethodMacroThunk(output, slotDict):
+	output.println(u'REALLY_INLINE void set_%(name)s(%(type)s newVal) { %(instance)s.set_%(name)s(this, newVal); } \\' % slotDict)
+
+def outputWBAtomSetMethodMacroThunk(output, slotDict):
+	output.println(u'REALLY_INLINE void set_%(name)s(%(type)s newVal) { %(instance)s.set_%(name)s(this, newVal); } \\' % slotDict)
+
+CTYPE_TO_SET_METHOD_MACRO_THUNK = {
+	ctype_from_enum(CTYPE_OBJECT, True) : outputWBRCSetMethodMacroThunk,
+	ctype_from_enum(CTYPE_ATOM, False) : outputWBAtomSetMethodMacroThunk,
+	ctype_from_enum(CTYPE_VOID, True) : lambda output, slotDict: None,
+	ctype_from_enum(CTYPE_BOOLEAN, True) : outputBasicSetMethodMacroThunk,
+	ctype_from_enum(CTYPE_INT, True) : outputBasicSetMethodMacroThunk,
+	ctype_from_enum(CTYPE_UINT, True) : outputBasicSetMethodMacroThunk,
+	ctype_from_enum(CTYPE_DOUBLE, True) : outputBasicSetMethodMacroThunk,
+	ctype_from_enum(CTYPE_STRING, True) : outputWBRCSetMethodMacroThunk,
+	ctype_from_enum(CTYPE_NAMESPACE, True) : outputWBRCSetMethodMacroThunk
+}
+
+NON_POINTER_4_BYTE_SLOT_BUCKET = 0
+POINTER_SLOT_BUCKET = 1
+NON_POINTER_8_BYTE_SLOT_BUCKET = 2
+
+CTYPE_TO_SLOT_SORT_BUCKET = {
+	# following types are 4 bytes
+	ctype_from_enum(CTYPE_INT, True) : NON_POINTER_4_BYTE_SLOT_BUCKET,
+	ctype_from_enum(CTYPE_UINT, True) : NON_POINTER_4_BYTE_SLOT_BUCKET,
+	ctype_from_enum(CTYPE_BOOLEAN, True) : NON_POINTER_4_BYTE_SLOT_BUCKET,
+	# following types are pointer size ( either 4 or 8 bytes )
+	ctype_from_enum(CTYPE_OBJECT, True) : POINTER_SLOT_BUCKET,
+	ctype_from_enum(CTYPE_ATOM, False) : POINTER_SLOT_BUCKET,
+	ctype_from_enum(CTYPE_STRING, True) : POINTER_SLOT_BUCKET,
+	ctype_from_enum(CTYPE_NAMESPACE, True) : POINTER_SLOT_BUCKET,
+	# doubles are 8 bytes
+	ctype_from_enum(CTYPE_DOUBLE, True) : NON_POINTER_8_BYTE_SLOT_BUCKET,
+	# slots should never be of type void
+	ctype_from_enum(CTYPE_VOID, True) : -1
+}
+
+CTYPE_TO_NEED_FORWARD_DECL = {
+	ctype_from_enum(CTYPE_INT, True) : False,
+	ctype_from_enum(CTYPE_UINT, True) : False,
+	ctype_from_enum(CTYPE_BOOLEAN, True) : False,
+	ctype_from_enum(CTYPE_OBJECT, True) : True,
+	ctype_from_enum(CTYPE_ATOM, False) : False,
+	ctype_from_enum(CTYPE_STRING, True) : True,
+	ctype_from_enum(CTYPE_NAMESPACE, True) : True,
+	ctype_from_enum(CTYPE_DOUBLE, True) : False,
+	ctype_from_enum(CTYPE_VOID, True) : False
+}
+
+GLUECLASSES_WITHOUT_SLOTS = frozenset((
+	'bool',
+	'double',
+	'int32_t',
+	'Namespace',
+	'String',
+	'uint32_t'))
+	
+
 class AbcThunkGen:
 	abc = None
 	abcs = []
@@ -949,6 +1196,21 @@ class AbcThunkGen:
 
 	def class_id_name(self, c):
 		return "abcclass_" + self.class_native_name(c)
+
+	@staticmethod
+	def __parseCPPNamespaceStr(nsStr):
+		return nsStr.split(u'::')
+	
+	@staticmethod
+	def __parseCPPClassName(className):
+		prependRootNS = (len(opts.rootImplNS) > 0)
+		if (className.startswith('::')):
+			prependRootNS = False
+		fullyQualifiedName = (opts.rootImplNS + '::' + className) if prependRootNS else className
+		fullyQualifiedNameComponents = fullyQualifiedName.split('::')
+		if (len(fullyQualifiedNameComponents) < 2):
+			fullyQualifiedNameComponents = (u'', fullyQualifiedNameComponents)
+		return ('::'.join(filter(lambda ns: len(ns) > 0, fullyQualifiedNameComponents[:-1])), fullyQualifiedNameComponents[-1])
 
 	def emit(self, abc, name, out_h, out_c):
 		self.abc = abc;
@@ -974,6 +1236,15 @@ class AbcThunkGen:
 
 		out_h.println("#define AVMTHUNK_VERSION 5");
 		out_h.println('')
+		
+		self.forwardDeclareGlueClasses(out_h)
+		
+		nativeIDNamespaces = self.__parseCPPNamespaceStr(opts.nativeIDNS)
+		#turn list of namespaces [foo, bar, baz] into "namespace foo { namespace bar { namespace baz{"
+		out_h.println(' '.join(map(lambda ns: u'namespace %s {' % ns, nativeIDNamespaces)))
+		out_h.println('')
+		out_c.println(' '.join(map(lambda ns: u'namespace %s {' % ns, nativeIDNamespaces)))
+		out_c.println('')
 		
 		out_h.println("extern const uint32_t "+name+"_abc_class_count;")
 		out_h.println("extern const uint32_t "+name+"_abc_script_count;")
@@ -1015,12 +1286,25 @@ class AbcThunkGen:
 			unique_thunk_sigs[sig][m.native_id_name] = (receiver, m)
 		out_c.println("");
 		out_c.println("/* thunks (%d unique signatures, %d total) */" % (len(unique_thunk_sigs.keys()), len(self.all_thunks)));
-		if opts.uniquethunks:
+		if opts.thunkvprof:
+			out_c.println("#define DOPROF")
+			out_c.println('#include "../vprof/vprof.h"')
+		if opts.directthunks:
+			out_c.println("")
+			out_c.println("#ifdef AVMPLUS_INDIRECT_NATIVE_THUNKS")
+			out_c.println("  #error nativegen.py: --directthunks requires AVMFEATURE_INDIRECT_NATIVE_THUNKS=0")
+			out_c.println("#endif")
+			out_c.println("")
 			for receiver,m in self.all_thunks:
 				thunkname = m.native_id_name;
 				self.emitThunkProto(thunkname, receiver, m);
 				self.emitThunkBody(thunkname, receiver, m, True);
 		else:
+			out_c.println("")
+			out_c.println("#ifndef AVMPLUS_INDIRECT_NATIVE_THUNKS")
+			out_c.println("  #error nativegen.py: --directthunks requires AVMFEATURE_INDIRECT_NATIVE_THUNKS=1")
+			out_c.println("#endif")
+			out_c.println("")
 			for sig in unique_thunk_sigs:
 				users = unique_thunk_sigs[sig]
 				receiver = None;
@@ -1037,13 +1321,19 @@ class AbcThunkGen:
 					# (sad but true, happens in some environments)
 					out_h.println("#define "+native_name+"_thunk  "+thunkname+"_thunk")
 				out_h.println("")
-				self.emitThunkBody(thunkname, receiver, m, False);
+				# if there's only one client of the thunk, emit a direct call even if direct thunks aren't requested
+				do_direct = (len(users) == 1)
+				self.emitThunkBody(thunkname, receiver, m, do_direct)
 
-		out_c.println("");
+		out_c.println("")
+		self.printStructAsserts(out_c, abc)
+		out_c.println("")
+		
 		for i in range(0, len(abc.classes)):
 			c = abc.classes[i]
 			if c.ni.gen_method_map:
-				out_c.println("AVMTHUNK_NATIVE_CLASS_GLUE(%s)" % c.ni.class_name)
+				formatDict = { u'nativeClass' : c.ni.class_name, u'nativeClassBaseName' : self.__baseNINameForNIName(c.ni.class_name) }
+				out_c.println("AVMTHUNK_NATIVE_CLASS_GLUE(%(nativeClassBaseName)s, %(nativeClass)s, SlotOffsetsAndAsserts::do%(nativeClassBaseName)sAsserts)" % formatDict)
 
 		out_c.println("");
 		out_c.println("AVMTHUNK_BEGIN_NATIVE_TABLES(%s)" % self.abc.scriptName)
@@ -1082,7 +1372,9 @@ class AbcThunkGen:
 			c = abc.classes[i]
 			if c.ni.class_name != None or c.ni.instance_name != None:
 				if c.ni.gen_method_map:
-					out_c.println("AVMTHUNK_NATIVE_CLASS(%s, %s, %s)" % (self.class_id_name(c), c.ni.class_name, c.ni.instance_name))
+					offsetOfSlotsClass = "SlotOffsetsAndAsserts::s_slotsOffset%s" % self.__baseNINameForNIName(c.ni.class_name)
+					offsetOfSlotsInstance = "SlotOffsetsAndAsserts::s_slotsOffset%s" % self.__baseNINameForNIName(c.ni.instance_name)
+					out_c.println("AVMTHUNK_NATIVE_CLASS(%s, %s, %s, %s, %s, %s)" % (self.class_id_name(c), self.__baseNINameForNIName(c.ni.class_name), c.ni.class_name, offsetOfSlotsClass, c.ni.instance_name, offsetOfSlotsInstance))
 				else:
 					out_c.println("NATIVE_CLASS(%s, %s, %s)" % (self.class_id_name(c), c.ni.class_name, c.ni.instance_name))
 		out_c.indent -= 1
@@ -1094,6 +1386,11 @@ class AbcThunkGen:
 
 		out_c.println("");
 		out_c.println("AVMTHUNK_DEFINE_NATIVE_INITIALIZER(%s)" % (name));
+
+		if opts.externmethodandclassetables:
+			out_c.println("");
+			out_c.println("extern const NativeClassInfo* "+name+"_classEntriesExtern = "+name+"_classEntries;");
+			out_c.println("extern const NativeMethodInfo* "+name+"_methodEntriesExtern = "+name+"_methodEntries;");
 
 		out_c.println("");
 		out_c.println("/* abc */");
@@ -1107,6 +1404,307 @@ class AbcThunkGen:
 			if i%16 == 15:
 				out_c.println("");
 		out_c.println("};");
+		out_c.println('')
+		
+		self.printStructInfoForClasses(out_h)
+		
+		if haveSecrets:
+			secrets.emit(self, name, CTYPE_OBJECT)
+		
+		out_h.println(' '.join(('}',) * len(nativeIDNamespaces)))
+		out_c.println(' '.join(('}',) * len(nativeIDNamespaces)))
+
+	def forwardDeclareGlueClasses(self, out_h):
+		#find all the native glue classes and write forward declarations for them
+		cppNamespaceToGlueClasses = {}
+		traitsSet = set()
+		for i in range(0, len(self.abc.classes)):
+			c = self.abc.classes[i]
+			if c.ni.class_name != None:
+				traitsSet.add(c)
+			if (c.ni.instance_name != None):
+				traitsSet.add(c.itraits)
+		
+		for t in frozenset(traitsSet):
+			filteredSlots = filter(lambda s: s is not None, t.slots)
+			for s in filteredSlots:
+				slotTraits = self.lookupTraits(s.type)
+				traitsSet.add(slotTraits)
+		
+		glueClassToTraits = {}
+		for t in traitsSet:
+			if ((t.niname is not None) and (CTYPE_TO_NEED_FORWARD_DECL[ctype_from_traits(t, True)])):
+				(classNS, glueClassName) = self.__parseCPPClassName(t.niname)
+				# special hack because the meta data for the class Math says its instance data is of type double
+				if (CTYPE_TO_NEED_FORWARD_DECL.get(glueClassName, True)):
+					cppNamespaceToGlueClasses.setdefault(classNS, set()).add(glueClassName)
+					glueClassToTraits[classNS + u'::' + glueClassName] = t
+		for (nsStr, glueClasses) in cppNamespaceToGlueClasses.iteritems():
+			#turn list of namespaces [foo, bar, baz] into "namespace foo { namespace bar { namespace baz{"
+			nsList = self.__parseCPPNamespaceStr(nsStr)
+			out_h.println(' '.join(map(lambda ns: u'namespace %s {' % ns, nsList)))
+			out_h.indent += 1
+			
+			for glueClass in sorted(glueClasses):
+				traits = glueClassToTraits[nsStr + u'::' + glueClass]
+				out_h.println('class %s; //%s' % (glueClass, str(traits.name)))
+			out_h.indent -= 1
+			out_h.println(' '.join(('}',) * len(nsList)))
+			out_h.println('')
+
+	@staticmethod
+	def cmpSlots(slotA, slotB, slotsTypeInfo):
+		if (slotA is slotB):
+			return 0;
+		
+		# slotA or slotB could be None, which means they are an anonymous slot.
+		# Anonymous slots should be at the end of the pointer slots.
+		slotBBucket = CTYPE_TO_SLOT_SORT_BUCKET[slotsTypeInfo[id(slotB)][0]] if (slotB is not None) else POINTER_SLOT_BUCKET
+		if (slotA is None):
+			if (slotBBucket <= POINTER_SLOT_BUCKET):
+				return 1
+			else:
+				return -1
+		
+		assert slotA is not None
+		slotABucket = CTYPE_TO_SLOT_SORT_BUCKET[slotsTypeInfo[id(slotA)][0]]
+		if (slotB is None):
+			if (slotBBucket <= POINTER_SLOT_BUCKET):
+				return -1
+			else:
+				return 1
+				
+		assert slotB is not None
+		slotBucketCmp = cmp(slotABucket, slotBBucket)
+		if (slotBucketCmp != 0):
+			return slotBucketCmp
+		return cmp(slotA.fileOffset, slotB.fileOffset)
+
+	@staticmethod
+	def slotsStructNameForTraits(t, isClassTraits):
+		return to_cname(t.niname) + u'Slots'
+	
+	@staticmethod
+	def __baseNINameForNIName(niname):
+		return AbcThunkGen.__parseCPPClassName(niname)[1]
+	
+	@staticmethod
+	def slotsInstanceNameForTraits(t, isClassTraits):
+		return u'm_slots_' + AbcThunkGen.__baseNINameForNIName(t.niname)
+		
+	@staticmethod
+	def needsInstanceSlotsStruct(c):
+		return (c.ni.instance_name is not None) and (c.ni.instance_name != "ScriptObject")
+
+	@staticmethod
+	def hashSlots(c):
+		return False
+
+	def printStructInfoForClasses(self, out_h):
+		out_h.println(u'class SlotOffsetsAndAsserts;')
+		
+		visitedGlueClasses = set()
+		
+		for i in range(0, len(self.abc.classes)):
+			c = self.abc.classes[i]
+			if (c.ni.class_name is not None):
+				self.printStructInfoForTraits(out_h, c, visitedGlueClasses, True)
+				if (self.needsInstanceSlotsStruct(c)):
+					self.printStructInfoForTraits(out_h, c.itraits, visitedGlueClasses, False)
+			else:
+				assert not self.needsInstanceSlotsStruct(c)
+
+	def printStructInfoForTraits(self, out_h, t, visitedGlueClasses, isClassTraits):
+		if (t.base is not None):
+			baseTraits = self.lookupTraits(t.base)
+			if (((isClassTraits) and (baseTraits.ni.class_name is None)) or ((not isClassTraits) and (baseTraits.ni.instance_name is None))):
+				glueClassName = t.ni.class_name if isClassTraits else t.ni.instance_name
+				raise Error(u'Native class %s(%s) extends %s which is not a native class' % (unicode(t.name), glueClassName, unicode(t.base)))
+		
+		if (t.niname in visitedGlueClasses):
+			if (len(t.slots) > 0):
+				raise Error(u'C++ glue classes for AS3 classes that have slots may only be referenced by meta data for one AS3 class: %s(%s)' % (unicode(t.name), t.niname))
+			else:
+				return
+				
+		visitedGlueClasses.add(t.niname)
+		if (t.niname in GLUECLASSES_WITHOUT_SLOTS):
+			return
+			
+		memberVars = []
+		structName = self.slotsStructNameForTraits(t, isClassTraits)
+		slotsInstanceName = self.slotsInstanceNameForTraits(t, isClassTraits)
+		out_h.println(u'// %s' % str(t.name))
+		out_h.println(u'//-----------------------------------------------------------')
+		out_h.println(u'class %(struct)s' % {u'struct' : structName})
+		out_h.println(u'{')
+		out_h.indent += 1
+		out_h.println(u'friend class SlotOffsetsAndAsserts;')
+		out_h.indent -= 1
+		out_h.println(u'public:')
+		out_h.indent += 1
+		
+		filteredSlots = filter(lambda s: s is not None, t.slots)
+		
+		slotsTypeInfo = {}
+		for slot in filteredSlots:
+			slotTraits = self.lookupTraits(slot.type)
+			slotCType = ctype_from_traits(slotTraits, True)
+			slotNIType = (slotTraits.niname + u'*') if ((slotTraits.niname is not None) and (slotCType == ctype_from_enum(CTYPE_OBJECT, True))) else slotCType
+			slotsTypeInfo[id(slot)] = (slotCType, slotNIType)
+			
+		sortedSlots = sorted(t.slots, lambda x,y: self.cmpSlots(x, y, slotsTypeInfo))
+		
+		for slot in sortedSlots:
+			if (slot is not None):
+				assert slot.kind in (TRAIT_Slot, TRAIT_Const)
+				(slotCType, slotNIType) = slotsTypeInfo[id(slot)]
+				slotDict = { u'struct' : structName, u'native' : t.niname, u'instance' : slotsInstanceName, u'type' : slotNIType, u'name' : to_cname(slot.name) }
+				CTYPE_TO_GET_METHOD_DECL[slotCType](out_h, slotDict)
+				if ((slot.kind == TRAIT_Slot) or (t.ni.constSetters)):
+					CTYPE_TO_SET_METHOD_DECL[slotCType](out_h, slotDict)
+		out_h.indent -= 1
+		out_h.println(u'private:')
+		out_h.indent += 1
+		
+		anonCount = 0
+		for slot in sortedSlots:
+			if (slot is not None):
+				assert slot.kind in (TRAIT_Slot, TRAIT_Const)
+				(slotCType, slotNIType) = slotsTypeInfo[id(slot)]
+				slotDict = { u'struct' : structName, u'native' : t.niname, u'instance' : slotsInstanceName, u'type' : slotNIType, u'name' : to_cname(slot.name) }
+				CTYPE_TO_SLOT_DECL[slotCType](out_h, slotDict)
+			else:
+				out_h.println(u'ATOM_WB __anonymous_slot_%u;' % (anonCount,))
+				anonCount = anonCount + 1
+		baseTraits = self.lookupTraits(t.base)
+			
+		out_h.indent -= 1
+		out_h.println(u'};')
+		
+		for slot in sortedSlots:
+			assert slot.kind in (TRAIT_Slot, TRAIT_Const)
+			(slotCType, slotNIType) = slotsTypeInfo[id(slot)]
+			slotDict = { u'struct' : structName, u'native' : t.niname, u'instance' : slotsInstanceName, u'type' : slotNIType, u'name' : to_cname(slot.name) }
+			if ((slot.kind == TRAIT_Slot) or (t.ni.constSetters)):
+				CTYPE_TO_SET_METHOD_BODY[slotCType](out_h, slotDict)
+		out_h.println(u'#define DECLARE_SLOTS_' + self.__baseNINameForNIName(t.niname) + u' \\')
+		out_h.indent += 1
+		out_h.println(u'private: \\')
+		out_h.indent += 1
+		out_h.println(u'friend class %s::SlotOffsetsAndAsserts; \\' % opts.nativeIDNS)
+		out_h.indent -= 1
+		if (len(t.slots) > 0):
+			out_h.println(u'protected: \\')
+			out_h.indent += 1
+			for slot in sortedSlots:
+				assert slot.kind in (TRAIT_Slot, TRAIT_Const)
+				(slotCType, slotNIType) = slotsTypeInfo[id(slot)]
+				slotDict = { u'struct' : structName, u'native' : t.niname, u'instance' : slotsInstanceName, u'type' : slotNIType, u'name' : to_cname(slot.name) }
+				out_h.println(u'REALLY_INLINE %(type)s get_%(name)s() const { return %(instance)s.get_%(name)s(); } \\' % slotDict);
+				if ((slot.kind == TRAIT_Slot) or (t.ni.constSetters)):
+					CTYPE_TO_SET_METHOD_MACRO_THUNK[slotCType](out_h, slotDict)
+			out_h.indent -= 1
+			out_h.println(u'private: \\')
+			out_h.indent += 1
+			out_h.println(u'%(nativeIDNS)s::%(struct)s %(instance)s' % { u'nativeIDNS' : opts.nativeIDNS, u'struct' : structName, u'instance' : slotsInstanceName} )
+			out_h.indent -= 1
+		else:
+			out_h.indent += 1
+			out_h.println(u'typedef %s::%s EmptySlotsStruct_%s' % (opts.nativeIDNS, structName, self.__baseNINameForNIName(t.niname)))
+			out_h.indent -= 1
+		out_h.indent -= 1
+		out_h.println(u'//-----------------------------------------------------------')
+		out_h.println(u'')
+	
+	def printStructAsserts(self, out_c, abc):
+		namesDict = {}
+		for i in range(1, len(abc.names)):
+			if (not isinstance(abc.names[i], TypeName)):
+				namesDict[id(abc.qname(abc.names[i]))] = i
+		
+		out_c.println(u'class SlotOffsetsAndAsserts')
+		out_c.println(u'{')
+		out_c.println(u'private:')
+		out_c.indent += 1
+		out_c.println(u'static uint32_t getSlotOffset(Traits* t, int nameId);')
+		out_c.indent -= 1
+		out_c.println(u'public:')
+		out_c.indent += 1
+		visitedNativeClasses = set()
+		for i in range(0, len(abc.classes)):
+			c = abc.classes[i]
+			if (c.ni.gen_method_map):
+				if (c.ni.class_name not in visitedNativeClasses):
+					visitedNativeClasses.add(c.ni.class_name)
+					if (len(c.slots) > 0):
+						out_c.println(u'static const uint16_t s_slotsOffset%(nativeClassBaseName)s = offsetof(%(nativeClass)s, %(slotsInstance)s);' %
+							{ u'nativeClass' : c.ni.class_name
+							, u'nativeClassBaseName' : self.__baseNINameForNIName(c.ni.class_name)
+							, u'slotsInstance' : self.slotsInstanceNameForTraits(c, True) } )
+					else:
+						out_c.println(u'static const uint16_t s_slotsOffset%s = 0;' % self.__baseNINameForNIName(c.ni.class_name))
+				if (c.ni.instance_name not in visitedNativeClasses):
+					visitedNativeClasses.add(c.ni.instance_name)
+					if (len(c.itraits.slots) > 0):
+						out_c.println(u'static const uint16_t s_slotsOffset%(nativeClassBaseName)s = offsetof(%(nativeClass)s, %(slotsInstance)s);' %
+							{ u'nativeClass' : c.ni.instance_name
+							, u'nativeClassBaseName' : self.__baseNINameForNIName(c.ni.instance_name)
+							, u'slotsInstance' : self.slotsInstanceNameForTraits(c.itraits, False) } )
+					else:
+						out_c.println(u'static const uint16_t s_slotsOffset%s = 0;' % self.__baseNINameForNIName(c.ni.instance_name))
+				out_c.println(u'static void do%sAsserts(Traits* cTraits, Traits* iTraits);' % self.__baseNINameForNIName(c.ni.class_name))
+		
+		out_c.indent -= 1
+		out_c.println(u'};')
+		for i in range(0, len(abc.classes)):
+			c = abc.classes[i]
+			if (c.ni.class_name is not None):
+				out_c.println(u'REALLY_INLINE void SlotOffsetsAndAsserts::do%sAsserts(Traits* cTraits, Traits* iTraits)' % self.__baseNINameForNIName(c.ni.class_name))
+				out_c.println(u'{')
+				out_c.indent += 1
+				out_c.println(u'(void)cTraits; (void)iTraits;')
+				noSlotsStaticAssertStr = u'// MMGC_STATIC_ASSERT(sizeof(%(nativeClass)s::EmptySlotsStruct_%(nativeClassBaseName)s) >= 0);'
+				assert (c.ni.class_name is not None)
+				if (len(c.slots) > 0):
+					self.printStructAssertsForTraits(namesDict, out_c, c, True, u'cTraits')
+				elif (c.ni.class_name not in GLUECLASSES_WITHOUT_SLOTS):
+					out_c.println(noSlotsStaticAssertStr % { u'nativeClass' : c.ni.class_name, u'nativeClassBaseName' : self.__baseNINameForNIName(c.ni.class_name) })
+				if (self.needsInstanceSlotsStruct(c)):
+					if (len(c.itraits.slots) > 0):
+						self.printStructAssertsForTraits(namesDict, out_c, c.itraits, False, u'iTraits')
+					elif (c.ni.instance_name not in GLUECLASSES_WITHOUT_SLOTS):
+						out_c.println(noSlotsStaticAssertStr % { u'nativeClass' : c.ni.instance_name, u'nativeClassBaseName' : self.__baseNINameForNIName(c.ni.instance_name) })
+				
+				out_c.indent -= 1
+				out_c.println(u'}')
+	
+	def printStructAssertsForTraits(self, namesDict, out_c, t, isClassTraits, traitsVarName):
+		if (len(t.slots) == 0):
+			return
+		filteredSlots = filter(lambda s: s is not None, t.slots)
+		structName = self.slotsStructNameForTraits(t, isClassTraits)
+		slotsInstanceName = self.slotsInstanceNameForTraits(t, isClassTraits)
+		formatDict = {
+				u'nativeClass' : t.niname
+			,	u'nativeClassBaseName' : self.__baseNINameForNIName(t.niname)
+			,	u'slotsInstance' : slotsInstanceName
+			,	u'structName' : structName
+		}
+		out_c.println(u'MMGC_STATIC_ASSERT(offsetof(%(nativeClass)s, %(slotsInstance)s) == s_slotsOffset%(nativeClassBaseName)s);' % formatDict)
+		out_c.println(u'MMGC_STATIC_ASSERT(offsetof(%(nativeClass)s, %(slotsInstance)s) <= 0xFFFF);' % formatDict)
+		out_c.println(u'MMGC_STATIC_ASSERT(sizeof(%(nativeClass)s) <= 0xFFFF);' % formatDict)
+		for slot in filteredSlots:
+			formatDict = {
+					u'traits' : traitsVarName
+				,	u'nameId' : namesDict[id(slot.name)]
+				,	u'nativeClass' : t.niname
+				,	u'slotsInstance' : slotsInstanceName
+				,	u'structName' : structName
+				,	u'slotName' : to_cname(slot.name)
+			}
+			out_c.println(u'AvmAssert(getSlotOffset(%(traits)s, %(nameId)u) == (offsetof(%(nativeClass)s, %(slotsInstance)s) + offsetof(%(structName)s, m_%(slotName)s)));' % formatDict)
+
 
 	def argTraits(self, receiver, m):
 		argtraits = [ receiver ]
@@ -1123,16 +1721,28 @@ class AbcThunkGen:
 
 	def emitThunkProto(self, name, receiver, m):
 		ret = ctype_from_traits(self.lookupTraits(m.returnType), False);
+		# see note in thunkSig() about setter return types
+		if m.kind == TRAIT_Setter:
+			ret = "void"
 		decl = self.thunkDecl(name, ret)
 		self.out_h.println("extern "+decl+";");
 
 	def emitThunkBody(self, name, receiver, m, directcall):
-		ret = ctype_from_traits(self.lookupTraits(m.returnType), False);
+		rettraits = self.lookupTraits(m.returnType)
+		ret = ctype_from_traits(rettraits, False);
+		# see note in thunkSig() about setter return types
+		if m.kind == TRAIT_Setter:
+			ret = "void"
 		decl = self.thunkDecl(name, ret)
+		
+		unbox_receiver = self.calc_unbox_this(m)
 
 		self.out_c.println(decl);
 		self.out_c.println("{");
 		self.out_c.indent += 1;
+
+		if opts.thunkvprof:
+			self.out_c.println('_nvprof("%s", 1);' % name)
 
 		param_count = len(m.paramTypes);
 		optional_count = m.optional_count;
@@ -1159,7 +1769,10 @@ class AbcThunkGen:
 		
 		cts = ctype_from_traits(argtraits[0], True)
 		assert(cts in ["AvmObject","AvmString","AvmNamespace"])
-		val = "AvmThunkUnbox_AvmReceiver("+cts+", argv[argoff0])";
+		if unbox_receiver:
+			val = "AvmThunkUnbox_AvmAtomReceiver("+cts+", argv[argoff0])";
+		else:
+			val = "AvmThunkUnbox_AvmReceiver("+cts+", argv[argoff0])";
 		if directcall and argtraits[0].niname != None:
 			val = "(%s*)%s" % (argtraits[0].niname, val)
 		args.append((val, cts))
@@ -1176,6 +1789,8 @@ class AbcThunkGen:
 				if dts != cts:
 					defval = "AvmThunkCoerce_"+dts+"_"+cts+"("+defval+")";
 				val = "(argc < "+str(i)+" ? "+defval+" : "+val+")";
+				if directcall and cts == "AvmObject" and argtraits[i].niname != None:
+					val = "(%s*)%s" % (argtraits[i].niname, val)
 			args.append((val, cts))
 
 		if m.needRest():
@@ -1187,23 +1802,43 @@ class AbcThunkGen:
 
 		if directcall:
 			self.out_c.println("(void)env;") # avoid "unreferenced formal parameter" in non-debugger builds
-			self.out_c.println("%s* obj = %s;" % (m.receiver.niname, args[0][0]))
-			# many setters are declared as returning "undefined" in as3 but return "void" in C++.
-			# quietly ignore the C++ result. likewise, native ctors always return "undefined" in AS3
-			# but typically are void in C++. (can't do this for non-directcall as sig might be shared between
-			# a setter and nonsetter)
-			if m.kind == TRAIT_Setter or m == m.receiver.init:
-				ret = "void"
+			if m.receiver == None:
+				recname = "ScriptObject"
+			else:
+				recname = m.receiver.niname
+			self.out_c.println("%s* const obj = %s;" % (recname, args[0][0]))
 			if ret != "void":
-				self.out_c.prnt("const %s ret = (%s)" % (ret, ret))
-			self.out_c.println("obj->%s(" % m.native_method_name)
-			self.out_c.indent += 1
-			for i in range(1, len(args)):
-				if i > 1:
-					self.out_c.prnt(", ")
-				self.out_c.println(args[i][0]);
-			self.out_c.indent -= 1
+				if rettraits.ctype == CTYPE_OBJECT:
+					if rettraits.niname == None:
+						self.out_c.prnt("%s const ret = " % ("AvmObject"))
+					else:
+						self.out_c.prnt("%s* const ret = " % (rettraits.niname))
+				else:
+					self.out_c.prnt("%s const ret = " % (ret))
+			if m.receiver == None:
+				self.out_c.prnt("%s(obj" % m.native_method_name)
+				need_comma = True
+			else:
+				native_method_name = m.native_method_name
+				if m.receiver.ni.method_map_name != None and m.receiver.itraits == None:
+					native_method_name = m.receiver.ni.method_map_name + "::" + m.native_method_name
+				self.out_c.prnt("obj->%s(" % native_method_name)
+				need_comma = False
+			if len(args) > 1:
+				self.out_c.println("")
+				self.out_c.indent += 1
+				for i in range(1, len(args)):
+					if need_comma:
+						self.out_c.prnt(", ")
+					self.out_c.println("%s" % args[i][0]);
+					need_comma = True
+				self.out_c.indent -= 1
 			self.out_c.println(");")
+			if ret != "void":
+				if ret == "double":
+					self.out_c.println("return ret;")
+				else:
+					self.out_c.println("return (AvmBox) ret;")
 		else:
 			if m.receiver == None:
 				self.out_c.prnt("typedef AvmRetType_%s (*FuncType)(AvmObject" % (ret))
@@ -1249,6 +1884,31 @@ class AbcThunkGen:
 		self.out_c.indent -= 1
 		self.out_c.println("}")
 
+	# inefficient, but doesn't really matter
+	def find_override_base(self, mi):
+		if mi.override and mi.receiver.base != None:
+			bt = self.lookupTraits(mi.receiver.base)
+			for j in range(0, len(bt.tmethods)):
+				bmi = bt.tmethods[j]
+				if bmi.name.name == mi.name.name and bmi.name.ns == mi.name.ns and bmi != mi:
+					#print "OVER", str(mi.name), str(mi.receiver)
+					#print "BASE", str(bmi.name), str(bmi.receiver)
+					return bt,bmi
+		return None,None
+
+	def calc_unbox_this(self, mi):
+		if mi.unbox_this < 0:
+			bt,bmi = self.find_override_base(mi)
+			if bmi == None:
+				mi.unbox_this = 0 # no need to unbox
+			elif bmi.unbox_this > 0:
+				mi.unbox_this = 1 # unbox_this is sticky, down the inheritance tree
+			elif len(bmi.paramTypes) > 0:
+				param0 = self.lookupTraits(bmi.paramTypes[0])
+				if mi.receiver.ctype in [CTYPE_OBJECT,CTYPE_STRING,CTYPE_NAMESPACE] and param0.ctype == CTYPE_ATOM:
+					mi.unbox_this = 1 # unbox_this is sticky, down the inheritance tree
+		return mi.unbox_this > 0
+
 	def lookupTraits(self, name):
 		name = str(name)
 		if self.lookup_traits == None:
@@ -1273,7 +1933,14 @@ class AbcThunkGen:
 		return self.lookup_traits[name]
 		
 	def thunkSig(self, receiver, m):
-		sig = sigchar_from_traits(self.lookupTraits(m.returnType), False)+"2";
+		sig = sigchar_from_traits(self.lookupTraits(m.returnType), False);
+		# many setters are declared as returning "undefined" in as3 but return "void" in C++.
+		# we could force them to be explicitly "void" in AS3, but I'm loathe to risk compatibility issues...
+		# so let's just force their native impl (and sig) to return void. (modifying the sig is important,
+		# otherwise we might combine some setters with some non-setters, which could have disastrous results)
+		if m.kind == TRAIT_Setter:
+			sig = "v"
+		sig += "2"
 		if m.returnType.name == "Number":
 			sig += "d"
 		else:
@@ -1289,6 +1956,8 @@ class AbcThunkGen:
 				sig += "_opt" + sigchar_from_enum(dct, True) + to_cname(defval)
 		if m.needRest():
 			sig += "_rest"
+		if self.calc_unbox_this(m):
+			sig += "_u"
 		# native script functions can't share thunk with native class methods, add a prefix to force uniqueness
 		if m.receiver == None:
 			sig = "func_" + sig

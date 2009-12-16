@@ -40,37 +40,58 @@
 #ifndef __GC__
 #define __GC__
 
-#if defined(MMGC_PORTING_API)
-	// When the porting API is in use, we exclude
-	// stdlib functions or use them through
-	// #defines for portability to platforms
-	// that don't have them.
-	#include "portapi_mmgc.h"
-#else
-
-#define MMGC_GCENTER(_gc)  MMgc::GCAutoExit __mmgc_auto_exit(_gc);
+#define MMGC_GCENTER(_gc)  MMgc::GCAutoEnter __mmgc_auto_enter(_gc);
 
 #if defined(MMGC_IA32) && defined(_MSC_VER)
 
 #define MMGC_GET_STACK_EXTENTS(_gc, _stack, _size)						\
 	jmp_buf __mmgc_env;													\
-	setjmp(__mmgc_env);													\
+	VMPI_setjmpNoUnwind(__mmgc_env);													\
 	__asm { mov _stack,esp };											\
-	GCAssertMsg(_gc->GetStackEnter() != 0, "Missing MMGC_GCENTER macro"); \
-	_size = (uint32_t)(_gc->GetStackEnter() - (uintptr_t)_stack);
+	_size = (uint32_t)(_gc->GetStackTop() - (uintptr_t)_stack);
+
+#elif AVMSYSTEM_SPARC == 1
+
+#define MMGC_GET_STACK_EXTENTS(_gc, _stack, _size)						\
+	jmp_buf __mmgc_env;													\
+	VMPI_setjmpNoUnwind(__mmgc_env);													\
+	asm ("mov %%sp, %0":"=r" (_stack));									\
+	_size = (uint32_t)(_gc->GetOSStackTop() - (uintptr_t)_stack);
+
+#elif AVMSYSTEM_MAC == 1 && AVMSYSTEM_PPC == 1
+
+register void *mmgc_sp __asm__("r1");
+
+#define MMGC_GET_STACK_EXTENTS(_gc, _stack, _size)						\
+	jmp_buf __mmgc_env;													\
+	VMPI_setjmpNoUnwind(__mmgc_env);													\
+	_stack = (void*)mmgc_sp;											\
+	_size = (uint32_t)(_gc->GetOSStackTop() - (uintptr_t)_stack);
 
 #else
 
 #define MMGC_GET_STACK_EXTENTS(_gc, _stack, _size)						\
 	jmp_buf __mmgc_env;													\
-	setjmp(__mmgc_env);													\
+	VMPI_setjmpNoUnwind(__mmgc_env);													\
 	_stack = &__mmgc_env;												\
-	GCAssertMsg(_gc->GetStackEnter() != 0, "Missing MMGC_GCENTER macro"); \
-	_size = (uint32_t)(_gc->GetStackEnter() - (uintptr_t)_stack);
+	_size = (uint32_t)(_gc->GetStackTop() - (uintptr_t)_stack);
 
 #endif
 
-#endif // MMGC_PORTING_API
+// This macro creates a GC root of the current threads stack, there
+// are two use cases for this: 
+//
+// 1) the main thread is halting to let another thread run doing
+// possible GC activity (debugger use case)
+//
+// 2) the stack is moving to another area of memory (stack switching)
+// but the old stack must still get scanned
+#define MMGC_GC_ROOT_THREAD(_gc)						\
+	void *__stack;										\
+	size_t __stackSize;									\
+	MMGC_GET_STACK_EXTENTS(_gc, __stack, __stackSize);	\
+	MMgc::GC::AutoRCRootSegment __root(_gc, __stack, __stackSize);	\
+	MMgc::GCAutoEnterPause __mmgc_enter_pause(_gc);
 
 // Enable our own alloca() replacement that always allocates in the heap, this is good on
 // systems with limited memory or limited stack
@@ -91,35 +112,7 @@ namespace avmplus
 
 namespace MMgc
 {
-	class GCAutoExit
-	{
-	public:
-		GCAutoExit(GC *_gc);
-		~GCAutoExit();
-	private:
-		GC* gc;
-	};
-
-	/**
-	 * Conservative collector unit of work
-	 */
-	class GCWorkItem
-	{
-	public:
-		GCWorkItem() : ptr(NULL), _size(0) { }
-		inline GCWorkItem(const void *p, uint32_t s, bool isGCItem);
-
-		uint32_t GetSize() const { return _size & ~1; }
-		uint32_t IsGCItem() const { return _size & 1; }
-
-		// If a WI is a GC item, `ptr` is the UserPointer; it must not
-		// be the RealPointer nor an interior pointer
-		const void *ptr;
-
-		// The low bit of _size stores whether this is a GC item.
-		// Always access this through `GetSize` and `IsGCItem`
-		uint32_t _size;
-	};
+	class GCAutoEnter;
 
 	/**
 	 * GCRoot is root in the reachability graph, it contains a pointer a size 
@@ -138,26 +131,18 @@ namespace MMgc
 		virtual ~GCRoot();
 
 		// override new and delete so we can know the objects extents (via FixedMalloc::Size())
-		void *operator new(size_t size)
-		{
-			void *space = GCHeap::GetGCHeap()->GetFixedMalloc()->Alloc(size);
-			// GCRoots are auto-scanned so clean them, don't rely on ctors to init the object properly
-			VMPI_memset(space, 0, GCHeap::GetGCHeap()->GetFixedMalloc()->Size(space));
-			return space;
-		}
+		void *operator new(size_t size);
         
-		void operator delete (void *object)
-		{
-			GCHeap::GetGCHeap()->GetFixedMalloc()->Free(object);
-		}
+		void operator delete (void *object);
 
 		const void *Get() const { return object; }
+		const void *End() const { return (char*)object + size; }
 		void Set(const void *object, size_t size);
 
 		GC *GetGC() const { return gc; }
 		/** if your object goes away after the GC is deleted this can be useful */
 		void Destroy();
-	
+
 	private:
 		GC * gc;
 
@@ -166,7 +151,7 @@ namespace MMgc
 		const void *object;
 		size_t size;
 
-		GCWorkItem GetWorkItem() const { return GCWorkItem(object, (uint32_t)size, false); }
+		GCWorkItem GetWorkItem() const;
 	};
 
 	/**
@@ -190,40 +175,23 @@ namespace MMgc
 		 * sweeping, useful for bookkeeping based on whether things
 		 * got marked
 		 */
-		virtual void presweep() {}
+		virtual void presweep();
 
 		/**
 		 * This method is invoked after all sweeping
 		 */
-		virtual void postsweep() {}
-
-		/**
-		 * This method is called whenever the collector decides to expand the heap
-		 */
-		virtual void heapgrew() {}
+		virtual void postsweep();
 
 		// called before a ZCT reap begins
-		virtual void prereap() {}
+		virtual void prereap();
 
 		// called after a ZCT reap completes
-		virtual void postreap() {}
-
-		/**
-		 * This callback is the first thing a stop-the-world collection calls.
-		 */
-		virtual void precollection() {}
-
-		/**
-		 * This callback is the last thing a stop-the-world collection calls.
-		 */
-		virtual void postcollection() {}
+		virtual void postreap();
 
 		/**
 		 * This method is called before an RC object is reaped
 		 */
-		virtual void prereap(void* /*rcobj*/) {}
-		virtual void log(const char* /*str*/) {}
-		virtual void oom(MemoryStatus) {}
+		virtual void prereap(void* /*rcobj*/);
 
 	private:
 		GC *gc;
@@ -276,45 +244,40 @@ namespace MMgc
 	 *
 	 * ----
 	 *
-	 * Notes, 2009-04-01 / lhansen:
+	 * Notes, 2009-06-23 / lhansen:
 	 *
-	 * This is the first cut, and it incorporates verbatim the policies of collection
-	 * in Tamarin at the time of the March 2009 TR -> TC merge.  More complexity and other
-	 * policies will appear here by and by, this is by no means set in stone.  In particular,
-	 * it will become aware of other GC instances and also more aware of FixedMalloc.
-	 *
-	 * Arguably the doubling in size of the mark stack is also a policy decision
-	 * that should be made here, not something the marker should decide for itself.  But
-	 * the fixed-size mark stack is a bug in itself so wait for that to be fixed.
+	 * This is the second cut, and it implements an allocation-driven policy that is
+	 * documented extensively in GC.cpp and in doc/mmgc/policy.pdf.  The policy improves
+	 * on the first-cut policy by running the GC less often and having lower pause times.
 	 *
 	 * ZCT reaping times are not bounded, so ZCT reaping may violate any kind of
-	 * incrementality guarantee.
-	 *
-	 * In general, the policy does not guarantee incremental collection, because
-	 * the amount of work performed each mark quantum is tied to a time slice, not to the
-	 * amount of work that needs to be done for the marker to keep up with the mutator.
-	 * The problem is that incremental marking only happens when we allocate fresh blocks,
-	 * not on a finer grain, so a lot of allocation can take place between each time the
-	 * marker gets to run, and then it gets a fixed quantum.  In practice, this biases
-	 * us toward heap expansion, which is not good for small systems.
+	 * incrementality guarantee.  This will be fixed by and by.
 	 */
 	class GCPolicyManager {
 	public:
 		GCPolicyManager(GC* gc, GCHeap* heap);
 		
 		/**
+		 * Clean up and print any final statistics.  Should be called from the very
+		 * start of the GC's destructor.
+		 */
+		void shutdown();
+		
+		/**
 		 * Situation: the GC is about to run the incremental marker.
 		 *
-		 * @return the desired length of an incremental mark quantum.
-		 * @note this can vary from call to call.
+		 * @return the desired length of the next incremental mark quantum.
+		 * @note the result can vary from call to call; the function should
+		 *       be called as an incremental mark is about to start and the
+		 *       result should not be cached.
 		 */
-		uint64_t incrementalMarkMilliseconds();
+		uint32_t incrementalMarkMilliseconds();
 		
 		/**
 		 * @return the number of blocks owned by this GC, as accounted for by calls to
 		 * signalBlockAllocation and signalBlockDeallocation.
 		 */
-		uint64_t blocksOwnedByGC();
+		size_t blocksOwnedByGC();
 
 		/**
 		 * @return the number of objects reported marked by signalMarkWork, since startup.
@@ -327,76 +290,17 @@ namespace MMgc
 		uint64_t bytesMarked();
 		
 		/**
-		 * Compute a new reap threshold for the ZCT based on its current size and occupancy.
+		 * Compute a ZCT growth budget (in blocks) based on its current size.
 		 *
-		 * @return the new reap threshold (ZCT occupancy upper limit).
-		 *
-		 * (Note, an alternative strategy for the ZCT would be to call a policy function
-		 * every time the ZCT has to be extended, and to shrink the ZCT following a reap.)
+		 * @return the growth budget
 		 */
-		uint64_t zctNewReapThreshold(uint64_t zctSize, uint64_t zctOccupancy);
+		uint32_t queryZCTBudget(uint32_t zctBlocksUsed);
 		
 		/**
-		 * Compute a new, larger size for the ZCT, based on its old size.
-		 * (As long as the ZCT is a linear array its growth factor is a policy matter.)
-		 *
-		 * @return the size for the new zct table given the old size.
+		 * Set the lower limit beyond which we try not to run the garbage collector.
+		 * The value is specified in 4k blocks, thus 256 == 1MB.
 		 */
-		uint64_t zctNewSize(uint64_t oldZctSize);
-		
-		/**
-		 * Situation: The GC is about to allocate one or more blocks from GCHeap, and 
-		 * does not know if GCHeap may have to expand the heap.  An incremental collection
-		 * is already in progress.  Should we run the marker?
-		 *
-		 * @return true if we should run the incremental marker for one quantum.
-		 */
-		bool queryIncrementalMarkAtAllocBlock();
-		
-		 /**
-		 * Situation: The GC is about to allocate one or more blocks from GCHeap, and
-		 * does not know if GCHeap may have to expand the heap.  An incremental collection
-		 * is /not/ in progress.  Should we start it?
-		 *
-		 * @return true if we should start an incremental collection.
-		 */
-		bool queryStartIncrementalMarkAtAllocBlock();
-
-		/**
-		 * Situation: The GC is about to allocate one or more blocks from GCHeap.
-		 *
-		 * If the heap has been expanded by external agents (FixedMalloc or other
-		 * garbage collectors, or possibly other block-allocating agents) since
-		 * the last time the GC allocated a block, we might want to kick off a
-		 * collection to keep up with the allocator.  Should we start the collection?
-		 *
-		 * @return true if we should start an incremental collection (in incremental mode)
-		 *              or a non-incremental collection (in non-incremental mode)
-		 */
-		 bool queryStartCollectionAfterHeapExpansion();
-		 
-		 /**
-		 * Situation: The GC has just failed to allocate one or more blocks from GCHeap
-		 * without expanding the heap, and an incremental collection is in progress.
-		 * Should we force the collection to finish in order to increase the chance of 
-		 * being able to allocate a block without expanding the heap?
-		 *
-		 * @return true if we should force the collection to finish.
-		 *
-		 * FIXME: This is not good policy.  Essentially it amounts to a stop-the-world
-		 * collection, and I have simple benchmark programs that show huge latencies
-		 * if this is made to happen.  Expect this to go away by and by.
-		 */
-		bool queryFinishIncrementalMarkAfterAllocBlockFail();
-
-		/**
-		 * Situation: The GC has just failed ot allocate one or more blocks from GCHeap
-		 * without expanding the heap, and the system is in non-incremental mode.
-		 * Should we start a collection?
-		 *
-		 * @return true to run a stop-the-world collection.
-		 */
-		bool queryRunCollectionAfterAllocBlockFail();
+		void setLowerLimitCollectionThreshold(uint32_t blocks);
 
 		enum PolicyEvent 
 		{
@@ -436,16 +340,88 @@ namespace MMgc
 		void signalBlockDeallocation(size_t numblocks);
 		
 		/**
-		 * Situation: signal that some number of pointer-containing objects, whose combined
-		 * size total nbytes, have been scanned by the garbage collector.
+		 * Situation: signal that one pointer-containing object, whose size is nbytes,
+		 * has been scanned by the garbage collector.
 		 *
 		 * This may only be called between the signals START_StartIncrementalMark and 
 		 * END_FinalizeAndSweep, and mark work signaled after a START event may not be
 		 * reflected in the values returned by objectsMarked() and bytesMarked() until
 		 * after the corresponding END event has been signaled.
 		 */
-		/*inline*/ void signalMarkWork(size_t nbytes, uint64_t nobjects=1);
+		/*REALLY_INLINE*/ void signalMarkWork(size_t nbytes);
 		
+		/**
+		 * Situation: signal that some number of bytes have just been successfully
+		 * allocated and are about to be returned to the caller of the allocator.
+		 *
+		 * @return true if collection work should be triggered because the allocation
+		 * budget has been exhausted.
+		 */
+		/*REALLY_INLINE*/ bool signalAllocWork(size_t nbytes);
+
+		/**
+		 * Situation: signal that some number of bytes have just been successfully
+		 * freed.
+		 */
+		/*REALLY_INLINE*/ void signalFreeWork(size_t nbytes);
+
+		/**
+		 * Situation: the incremental marker has been started, and we need to know whether
+		 * to run another mark increment or push the conclusion to a finish (because the
+ 		 * total allocation budget for the collection cycle has been exhausted).  This
+		 * predicate returns true in the latter case.
+		 */
+		bool queryEndOfCollectionCycle();
+
+#ifdef MMGC_POLICY_PROFILING
+		/**
+		 * Situation: signal that one write has been examined by the write barrier and made
+		 * it to the given stage of the barrier.   See the barrier code to find out what the
+		 * stages are.
+		 */
+		/*REALLY_INLINE*/ void signalWriteBarrierWork(int stage);
+
+		/**
+		 * Situation: signal that the ZCT reaper has run and performed some work.
+		 */
+		void signalReapWork(uint32_t objects_reaped, uint32_t bytes_reaped, uint32_t objects_pinned);
+#endif
+#ifdef MMGC_POINTINESS_PROFILING
+		/**
+		 * Situation: signal that 'words' words have been scanned; that 'could_be_pointer'
+		 * number of these words passed the initial heap range checks; and that 
+		 * 'actually_is_pointer' number of these words were conservatively found to
+		 * be pointers to heap objects.
+		 */
+		/*inline*/ void signalDemographics(size_t words, size_t could_be_pointer, size_t actually_is_pointer);
+#endif
+#ifdef MMGC_REFCOUNT_PROFILING
+		/**
+		 * Situation: signal that IncrementRef has been called on an object.
+		 */
+		/*REALLY_INLINE*/ void signalIncrementRef();
+		
+		/**
+		 * Situation: signal that DecrementRef has been called on an object.
+		 */
+		/*REALLY_INLINE*/ void signalDecrementRef();
+		
+		/**
+		 * Situation: signal that one reference is being added to the ZCT.  If 'initial'
+		 * is true then the object is freshly allocated and the adding is from RCObject's
+		 * constructor.  'population' is the number of elements in the table at the time
+		 * ZCT::Add is entered.
+		 */
+		/*REALLY_INLINE*/ void signalZCTAdd(bool initial, uint32_t population);
+		
+		/**
+		 * Situation: signal that one reference is being removed from the ZCT.  If 'final'
+		 * is true then the object is being deleted and the removal is from RCObject's
+		 * destructor.
+		 */
+		/*REALLY_INLINE*/ void signalZCTRemove(bool final);
+#endif
+
 		/**
 		 * The collector 'gc' (which is not the collector for this manager) has started
 		 * a garbage collection, indicating perhaps some memory pressure in that heap.
@@ -458,6 +434,26 @@ namespace MMgc
 		 */
 		void signalEndCollection(GC* gc);
 
+		/**
+		 * Request a full collection happen at the next GC edge (enter/exit)
+		 */
+		void queueFullCollection() { fullCollectionQueued = true; }
+
+		/**
+		 * called after a full collection is done
+		 */
+		void fullCollectionComplete() { fullCollectionQueued = false; }
+
+		/**
+		 * called to find out if a full collection has been requested
+		 */
+		bool queryFullCollectionQueued() { return fullCollectionQueued; }
+
+		/**
+		 * Called by the owner when the owner is notified of an imminent abort
+		 */
+		void SignalImminentAbort();
+		
 		// ----- Public data --------------------------------------
 		
 		// Elapsed time (in ticks) for various collection phases, and the maximum phase time
@@ -470,7 +466,18 @@ namespace MMgc
 		uint64_t timeFinalRootAndStackScan;
 		uint64_t timeFinalizeAndSweep;
 		uint64_t timeReapZCT;
-		
+
+		// The total time doing collection work (sum of the variables above except the ZCT reap
+		// time) and the elapsed time from the start of StartIncrementalMark to the end of
+		// FinalizeAndSweep.  Together they provide a crude approximation to a measure of 
+		// pause clustering.
+		uint64_t timeInLastCollection;
+		uint64_t timeEndToEndLastCollection;
+
+		// Time for ZCT reaping during the last collection cycle (end of one FinalizeAndSweep
+		// to the end of the next one).
+		uint64_t timeReapZCTLastCollection;
+
 		// The maximum latceny for various collection phases across the run
 		uint64_t timeMaxStartIncrementalMark;
 		uint64_t timeMaxIncrementalMark;
@@ -478,10 +485,13 @@ namespace MMgc
 		uint64_t timeMaxFinalizeAndSweep;
 		uint64_t timeMaxReapZCT;
 		
-		// The maximum latency across those events, and the end event
-		uint64_t timeMaxLatency;
-		PolicyEvent eventMaxLatency;
-		
+		// The maximum latcency for various collection phases during the previous collection cycle
+		uint64_t timeMaxStartIncrementalMarkLastCollection;
+		uint64_t timeMaxIncrementalMarkLastCollection;
+		uint64_t timeMaxFinalRootAndStackScanLastCollection;
+		uint64_t timeMaxFinalizeAndSweepLastCollection;
+		uint64_t timeMaxReapZCTLastCollection;
+
 		// The total number of times each phase was run
 		uint64_t countStartIncrementalMark;
 		uint64_t countIncrementalMark;
@@ -490,42 +500,60 @@ namespace MMgc
 		uint64_t countReapZCT;
 		
 	private:
-		// Have we allocated "enough" since the the last collection?  Typically a
-		// function of allocation volume and the free space divisor.
-		bool queryAllocationLimitReached();
-		
-		// Is the size of the GC heap large enough to allow collection?
-		bool queryLowerLimitGCBlocksAllocated();
-		
-		// Has enough time passed since the end of the last collection to allow a
-		// new collection to start?
-		bool querySufficientTimeSinceLastCollection();
-
 		// The following parameters can vary not just from machine to machine and
 		// run to run on the same machine, but within a run in response to memory
 		// pressures and other feedback.
 		
-		// A number of ticks that must pass between each call to IncrementalMark.
-		// This parameter helps control the time allocated to the GC and must
-		// be balanced with the value for incrementalMarkTicks(), above.
-		uint64_t interIncrementalMarkTicks();
-		
-		// A number of ticks that must pass between the end of one collection and
-		// the beginning of the next collection.  This parameter helps control GC
-		// overhead in expansive phases, sometimes at a cost in memory.
-		uint64_t interCollectionTicks();
-		
-		// An integer n s.t. if L was the amount of live data at the end of one
-		// collection, then a new collection should have run to completion when
-		// L/n memory has been allocated since that collection.
-		uint32_t freeSpaceDivisor();
-		
 		// The lower limit beyond which we try not to run the garbage collector.
-		uint32_t lowerLimitHeapBlocks();
+		uint32_t lowerLimitCollectionThreshold();
 		
 		// Get the current time (in ticks).
 		uint64_t now();
 
+#ifdef MMGC_POLICY_PROFILING
+		// Convert ticks to milliseconds, as a double (used for printing)
+		double ticksToMillis(uint64_t ticks);
+		
+		// @return true if we should print policy data
+		bool summarizeGCBehavior();
+
+		// Print policy data.  At shutdown, afterCollection will be passed as false.
+		void PrintGCBehaviorStats(bool afterCollection=true);
+#endif
+
+ 		// Various private methods for the GC policy follow.  See comment in GC.cpp for details.
+ 
+ 		// Amount of GC work to perform (bytes to scan) per byte allocated while the GC is active
+ 		double W();
+ 
+ 		// Amount of allocation to allow between two invocations of IncrementalMark
+ 		double A();
+ 
+ 		// Called from the policy event handler to start computing adjustments to R: before any
+ 		// mark work is performed.
+ 		void startAdjustingR();
+ 
+ 		// Called from the policy event handler to finish computing adjustments to R: after all
+ 		// mark work has been performed.
+ 		void endAdjustingR();
+ 
+ 		// Called from adjustPolicyForNextMajorCycle to compute the effective L for the next
+ 		// collection cycle
+ 		void adjustL();
+
+		// Called from the policy manager's constructor
+		void adjustPolicyInitially();
+		
+ 		// Called from the policy event handler to compute the GC policy for the next 
+ 		// major collection cycle (from the end of one FinishIncrementalMark to the start
+ 		// of the next one)
+ 		void adjustPolicyForNextMajorCycle();
+ 
+ 		// Called from the policy event handler to compute the GC policy for the next
+ 		// minor collection cycle (from the end of one IncrementalMark to the start of the
+ 		// next one)
+ 		void adjustPolicyForNextMinorCycle();
+ 
 		// ----- Private data --------------------------------------
 		
 		GC * const gc;
@@ -533,93 +561,134 @@ namespace MMgc
 		
 		// The time recorded the last time we received signalEndOfIncrementalMark
 		uint64_t timeEndOfLastIncrementalMark;
-		
+
+		// The time recorded the last time we received signalStartOfCollection
+		uint64_t timeStartOfLastCollection;
+
 		// The time recorded the last time we received signalEndOfCollection
 		uint64_t timeEndOfLastCollection;
 
-		// Blocks actually allocated from GCHeap
-		uint64_t blocksAllocatedSinceLastCollection;
+		// The total number of blocks owned by GC, and the maximum such number
+		size_t blocksOwned;
+		size_t maxBlocksOwned;
 		
-		// Blocks actually returned to GCHeap (as a result of calls to Free), note
-		// this may be larger than the number of blocks allocated
-		uint64_t blocksDeallocatedSinceLastCollection;
-		
-		// The total size of GCHeap following the previous allocation from GCHeap
-		uint64_t blocksInHeapAfterPreviousAllocation;
-		
-		// The total number of blocks owned by GC
-		uint64_t blocksOwned;
-		
-		// The number of objects scanned since startup
+		// The number of objects scanned since startup (which is equivalent to the number
+		// of calls to GC::MarkItem), less the number scanned during the last
+		// collection cycle.
 		uint64_t objectsScannedTotal;
 		
-		// The number of bytes scanned since startup
+		// The number of objects scanned during the last collection cycle.
+		uint32_t objectsScannedLastCollection;
+		
+		// The number of bytes scanned since startup less the ones scanned during the 
+		// last collection cycle.
 		uint64_t bytesScannedTotal;
 		
+		// The number of bytes scanned during the last collection cycle.
+		uint32_t bytesScannedLastCollection;
+
 		// Temporaries for holding the start time / start event until the end event arrives
 		uint64_t start_time;
 		PolicyEvent start_event;
+
+		// Value returned by lowerLimitCollectionThreshold() and set by setLowerLimitCollectionThreshold():
+		// the heap size, in blocks, below which we do not collect.
+		uint32_t collectionThreshold;
+
+		// true if a forced garbage collection has been requested
+		bool fullCollectionQueued;
+
+		// true if the ZCT statistics for the current GC cycle should be cleared;
+		// this is required because the ZCT stats may need to be updated before
+		// StartIncrementalMark but can't be cleared at the end of FinalizeAndSweep.
+		bool pendingClearZCTStats;
+
+#ifdef MMGC_POLICY_PROFILING
+		// Records the heap population before we sweep.  Unit is blocks except where noted.
+		size_t heapAllocatedBeforeSweep;
+		size_t heapUsedBeforeSweep;
+		size_t gcAllocatedBeforeSweep;
+		size_t gcBytesUsedBeforeSweep;
+		
+		// Barrier stages hit in InlineWriteBarrier: examine mark, and hit the barrier.
+		uint64_t barrierStageTotal[2];
+		uint32_t barrierStageLastCollection[2];
+
+		// Reap work, overall
+		uint64_t objectsReaped;
+		uint64_t bytesReaped;
+		uint64_t objectsPinned;
+		
+		// Allocation work, overall
+		uint64_t objectsAllocated;
+		uint64_t bytesAllocated;
+#endif
+#ifdef MMGC_POINTINESS_PROFILING
+		// Track the number of scannable words, the number that passes the initial range
+		// check, and the number that turn out to be (conservative) pointers.
+		//
+		// These are cleared at the start of each GC so stats are only valid for one
+		// GC cycle.
+		uint64_t candidateWords;
+		uint64_t couldBePointer;
+		uint64_t actuallyIsPointer;
+#endif
+#ifdef MMGC_REFCOUNT_PROFILING
+		uint64_t incrementRefTotal;
+		uint64_t incrementRefLastCollection;
+		uint64_t decrementRefTotal;
+		uint64_t decrementRefLastCollection;
+		uint32_t zctPeakSize;
+		uint64_t addZCTTotal;
+		uint64_t addZCTLastCollection;
+		uint64_t removeZCTTotal;
+		uint64_t removeZCTLastCollection;
+		uint64_t addZCTInitialTotal;
+		uint64_t removeZCTFinalTotal;
+#endif
+
+		// Various policy parameters.  For more documentation, see comments in GC.cpp.
+		
+		// max pause time in seconds
+		double P;
+
+		// approximate mark rate in bytes/sec, [1M,infty)
+		double R;
+
+		// requested inverse load factor (1,infty)
+		double L_ideal;
+		
+		// adjusted inverse load factor (adjusted for heap pressure, growth, etc)
+		double L_actual;
+		
+		// gc trigger as fraction of allocation budget to use before triggering GC [0,1]
+		double T;
+
+		// ratio of gc work to mutator work while the gc is running
+		double G;
+
+		// largest multiple of L_ideal to which L_actual can grow (unless 0, which means unlimited)
+		double X;
+
+		// the remaining allocation budget for the major GC cycle.  (This can go negative
+		// and the variable must accomodate negative values.  It's not frequently accessed.)
+		double remainingMajorAllocationBudget;
+
+		// the allocation budget for the minor GC cycle.  This variable remains constant
+		// throughout the minor cycle.
+		int32_t minorAllocationBudget;
+		
+		// the remaining allocation budget for the minor GC cycle.  Initially this has the
+		// value of minorAllocationBudget; the allocation request size is subtracted for
+		// every allocation.  This variable can go negative because we can overshoot the
+		// budget.
+		int32_t remainingMinorAllocationBudget;
+		
+		// Temporaries used to compute R
+		uint64_t adjustR_startTime;
+		uint64_t adjustR_totalTime;
 	};
-
-	inline void GCPolicyManager::signalMarkWork(size_t nbytes, uint64_t nobjects)
-	{
-		objectsScannedTotal += nobjects;
-		bytesScannedTotal += nbytes;
-	}
-
-	/**
-	 * The Zero Count Table used by DRC.
-	 */
-	class ZCT
-	{
-		friend class GC;
-
-		// size of table in pages
-		static const int ZCT_START_SIZE;
-	public:
-		ZCT();
-		~ZCT();
-		void Add(RCObject *obj);
-		void Remove(RCObject *obj);
-		void Reap();
-	private:
-		// for MMGC_GET_STACK_EXTENTS
-		uintptr_t StackTop;
-
-		GC *gc;
-		void SetGC(GC*);
-
-		// in pages
-		int zctSize;
-
-		// the zero count table
-		RCObject **zct;
-
-		// index to the end
-		RCObject **zctNext;
-
-		// freelist of open slots
-		RCObject **zctFreelist;
-
-		// during a reap where we are
-		int zctIndex;
-
-		// during a reap becomes zctNext
-		int nextPinnedIndex;
-
-		int count;
-		int zctReapThreshold;
-
-		// are we reaping the zct?
-		bool reaping;
-
-		void PinStackObjects(const void *start, size_t len);
-		bool IsZCTFreelist(RCObject **obj)
-		{
-			return obj >= zct && obj < (RCObject**)(zct+zctSize/sizeof(RCObject*));
-		}
-	};
-
+	
 	/**
 	 * This is a general-purpose garbage collector used by the Flash Player.
 	 * Application code must implement the GCRoot interface to mark all
@@ -653,19 +722,23 @@ namespace MMgc
 	 * to find the optimum value.
 	 *
 	 */
-	class GC
+	class GC : public OOMCallback
 	{
 		friend class GCRoot;
+		friend class GCHeap;
 		friend class GCCallback;
 		friend class GCAlloc;
 		friend class GCLargeAlloc;
 		friend class RCObject;
 		friend class GCInterval;
 		friend class ZCT;
+		friend class AutoRCRootSegment;
+		friend class GCPolicyManager;
 	public:
 
 		/**
 		 * If you need context vars use this!
+		 * FIXME: document context variables.
 		 */
 		enum
 		{
@@ -673,38 +746,61 @@ namespace MMgc
 			GCV_AVMCORE,
 			GCV_COUNT
 		};
-		void *GetGCContextVariable(int var) const { return m_contextVars[var]; }
-		void SetGCContextVariable(int var, void *val) { m_contextVars[var] = val; }
 		
-		avmplus::AvmCore *core() const { return (avmplus::AvmCore*)GetGCContextVariable(GCV_AVMCORE); }
+		void *GetGCContextVariable(int var) const;
 
+		void SetGCContextVariable(int var, void *val);
+		
 		/**
-		 * greedy is a debugging flag.  When set, every allocation
-		 * will cause a garbage collection.  This makes code run
-		 * abysmally slow, but can be useful for detecting mark
-		 * bugs.
-		 *
-		 * The GC reads this flag only when holding the GC lock.  It is best
-		 * to set it as soon as the GC is created.
+		 * @return the AvmCore instance associated with this GC.
 		 */
-		bool greedy;
+		avmplus::AvmCore *core() const;
 
 		/**
-		 * nogc is a debugging flag.  When set, garbage collection
-		 * never happens.
+		 * greedy is a debugging flag.  When set, every allocation will cause
+		 * a garbage collection.  This makes code run abysmally slow, but can
+		 * be useful for detecting mark bugs or computing true peak live size.
+		 * (The flag is effective in both debug and release builds.)
 		 */
-		bool nogc;
+		const bool greedy;
 
 		/**
-	      * findUnmarkedPointers is a debugging flag, only 
-		  */
+		 * nogc is a debugging flag.  When set, garbage collection never happens.
+		 * (The flag is effective in both debug and release builds.)
+		 */
+		const bool nogc;
+
+		/**
+		 * incremental controls the behavior of the garbage collection.  If true,
+		 * collection is incremental (and pause times are more or less controlled);
+		 * if false, collection is stop-the-world.
+		 */
+		const bool incremental;
+		
+		/**
+	     * findUnmarkedPointers is a debugging flag.  If true, the GC will scan the
+		 * heap at the end of garbage collection, asserting that every word that
+		 * looks like it conservatively points to an object points to an object that
+		 * was marked by the collector.  The flag is available in release builds but
+		 * effective in debug builds only.)
+		 */
 		bool findUnmarkedPointers;
 
 		/**
-		* turns on code that does a trace before reaping zero count object and asserting on
-		* any objects that get marked, debug builds only
-		*/
+		 * validateDefRef is a debugging flag.  It turns on code that does a
+		 * trace before reaping zero count object and asserting on any objects
+		 * that get marked.  Significant space cost.  (The flag is available
+		 * in release builds but effective in debug builds only.)
+		 */
 		bool validateDefRef;		
+		
+		/**
+		 * keepDRCHistory is a debugging flag.  It turns on code that keeps the call
+		 * stacks of all IncrementRef and DecrementRef operations on each RC object,
+		 * and prints this history when the reference count is already zero
+		 * on entry to DecrementRef.  Significant space cost.  (The flag is available
+		 * in release builds but effective in debug builds only.)
+		 */
 		bool keepDRCHistory;
 
 		bool dontAddToZCTDuringCollection;
@@ -715,31 +811,46 @@ namespace MMgc
 #endif
 
 		/**
-		 * Configuration flag enabling incremental collection.
+		 * Garbage collection mode.  The GC is configured at creation in one of
+		 * these (it would be pointlessly hairy to allow the mode to be changed
+		 * at run-time).
 		 */
-		bool incremental;
+		enum GCMode 
+		{
+			kDisableGC=1,		// never collect
+			kGreedyGC,			// stop-the-world collection at every allocation
+			kIncrementalGC,		// incremental collection
+			kNonincrementalGC	// nonincremental collection
+		};
 
-		// -- Interface
-		GC(GCHeap *heap);
-		~GC();
+		GC(GCHeap *heap, GCMode mode);
+		
+		virtual ~GC();
 		
 		/**
 		 * Causes an immediate stop-the-world garbage collection (or finishes any
 		 * incremental collection underway).
 		 */
-		void Collect();
+		void Collect(bool scanStack=true);
 
 		/**
-		* flags to be passed as second argument to alloc
-		*/
+		 * Do a full collection at the next MMGC_GCENTER macro site
+		 */
+		void QueueCollection();
+
+		/**
+		 * flags to be passed as second argument to alloc
+		 */
 		enum AllocFlags
 		{
 			kZero=1,
 			kContainsPointers=2,
 			kFinalize=4,
-			kRCObject=8
+			kRCObject=8,
+			kCanFail=16			
 		};
 
+		// FIXME: why is this public?
 		enum PageType
 		{
 			kNonGC = 0,
@@ -749,14 +860,62 @@ namespace MMgc
 		};
 
 		/**
-		 * Main interface for allocating memory.  Default flags is no
-		 * finalization, contains pointers is set and zero is set.
+		 * Main interface for allocating memory.  Default flags are
+		 * no finalization, not containing pointers, not zero'd, and not ref-counted.
 		 *
-		 * Do not call this from a finalizer.
+		 * This function returns NULL only if kCanFail is passed in 'flags'.
 		 */
 		void *Alloc(size_t size, int flags=0);
 
+		/**
+		 * Specialized implementations of Alloc().  Flags are omitted, each function is annotated
+		 * with the flags they assume.   Additionally, 'size' is usually known statically in the 
+		 * calling context (typically a 'new' operator).  Finally, these are always inlined.
+		 * The result is that most computation boils away and we're left with just a call to the
+		 * underlying primitive operator.
+		 */
+		void *AllocPtrZero(size_t size);			// Flags: GC::kContainsPointers|GC::kZero
+		void *AllocPtrZeroFinalized(size_t size);	// Flags: GC::kContainsPointers|GC::kZero|GC::kFinalize
+		void *AllocRCObject(size_t size);			// Flags: GC::kContainsPointers|GC::kZero|GC::kRCObject|GC::kFinalize
+
+		/**
+		 * Like Alloc but optimized for the case of allocating one 8-byte non-pointer-containing
+		 * non-finalizable non-rc non-zeroed object (a box for an IEEE double).
+		 */
+		void* AllocDouble();
+
+		/**
+		 * Like Alloc but allocating a little extra memory; factored out as a
+		 * separate function in order to allow for a fast object overflow check.
+		 */
+		void *AllocExtra(size_t size, size_t extra, int flags=0);
+
+		/**
+		 * Specialized implementations of Alloc().  See above for explanations.
+		 */
+		void *AllocExtraPtrZero(size_t size, size_t extra);				// Flags: GC::kContainsPointers|GC::kZero
+		void *AllocExtraPtrZeroFinalized(size_t size, size_t extra);	// Flags: GC::kContainsPointers|GC::kZero|GC::kFinalize
+		void *AllocExtraRCObject(size_t size, size_t extra);			// Flags: GC::kContainsPointers|GC::kZero|GC::kRCObject|GC::kFinalize
+		
+		/**
+		 * Out-of-line version of AllocExtra, used by the specialized versions
+		 */
+		void *OutOfLineAllocExtra(size_t size, size_t extra, int flags);
+		
+		/**
+		 * Just like Alloc but can return NULL
+		 */
+		void *PleaseAlloc(size_t size, int flags=0);
+		
+		/**
+		 * Signal that we've allocated some memory and that collection can be triggered
+		 * if necessary.
+		 */
+		void SignalAllocWork(size_t size);
+
 	private:
+		const static size_t kLargestAlloc = 1968;
+
 		class RCRootSegment : public GCRoot
 		{
 		public:
@@ -769,7 +928,19 @@ namespace MMgc
 		
 		RCRootSegment* rcRootSegments;
 		
+		void AddRCRootSegment(RCRootSegment *segment);
+
+		void RemoveRCRootSegment(RCRootSegment *segment);
+
 	public:
+
+		class AutoRCRootSegment : public RCRootSegment
+		{
+		public:
+			AutoRCRootSegment(GC* gc, void* mem, size_t size);
+			~AutoRCRootSegment();			
+		};
+
 		
 		/**
 		 * Allocate memory that will be scanned for pointers to GC memory
@@ -782,340 +953,318 @@ namespace MMgc
 		 */
 		void FreeRCRoot(void* mem);
 		
-		void *AllocAlreadyLocked(size_t size, int flags=0);
-
-		
 		/**
 		 * overflow checking way to call Alloc for a # of n size'd items,
 		 * all instance of Alloc(num*sizeof(thing)) should be replaced with:
 		 * Calloc(num, sizeof(thing))
-		 *
-		 * Do not call this from a finalizer.
 		 */
 		void *Calloc(size_t num, size_t elsize, int flags=0);
 
 		/**
-		 * One can free a GC allocated pointer, this will throw an assertion
-		 * if called during the Sweep phase (ie via a finalizer) it can only be
-		 * used outside the scope of a collection
+		 * One can free a GC allocated pointer.  The pointer may be NULL.
 		 */
 		void Free(const void *ptr);
 
 		/**
-		 * return the size of a piece of memory, may be bigger than what was asked for
+		 * One can free a GC allocated pointer.  The pointer must not be NULL.
 		 */
-		static size_t Size(const void *ptr)
-		{
-			GCAssert(GetGC(ptr)->IsGCMemory(ptr));			
-			size_t size = GCLargeAlloc::GetBlockHeader(ptr)->usableSize;
-			size -= DebugSize();
-			return size;
+		void FreeNotNull(const void *ptr);
+		
+		/**
+		 * @return the size of a managed object given a user or real pointer to its
+		 * beginning.  The returned value may be bigger than what was asked for.
+		 */
+		static size_t Size(const void *ptr);
 
-		}
-
+		/**
+		 * @return the GC object associated with a managed object.
+		 * this item must be a small item (<1968) or the first page of a large allocation,
+		 * it won't work on secondary pages of a large allocation,
+		 */
+		static GC* GetGC(const void *item);
+		
 		/**
 		 * Tracers should employ GetMark and SetMark to
 		 * set the mark bits during the mark pass.
 		 */
 		static int GetMark(const void *item);
-
-		static int SetMark(const void *item)
-		{
-			GCAssert(item != NULL);
-#ifdef MMGC_MEMORY_INFO
-			GC *gc = GetGC(item);	
-			item = GetRealPointer(item);
-			GCAssert(gc->IsPointerToGCPage(item));
-#endif 			
-			if (GCLargeAlloc::IsLargeBlock(item)) {
-				return GCLargeAlloc::SetMark(item);
-			} else {
-				return GCAlloc::SetMark(item);
-			}
-		}
 		
-		void SetQueued(const void *item)
-		{
-#ifdef MMGC_MEMORY_INFO
-			item = GetRealPointer(item);
-			GCAssert(IsPointerToGCPage(item));
-#endif 			
-			if (GCLargeAlloc::IsLargeBlock(item)) {
-				GCLargeAlloc::SetQueued(item);
-			} else {
-				GCAlloc::SetQueued(item);
-			}
-		}
+		static int SetMark(const void *item);
 
-		static void ClearFinalized(const void *item)
-		{
-#ifdef MMGC_MEMORY_INFO
-			GC *gc = GetGC(item);	
-			item = GetRealPointer(item);
-			GCAssert(gc->IsPointerToGCPage(item));
-#endif 			
-			if (GCLargeAlloc::IsLargeBlock(item)) {
-				GCLargeAlloc::ClearFinalized(item);
-			} else {
-				GCAlloc::ClearFinalized(item);
-			}
-		}
+		// Not a hot method
+		void ClearQueued(const void *item);
+		
+		// not a hot method
+		static void ClearFinalized(const void *item);
 
-		static void SetFinalize(const void *item)
-		{
-#ifdef MMGC_MEMORY_INFO
-			GC *gc = GetGC(item);	
-			item = GetRealPointer(item);
-			GCAssert(gc->IsPointerToGCPage(item));
-#endif 			
-			if (GCLargeAlloc::IsLargeBlock(item)) {
-				GCLargeAlloc::SetFinalize(item);
-			} else {
-				GCAlloc::SetFinalize(item);
-			}
-		}
+		// not a hot method
+		static void SetFinalize(const void *item);
 
-		static int IsFinalized(const void *item)
-		{
-#ifdef MMGC_MEMORY_INFO
-			GC *gc = GetGC(item);	
-			item = GetRealPointer(item);
-			GCAssert(gc->IsPointerToGCPage(item));
-#endif 			
-			if (GCLargeAlloc::IsLargeBlock(item)) {
-				return GCLargeAlloc::IsFinalized(item);
-			} else {
-				return GCAlloc::IsFinalized(item);
-			}
-		}
+		// not a hot method
+		static int IsFinalized(const void *item);
 
-		static int HasWeakRef(const void *item)
-		{
-#ifdef MMGC_MEMORY_INFO
-			GC *gc = GetGC(item);	
-			item = GetRealPointer(item);
-			GCAssert(gc->IsPointerToGCPage(item));
-#endif 			
-			if (GCLargeAlloc::IsLargeBlock(item)) {
-				return GCLargeAlloc::HasWeakRef(item);
-			} else {
-				return GCAlloc::HasWeakRef(item);
-			}
-		}
-
-		/**
-		 * Utility function: Returns the GC object
-		 * associated with an allocated object
-		 */
-		static GC* GetGC(const void *item)
-		{
-			GC **gc = (GC**) ((uintptr_t)item&~0xfff);
-			return *gc;
-		}
+		// not a hot method
+		static int HasWeakRef(const void *item);
 
 		/**
 		 * Used by sub-allocators to obtain memory.
 		 */
-		void* AllocBlock(int size, int pageType, bool zero=true);
+		void* AllocBlock(int size, int pageType, bool zero=true, bool canFail=false);
 
 		void FreeBlock(void *ptr, uint32_t size);
 
-		GCHeap *GetGCHeap() const { return heap; }
+		// Host API: this should go away but Player code is currently using it.  VM code should not use it.
+		GCHeap *GetGCHeap() const;
 
-		void ReapZCT() { zct.Reap(); }
-		bool Reaping() { return zct.reaping; }
+		void ReapZCT(bool scanStack=true);
+		
+		bool Reaping();
+
 #ifdef _DEBUG
+		// Test whether the RCObject cleaned itself properly by zeroing everything.
 		void RCObjectZeroCheck(RCObject *);
+
+		// Test whether 'item' points into a non-free object in the gc'd heap.
+		bool IsPointerIntoGCObject(const void* item);
 #endif
 
 		/**
-		 * debugging tool
-	     */
-		bool IsPointerToGCPage(const void *item);
-
-		/**
-		 * Do as much marking as possible in time milliseconds
+		 * Do as much marking as possible in the allotted time slice
 		 */
 		void IncrementalMark();
 
 		/**
-		 * Are we currently marking
+		 * Perform some garbage collection work: the allocation budget has been exhausted.
 		 */
-		inline bool IncrementalMarking() const { return marking; }
+		void CollectionWork();
 
 		/**
-		 * A magical write barrier that finds the container's address and the
-		 * GC, just make sure @a address is a pointer to a GC page. Only used
-		 * by WB smart pointers.
+		 * Are we currently marking?
+		 */
+		bool IncrementalMarking();
+
+		//////////////////////////////////////////////////////////////////////////
+		//
+		// Write barrier.  Those that are REALLY_INLINE are defined in WriteBarrier.h.
+
+	private:
+		/**
+		 * Perform the actual store of value into *address, adjusting reference counts.
+		 */
+		/*REALLY_INLINE*/ void WriteBarrierWriteRC(const void *address, const void *value);
+		
+		/*
+		 * Streamlined versions to be used from the ctor/dtor of containers.
+		 */
+		/*REALLY_INLINE*/ void WriteBarrierWriteRC_ctor(const void *address, const void *value);
+		/*REALLY_INLINE*/ void WriteBarrierWriteRC_dtor(const void *address);
+		
+		/**
+		 * Perform the actual store of value into *address.  (This is just a store, but there
+		 * is additional error checking in debug builds.)
+		 */
+		/*REALLY_INLINE*/ void WriteBarrierWrite(const void *address, const void *value);
+
+		/**
+		 * The marker is running and the container object has just been transitioned from
+		 * 'marked' to 'queued'.
+		 */
+		void WriteBarrierHit(const void* container);
+		
+	private:
+		/**
+		 * Implementation of privateWriteBarrier; too large to be inlined everywhere.
+		 */
+		/*REALLY_INLINE*/ void privateInlineWriteBarrier(const void *container, const void *address, const void *value);
+
+		/**
+		 * Like the preceding but computes 'container' only if 'marking' is true (important optimization).
+		 */
+		/*REALLY_INLINE*/ void privateInlineWriteBarrier(const void *address, const void *value);
+		
+		/**
+		 * Implementation of privateWriteBarrierRC; too large to be inlined everywhere.
+		 */
+		/*REALLY_INLINE*/ void privateInlineWriteBarrierRC(const void *container, const void *address, const void *value);
+
+		/**
+		 * Like the preceding but computes 'container' only if 'marking' is true (important optimization).
+		 */
+		/*REALLY_INLINE*/ void privateInlineWriteBarrierRC(const void *address, const void *value);
+		
+		/**
+		 * Out-of-line implementation of ConservativeWriteBarrierNoSubstitute, called only
+		 * when 'marking' is true.
+		 */
+		void privateConservativeWriteBarrierNoSubstitute(const void *address);
+		
+	public:
+		/**
+		 * General, conditional write barrier trap.  Tests that incremental marking is in fact ongoing
+		 * and that the container is black (marked, not queued); if so, it makes the container gray
+		 * by scheduling it for rescanning at some appropriate time.
+		 *
+		 * Container must be a non-NULL untagged pointer to the beginning of an object on a page
+		 * owned by this GC.
+		 */
+		void WriteBarrierTrap(const void *container);
+		
+		/**
+		 * Inline implementation of WriteBarrierTrap; probably too large to be inlined everywhere
+		 * so use sparingly.  AvmCore::atomWriteBarrier benefits substantially from inlining it.
+		 *
+		 * PRECONDITION: 'marking' must be true when this is called.
+		 */
+		/*REALLY_INLINE*/ void InlineWriteBarrierTrap(const void *container);
+		
+		/**
+		 * Standard write barrier write for non-RC values.  If marking is ongoing, and the 'container'
+		 * is black (ie marked and not queued) and the 'value' is white (ie unmarked and not queued) 
+		 * then make sure to queue value for marking.
+		 *
+		 * Finally stores value into *address.
+		 *
+		 * 'container' may be NULL, in which case this is just a store and 'address' can be arbitrary.
+		 *
+		 * If 'container' is not NULL then it is constrained as for WriteBarrierTrap, and 'address'
+		 * must point into the object referenced by 'container'.
+		 *
+		 * Value can be anything except a reference to an RCObject.
+		 *
+		 * This is called by the WB macro in WriteBarrier.h - not an API to be used otherwise.
+		 */
+		void privateWriteBarrier(const void *container, const void *address, const void *value);
+
+		/**
+		 * A write barrier that finds the container's address and the container's
+		 * GC and then performs a standard write barrier operation (see privateWriteBarrier).
+		 * Finally stores value into *address.
 		 */
 		static void WriteBarrier(const void *address, const void *value);
-
-		static void WriteBarrierNoSub(const void *address, const void *value);
-
-		void writeBarrier(const void *container, const void *address, const void *value)
-		{
-			GCAssert(!container || IsPointerToGCPage(container));
-			GCAssert(((uintptr_t)address & 3) == 0);
-
-			if (container) {
-				GCAssert(address >= container);
-				GCAssert(address < (char*)container + Size(container));
-				WriteBarrierNoSubstitute(container, value);
-			}
-			WriteBarrierWrite(address, value);
-		}
+		
+		/**
+		 * Standard write barrier write for RC values.  If marking is ongoing, and the 'container'
+		 * is black (ie marked and not queued) and the 'value' is white (ie unmarked and not queued) 
+		 * then make sure to queue value for marking.
+		 *
+		 * Finally stores value into *address, adjusting the reference counts of both the old value
+		 * and the new value.
+		 *
+		 * 'container' is constrained as for WriteBarrierTrap.
+		 *
+		 * 'address' must point into the object referenced by 'container'.  The value there, if not
+		 * NULL, must be a (possibly tagged) pointer to an RC object.
+		 *
+		 * 'value', if not NULL, must point to an RC object owned by this GC.
+		 * 
+		 * This is called by the WBRC macro in WriteBarrier.h - not an API to be used otherwise.
+		 */
+		void privateWriteBarrierRC(const void *container, const void *address, const void *value);
+		
+		/**
+		 * A write barrier that finds the container's address and the container's GC
+		 * and then performs a standard RC write barrier operation (see privateWriteBarrierRC).
+		 */
+		static void FASTCALL WriteBarrierRC(const void *address, const void *value);
 
 		/**
-		 * optimized version with no RC checks or pointer masking
+		 * Like WriteBarrierRC, but used when calling from a container's ctor/dtor.
+		 * We can avoid some unnecessary work in each case.
 		 */
-		void writeBarrierRC(const void *container, const void *address, const void *value);
+		static void FASTCALL WriteBarrierRC_ctor(const void *address, const void *value);
+		static void FASTCALL WriteBarrierRC_dtor(const void *address);
 
 		/**
-		 * Write barrier when the value could be a pointer with anything in the lower 3 bits
-		 * FIXME: maybe assert that the lower 3 bits are either zero or a pointer type signature,
-		 * this would require the application to tell us what bit patterns are pointers.
+		 * Host API: if 'address' points to a GC page (it can point into an object, not just
+		 * to the start of one), and 'value' points to a GC page as well, record that 'value'
+		 * has been stored into the object containing 'address'.
+		 *
+		 * The function does /not/ perform the store (this is what NoSubstitute means).
+		 *
+		 * The function works for both RCObjects and GCObjects.
 		 */
-		REALLY_INLINE void WriteBarrierNoSubstitute(const void *container, const void *value)
-		{
-			WriteBarrierTrap(container, (const void*)((uintptr_t)value&~7));
-		}
-			
+		void ConservativeWriteBarrierNoSubstitute(const void *address, const void *value);
+
 		/**
-		 * AVM+ write barrier, valuePtr is known to be pointer and the caller
-		 * does the write.
+		 * Host API: 'container' must be a non-NULL untagged pointer to the beginning of an
+		 * object on a page owned by this GC.  Record that 'value' has been stored into
+		 * 'container'.
+		 *
+		 * The function does /not/ perform the store (this is what NoSubstitute means).
+		 *
+		 * The function works for both RCObjects and GCObjects.
 		 */
-		REALLY_INLINE void WriteBarrierTrap(const void *container, const void *valuePtr)
-		{
-			GCAssert(IsPointerToGCPage(container));
-			GCAssert(((uintptr_t)valuePtr&7) == 0);
-			GCAssert(IsPointerToGCPage(container));
-			if(marking && valuePtr && GetMark(container) && IsWhite(valuePtr))
-			{
-				TrapWrite(container, valuePtr);
-			}
-		}
-
-		void ConservativeWriteBarrierNoSubstitute(const void *address, const void *value)
-		{
-			if(IsPointerToGCPage(address))
-				WriteBarrierNoSubstitute(FindBeginning(address), value);
-		}
-
-		void MemoryStatusChange(MemoryStatus from, MemoryStatus to)
-		{
-			policy.signalMemoryStatusChange(from, to);
-			pendingStatusChange = true;
-			statusFrom = from;
-			statusTo = to;
-		}
-
-		void Poke();
-
+		void WriteBarrierNoSubstitute(const void *container, const void *value);
+		
 	public:
 		GCPolicyManager policy;
 		
-	private:
-		void WriteBarrierWrite(const void *address, const void *value);
-		void WriteBarrierWriteRC(const void *address, const void *value);
-
 	public:
 
+		// not a hot method
 		bool ContainsPointers(const void *item);
 
-		void *FindBeginning(const void *gcItem)
-		{
-			GCAssert(gcItem != NULL);
-			GCAssert(GetPageMapValue((uintptr_t)gcItem) != 0);
-			void *realItem = NULL;
-			if((uintptr_t)gcItem < memStart || (uintptr_t)gcItem >= memEnd)
-				return NULL;
-			int bits = GetPageMapValue((uintptr_t)gcItem);
-			switch(bits)
-			{
-			case kGCAllocPage:
-				realItem = GCAlloc::FindBeginning(gcItem);
-				break;
-			case kGCLargeAllocPageFirst:
-				realItem = GCLargeAlloc::FindBeginning(gcItem);
-				break;
-			case kGCLargeAllocPageRest:
-				while(bits == kGCLargeAllocPageRest)
-				{
-					gcItem = (void*) ((uintptr_t)gcItem - GCHeap::kBlockSize);
-					bits = GetPageMapValue((uintptr_t)gcItem);
-				}
-				realItem = GCLargeAlloc::FindBeginning(gcItem);
-				break;
-			default:
-				return NULL;
-			}		
-#ifdef MMGC_MEMORY_INFO
-			realItem = GetUserPointer(realItem);
-#endif
-			return realItem;
-		}
+		// not a hot method.  Will reliably return NULL if gcItem does not point into managed
+		// memory (and _DEBUG code will also assert if that happens - it should not).
+		void *FindBeginningGuarded(const void *gcItem, bool allowGarbage=false);
 
+		// Legacy public API.  DO NOT USE from within AVM code.
+		void *FindBeginning(const void *gcItem);
+
+		// Used on the critical path of the write barrier path.  gcItem must point into
+		// managed memory, and NULL is never returned.  Don't use this for GCAssert and
+		// similar purposes, but use it when speed is key.
+		void *FindBeginningFast(const void *gcItem);
+		
+		// not a hot method; PinStackObjects goes directly to GCAlloc::IsRCObject/GCLargeAlloc::IsRCObject.
 		bool IsRCObject(const void *);
 
 		/**
 		 * True during Sweep phase.  Application code can use this to
 		 * determine if it's being called (directly or indirectly) from a
 		 * finalizer.
-		 *
-		 * @see IsGCRunning()
 		 */
-		bool Collecting() const
-		{
-			return collecting;
-		}
+		bool Collecting();
 
-		bool IsGCMemory (const void *);
+		/**
+		 * @return true if the item points to a page containing managed objects.
+		 * Any pointer can be passed in here.
+		 */
+		bool IsPointerToGCPage(const void *item);
 
-		bool IsQueued(const void *item);
-
-		static double duration(uint64_t start) 
-		{
-			return (double(VMPI_getPerformanceCounter() - start) * 1000) / VMPI_getPerformanceFrequency();
-		}
-
-		void DisableThreadCheck() { disableThreadCheck = true; }
-
-		/** GC initialization time, in ticks.  Used for logging. */
+		bool IsPointerToGCObject(const void *realPtr);
+		
+		/**
+		 * GC initialization time, in ticks.  Used for logging.
+		 * FIXME: why is this public?
+		 */
 		const uint64_t t0;
 
+		// FIXME: these three static methods could be lifted out of the GC class to the global level,
+		// they're simple utilities.
+		static double duration(uint64_t start);
+		
 		// a tick is the unit of VMPI_getPerformanceFrequency()
-		static uint64_t ticksToMicros(uint64_t ticks) 
-		{ 
-			return (ticks*1000000)/VMPI_getPerformanceFrequency();
-		}
+		static uint64_t ticksToMicros(uint64_t ticks);
 
-
-		static uint64_t ticksToMillis(uint64_t ticks) 
-		{ 
-			return (ticks*1000)/VMPI_getPerformanceFrequency();
-		}
+		static uint64_t ticksToMillis(uint64_t ticks);
 
 		/**
 		 * Total number of bytes of pointer-containing memory scanned by this
 		 * GC.  Used to measure marking rate, which is
 		 * <code>bytesMarked()/ticksToMillis(markTicks())</code>.
 		 */
-		uint64_t bytesMarked() { return policy.bytesMarked(); }
+		uint64_t bytesMarked();
 
 		/**
 		 * Total time spent doing incremental marking, in ticks.  See
 		 * bytesMarked.
 		 */
-		uint64_t markTicks() { return policy.timeStartIncrementalMark + policy.timeIncrementalMark; }
+		uint64_t markTicks();
 
 		// calls to mark item
 		uint32_t lastStartMarkIncrementCount;
-		uint32_t markIncrements() { return (uint32_t)policy.countIncrementalMark; }
-
-		/**
-		 * Number of calls to MarkItem().
-		 */
-		uint32_t marks() { return (uint32_t)policy.objectsMarked(); }
+		uint32_t markIncrements();
 
 		/**
 		 * Number of calls to Sweep().
@@ -1123,28 +1272,9 @@ namespace MMgc
         uint32_t sweeps;
 
 		/**
-		 * Number of calls to MarkItem() during the current (or most recent)
-		 * IncrementalMark().
-		 */
-		uint32_t numObjects;
-
-		/**
-		 * Number of bytes scanned in MarkItem() during the current (or most
-		 * recent) IncrementalMark().
-		 */
-		size_t objSize;
-
-		/**
 		 * Time of the latest FinishIncrementalMark() call, in ticks.
 		 */
 		uint64_t sweepStart;
-
-		/**
-		 * True if we emptied the work queue during the most recent
-		 * incremental mark.  This means the next mark will force the GC cycle
-		 * through to completion.
-		 */
-		bool hitZeroObjects;
 
 		// called at some apropos moment from the mututor, ideally at a point
 		// where all possible GC references will be below the current stack pointer
@@ -1153,7 +1283,7 @@ namespace MMgc
 		// a lot without impacting performance
 		void CleanStack(bool force=false);
 
-		bool Destroying() { return destroying; }
+		bool Destroying();
 
 		static GCWeakRef *GetWeakRef(const void *obj);
 		
@@ -1163,40 +1293,49 @@ namespace MMgc
 		void ClearWeakRef(const void *obj);
 
 		// legacy API that gets physical start of OS thread
+		uintptr_t GetOSStackTop() const;
+
 		uintptr_t GetStackTop() const;
 
-		// owner stack refers to the stack that created the GC		
-		uintptr_t GetOwnerStackBottom() const { return (uintptr_t)rememberedStackBottom; }
-
-		uintptr_t GetStackEnter() const 
-		{ 
-			if(stackEnter == 0)
-				return GetStackTop();
-			return stackEnter; 
-		}
-		void SetStackEnter(void *enter);
+		uintptr_t GetStackEnter() const;
 
 		// for deciding a tree of things should be scanned from presweep
-		void PushWorkItem(GCWorkItem &item) { PushWorkItem(m_incrementalWork, item); }
+		void PushWorkItem_MayFail(GCWorkItem &item);
+		bool GetMarkStackOverflow() const { return m_markStackOverflow; }
 		
-	private:
+#ifdef DEBUG
+		// Check that invariants for an inactive GC hold
+		void ShouldBeInactive();
+#endif
 
-		void *heapAllocNoProfile(size_t size, bool expand=true, bool zero=true)
-		{
-			return heapAlloc(size, expand, zero, true);
-		}
-		void heapFreeNoProfile(void *ptr, size_t siz=0)
-		{
-			heapFree(ptr, siz, true);
-		}
+	private:
 
 		// heapAlloc is like heap->Alloc except that it also calls policy.signalBlockAllocation
 		// if the allocation succeeded.
-		void *heapAlloc(size_t size, bool expand=true, bool zero=true, bool internal=false);
+		void *heapAlloc(size_t size, int flags=GCHeap::kExpand|GCHeap::kZero|GCHeap::kProfile);
 
 		// heapFree is like heap->Free except that it also calls policy.signalBlockDeallocation.
-		void heapFree(void *ptr, size_t siz=0, bool internal=false);
+		void heapFree(void *ptr, size_t siz=0, bool profile=true);
 
+		friend class GCAutoEnter;
+		friend class GCAutoEnterPause;
+		void SetStackEnter(GCAutoEnter *enter, bool doCollectionWork=true);
+
+		GCAutoEnter *GetAutoEnter();
+
+ 		vmpi_spin_lock_t m_gcLock;
+
+ 		bool onThread();
+
+		// store a handle to the thread that create the GC to ensure thread safety
+		vmpi_thread_t m_gcThread;
+
+		// Will be called from GCHeap::AbortCleanup before a longjmp that jumps past the
+		// GC (effectively aborting an operation, be it allocation or GC).  This function
+		// must be aware of the internal state of the GC and must take
+		// care to make that state consistent.
+		void SignalImminentAbort();
+		
 		void gclog(const char *format, ...);
 		void log_mem(const char *name, size_t s, size_t comp );
 
@@ -1207,37 +1346,18 @@ namespace MMgc
 
 		uint32_t *GetBits(int numBytes, int sizeClass);
 
-		void FreeBits(uint32_t *bits, int sizeClass)
-		{
-#ifdef _DEBUG
-			for(int i=0, n=noPointersAllocs[sizeClass]->m_numBitmapBytes; i<n;i++) GCAssert(((uint8_t*)bits)[i] == 0);
-#endif
-			*(uint32_t**)bits = m_bitsFreelists[sizeClass];
-			m_bitsFreelists[sizeClass] = bits;
-		}
+		void FreeBits(uint32_t *bits, int sizeClass);
 
 		uint32_t *m_bitsFreelists[kNumSizeClasses];
 		uint32_t *m_bitsNext;
 
 		GCHashtable weakRefs;
 
+		// BEGIN FLAGS
+		// The flags are hot, group them and hope they end up in the same cache line
+		
+		// True when the GC is being destroyed
 		bool destroying;
-
-		// we track the top and bottom of the stack for cleaning purposes.
-		// the top tells us how far up the stack as been dirtied.
-		// the bottom is also tracked so we can ensure we're on the same
-		// stack that the GC responsible for cleaning.  necessary if multiple
-		// threads use the GC.  only thread that creates the GC will have its stack
-		// tracked and cleaned.
-		bool stackCleaned;
-		const void *rememberedStackTop;
-		const void *rememberedStackBottom;
-		uintptr_t stackEnter;
-
-		// for external which does thread safe multi-thread AS execution
-		bool disableThreadCheck;
-
-		GCRoot* emptyWeakRefRoot;
 
 		/**
 		 * True if incremental marking is on and some objects have been marked.
@@ -1246,17 +1366,77 @@ namespace MMgc
 		 * The GC thread may read and write this flag.  Application threads in
 		 * requests have read-only access.
 		 *
-		 * Note that this is not obviously exclusive with 'collecting'.
+		 * It is possible for marking==true and collecting==false but not vice versa.
 		 */
 		bool marking;
-		GCStack<GCWorkItem> m_incrementalWork;
-		void StartIncrementalMark();
-		void FinishIncrementalMark();
-
-		int IsWhite(const void *item);
 		
+		/**
+		 * True during the sweep phase of collection.  Several things have to
+		 * behave a little differently during this phase.  For example,
+		 * GC::Free() does nothing during sweep phase; otherwise finalizers
+		 * could be called twice.
+		 *
+		 * Also, Collect() uses this to protect itself from recursive calls
+		 * (from badly behaved finalizers).
+		 *
+		 * It is possible for marking==true and collecting==false but not vice versa.
+		 */
+		bool collecting;
+		
+		// END FLAGS
+		
+		
+		// we track the top and bottom of the stack for cleaning purposes.
+		// the top tells us how far up the stack as been dirtied.
+		// the bottom is also tracked so we can ensure we're on the same
+		// stack that the GC responsible for cleaning.  necessary if multiple
+		// threads use the GC.  only thread that creates the GC will have its stack
+		// tracked and cleaned.
+		bool stackCleaned;
+		const void *rememberedStackTop;
+		GCAutoEnter* stackEnter;
+
+		GCRoot* emptyWeakRefRoot;
+
+		GCMarkStack m_incrementalWork;
+		void StartIncrementalMark();
+		void FinishIncrementalMark(bool scanStack);
+
+		bool m_markStackOverflow;
+		void HandleMarkStackOverflow();
+		void SignalMarkStackOverflow(GCWorkItem& item);
+		
+		GCMarkStack m_barrierWork;
+		void CheckBarrierWork();
+		void FlushBarrierWork();
+
+		// Set at initialization to the deepest recursion level MarkItem is allowed to
+		// reach.  Managed entirely within MarkItem.
+		uint32_t mark_item_recursion_control;
+		
+#ifdef _DEBUG
+		bool IsWhite(const void *item);
+#endif
+
+		// Used heavily by the write barrier.
+		bool IsMarkedThenMakeQueued(const void* userptr);
+
+		// Used heavily by GC::Free.
+		bool IsQueued(const void* userptr);
+
 		const static int16_t kSizeClasses[kNumSizeClasses];		
 		const static uint8_t kSizeClassIndex[246];
+
+		// These two members help optimize GC::Alloc: by keeping a pointer in the GC instance
+		// for the kSizeClassIndex table we avoid code generation SNAFUs when compiling with -fPIC,
+		// which is the default on Mac at least.  (GCC generates a call-to-next-instruction-and-pop
+		// to obtain the PC address, from which it can compute the table address.  Keeping the
+		// member here effectively hoists that computation out of the allocator.)  And by keeping
+		// a lookup table of allocators indexed by the flag bits of interest we avoid a decision
+		// tree inside GC::Alloc.
+
+		const uint8_t* const sizeClassIndex;
+		GCAlloc** allocsTable[(kRCObject|kContainsPointers)+1];
 
 		void *m_contextVars[GCV_COUNT];
 
@@ -1282,12 +1462,11 @@ namespace MMgc
 		 */
 		unsigned char *pageMap;
 
-		inline int GetPageMapValue(uintptr_t addr) const
-		{
-			return GetPageMapValueAlreadyLocked(addr);
-		}
+		// This is very hot
+		int GetPageMapValue(uintptr_t addr) const;
 
-		int GetPageMapValueAlreadyLocked(uintptr_t addr) const;
+		// This is warm - used in IsPointerToGCPage and in FindBeginningGuarded
+		int GetPageMapValueGuarded(uintptr_t addr);
 
 		/**
 		 * Set the pageMap bits for the given address.  Those bits must be
@@ -1315,88 +1494,58 @@ namespace MMgc
 		GCLargeAlloc *largeAlloc;
 		GCHeap *heap;
 
-		void* AllocBlockIncremental(int size, bool zero=true);
+#ifdef _DEBUG
+	public:
+#else
+	private:
+#endif
+		void ClearMarks();
 
-		void* AllocBlockNonIncremental(int size, bool zero=true);
+#ifdef _DEBUG
+	public:
+		/**
+		 * Kill any incremental mark in progress, then trace from roots and stack.  If
+		 * stackStart/stackSize are NULL/0 then the thread stack is obtained and used.
+		 *
+		 * It's sometimes useful for mutator to call this; the ZCT reaper uses it for
+		 * validating the heap.
+		 *
+		 * @return   true if it succeeded, false if there was a mark stack overflow.
+		 */
+		bool Trace(const void *stackStart=NULL, uint32_t stackSize=0);
+#endif
 
 	private:
-		/**
-		 * Just collect.
-		 */
-		void CollectImpl();
-
-#ifdef _DEBUG
-		public:
-#endif
-
-		void ClearMarks();
-#ifdef _DEBUG
-		private:
-#endif
-
-
-#ifdef _DEBUG
-		public:
-		// sometimes useful for mutator to call this
-		void Trace(const void *stackStart=NULL, uint32_t stackSize=0);
-		private:
-#endif
-
 		void Finalize();
-		void Sweep(bool force=false);
-		void ForceSweep() { Sweep(true); }
-		void Mark(GCStack<GCWorkItem> &work);
-		void MarkQueueAndStack(GCStack<GCWorkItem> &work);
-		void MarkItem(GCStack<GCWorkItem> &work)
-		{
-			GCWorkItem workitem = work.Pop();
-			MarkItem(workitem, work);
-		}
-		void MarkItem(GCWorkItem &workitem, GCStack<GCWorkItem> &work);
+		void Sweep();
+		void ForceSweepAtShutdown();
+		void MarkAllRoots(bool deep=false);
+		void Mark();
+		void MarkQueueAndStack(bool scanStack=true);
+		void MarkItem(GCWorkItem &wi);
 
-		/**
-		 * Write barrier slow path. Queues the white object.
-		 */
-		void TrapWrite(const void *black, const void *white);
-
-		/**
-		 * True during the sweep phase of collection.  Several things have to
-		 * behave a little differently during this phase.  For example,
-		 * GC::Free() does nothing during sweep phase; otherwise finalizers
-		 * could be called twice.
-		 *
-		 * Also, Collect() uses this to protect itself from recursive calls
-		 * (from badly behaved finalizers).
-		 */
-		bool collecting;
- 
+	public:
+		// Sweep all small-block pages that need sweeping
+		void SweepNeedsSweeping();
+		
+	private:
 		bool finalizedValue;
 
-		void AddToSmallEmptyBlockList(GCAlloc::GCBlock *b)
-		{
-			b->next = smallEmptyPageList;
-			smallEmptyPageList = b;
-		}
+		void AddToSmallEmptyBlockList(GCAlloc::GCBlock *b);
 
 		/**
 		 * List of pages to be swept, built up in Finalize.
 		 */
 		GCAlloc::GCBlock *smallEmptyPageList;
 		
-		void AddToLargeEmptyBlockList(GCLargeAlloc::LargeBlock *lb)
-		{
-			lb->next = largeEmptyPageList;
-			largeEmptyPageList = lb;
-		}
+		void AddToLargeEmptyBlockList(GCLargeAlloc::LargeBlock *lb);
 
 		/**
 		 * List of pages to be swept, built up in Finalize.
 		 */
 		GCLargeAlloc::LargeBlock *largeEmptyPageList;
 		
-#ifdef MMGC_LOCKING
 		vmpi_spin_lock_t m_rootListLock;
-#endif
 
 		GCRoot *m_roots;
 		void AddRoot(GCRoot *root);
@@ -1411,40 +1560,55 @@ namespace MMgc
 
 		// Deferred ref counting implementation
 		ZCT zct;
-		void AddToZCT(RCObject *obj) { zct.Add(obj); }
-		// public for one hack from Interval.cpp - no one else should call
-		// this out of the GC
-public:
-		void RemoveFromZCT(RCObject *obj) { zct.Remove(obj); }
-private:
+#ifdef MMGC_REFCOUNT_PROFILING
+		void AddToZCT(RCObject *obj, bool initial=false);
+#else
+		void AddToZCT(RCObject *obj);
+#endif
 
-		static const void *Pointer(const void *p) { return (const void*)(((uintptr_t)p)&~7); }
+		// Public for one hack from splay.cpp - no one else should call
+		// this out of the GC.  (The usage pattern in that file could be
+		// abstracted into a better API function here, probably.)
+public:
+#ifdef MMGC_REFCOUNT_PROFILING
+		REALLY_INLINE void RemoveFromZCT(RCObject *obj, bool final=false);
+#else
+		REALLY_INLINE void RemoveFromZCT(RCObject *obj);
+#endif
+
+		static const void *Pointer(const void *p);
 
 public:
 		void DumpMemoryInfo();
+#ifdef MMGC_MEMORY_PROFILER
+		void DumpPauseInfo();
+#endif
+		
 private:
 
-		void CheckThread();
+		// PushWorkItem is defined in GC.cpp, always inlined in callers there.
+		// item.ptr must not be NULL.
+		void PushWorkItem(GCWorkItem item);
 
-		void PushWorkItem(GCStack<GCWorkItem> &stack, GCWorkItem item);
-
-#ifdef _DEBUG		
-		void CheckFreelist(GCAlloc *gca);
+#ifdef _DEBUG
+		/**
+		 * Check the consistency of the free lists for all the allocators.
+		 */
 		void CheckFreelists();
 
-
-		int m_gcLastStackTrace;
-
 		/**
-		 * Used by FindUnmarkedPointers.
-		 */
-		void UnmarkedScan(const void *mem, size_t size);
-
-		/**
-		 * Find unmarked pointers in the entire heap.
+		 * Conservatively find pointers in the entire heap referencing unmarked objects, 
+		 * triggering assertions when one is found.  This is a sanity check on the GC
+		 * marking algorithm.
 		 */
 		void FindUnmarkedPointers();
 
+		/**
+		 * Conservatively find pointers in an address range referencing unmarked objects, 
+		 * triggering assertions when one is found.
+		 */
+		void UnmarkedScan(const void *mem, size_t size);
+		
 		// methods for incremental verification
 
 		/**
@@ -1458,23 +1622,11 @@ private:
 		 * it has no pointers to white objects.
 		 */
 		void FindMissingWriteBarriers();
-#ifdef WIN32
-		// store a handle to the thread that create the GC to ensure thread safety
-		DWORD m_gcThread;
-#endif
+
 #endif
 
 public:
-#ifdef MMGC_MEMORY_INFO
-		typedef void (*pDumpBackCallbackProc)(void* pContext, void *obj, const char *type );
-		void DumpBackPointerChain(void *o, pDumpBackCallbackProc p = NULL, void *context = NULL);
 
-		// debugging routine that records who marked who, can be used to
-		// answer the question, how did I get marked?  also could be used to
-		// find false positives by verifying the back pointer chain gets back
-		// to a GC root
-		static void WriteBackPointer(const void *item, const void *container, size_t itemSize);
-#endif
 #ifdef _DEBUG
 		// Dump a list of objects that have pointers to the given location.
 		void WhosPointingAtMe(void* me, int recurseDepth=0, int currentDepth=0);
@@ -1485,12 +1637,20 @@ public:
     	void ProbeForMatch(const void *mem, size_t size, uintptr_t value, int recurseDepth, int currentDepth);
 #endif
 
-		int DumpAlloc(GCAlloc*);
+		void DumpAlloc(GCAlloc *a, size_t& internal_waste, size_t& overhead);
+		
+		//This method returns the number bytes allocated for GC objects
 		size_t GetBytesInUse();
-		size_t GetNumBlocks() { return (size_t)policy.blocksOwnedByGC(); }
+		
+		//This method is for more fine grained allocation details
+		//It reports the total number of bytes requested (i.e. ask size) and
+		//the number of bytes actually allocated.  The latter is the same
+		//number as reported by GetBytesInUse()
+		void GetUsageInfo(size_t& totalAskSize, size_t& totalAllocated);
 
-		bool pendingStatusChange;
-		MemoryStatus statusFrom, statusTo;		
+		size_t GetNumBlocks();
+
+		virtual void memoryStatusChange(MemoryStatus oldStatus, MemoryStatus newStatus);
 
 		/* A portable replacement for alloca().
 		 *
@@ -1528,6 +1688,7 @@ public:
 		
 		void allocaInit();
 		void allocaShutdown();
+		void allocaUnwind();			// restore to initial state
 		void allocaPopToSlow(void* top);
 		void* allocaPushSlow(size_t nbytes);
 		void pushAllocaSegment(size_t nbytes);
@@ -1546,68 +1707,96 @@ public:
 		{
 			friend class GC;
 		public:
-			AllocaAutoPtr() : gc(NULL), unwindPtr(NULL) {}  // initialization of 'gc' to pacify gcc
-			~AllocaAutoPtr() { if (unwindPtr) gc->allocaPopTo(unwindPtr); }
+			AllocaAutoPtr();
+			~AllocaAutoPtr();
 		private:
 			GC* gc;
 			void* unwindPtr;
 		};
 				
-		inline void* allocaTop() 
-		{
-			return stacktop;
-		}
+		void* allocaTop();
 		
-		inline void allocaPopTo(void* top)
-		{ 
-			if (top >= top_segment->start && top <= top_segment->limit)
-				stacktop = top;
-			else
-				allocaPopToSlow(top);
-		}
+		void allocaPopTo(void* top);
 	
-		inline void* allocaPush(size_t nbytes, AllocaAutoPtr& x) 
-		{
-			GCAssert(x.unwindPtr == NULL);
-			x.gc = this;
-			x.unwindPtr = stacktop;
-			nbytes = (nbytes + 7) & ~7;
-			if ((char*)stacktop + nbytes <= top_segment->limit) {
-				stacktop = (char*)stacktop + nbytes;
-				return x.unwindPtr;
-			}
-			return allocaPushSlow(nbytes);
-		}
+		void* allocaPush(size_t nbytes, AllocaAutoPtr& x);
+
+#ifdef DEBUGGER
+ 	public:
+		// Attach an opaque sampler to this GC, overriding any previous sampler
+ 		void* GetAttachedSampler();
+		
+		// Retrieve the opaque sampler from this GC, NULL if none has been attached
+ 		void SetAttachedSampler(void *sampler);
+ 		
+ 	private:
+		// An attached sampler, or NULL.  We need to attach the sampler to the GC
+		// because it moves with the GC/AvmCore pair, it is not attached to a
+		// particular thread.
+ 		void* m_sampler;
+#endif
+
+#ifdef MMGC_HEAP_GRAPH			
+
+	public:
+
+		void addToBlacklist(const void *gcptr);
+		void removeFromBlacklist(const void *gcptr);
+
+	private:
+
+		GCHashtable blacklist;
+
+		void printBlacklist();
+		void pruneBlacklist();
+		
+		const void *findGCGraphBeginning(const void *addr, bool &wasDeletedGCRoot);
+		void dumpBackPointerChain(const void *obj, HeapGraph &g);
+		void dumpBackPointerChainHelper(const void *p, HeapGraph& g);
+		HeapGraph mutatorGraph;		
+		HeapGraph markerGraph;
+#endif
 	};
 
 	// helper class to wipe out vtable pointer of members for DRC
 	class Cleaner
 	{
 	public:
-		Cleaner() {}
+		Cleaner();
+		~Cleaner();
 		// don't let myself move between objects
-		Cleaner& operator=(const Cleaner& /*rhs*/) { return *this; }
-		void set(const void * _v, size_t _size) { this->v = (int*)_v; this->size = _size; }
-		~Cleaner() { 
-			if(v) 
-				VMPI_memset(v, 0, size);
-			v = 0; 
-			size = 0;
-		}
+		Cleaner& operator=(const Cleaner& /*rhs*/);
+		void set(const void * _v, size_t _size);
+
 		int *v;
 		size_t size;
 	};
 
-	inline GCWorkItem::GCWorkItem(const void *p, uint32_t s, bool isGCItem)
-		: ptr(p)
-		, _size(s | uint32_t(isGCItem))
+	/**
+	 * Stack object that takes care of many things including defining stack
+	 * boundaries, doing low stack queued collections/ZCT reaps and stack cleaning
+	 */
+	class GCAutoEnter
 	{
-#ifdef _DEBUG
-		if (IsGCItem()) {
-			GCAssert(GC::GetGC(p)->FindBeginning(p) == p);
-		}
-#endif
-	}
+	public:
+		GCAutoEnter(GC *gc);
+		~GCAutoEnter();
+		void Destroy() { gc = NULL; }
+	private:
+		GC* gc;
+	};
+
+	/**
+	 * Undoes the affects of GCAutoEnter on entry and reapplies them upon exit
+	 */
+	class GCAutoEnterPause
+	{
+	public:
+		GCAutoEnterPause(GC *gc);
+		~GCAutoEnterPause();
+	private:
+		GC* gc;
+		GCAutoEnter *enterSave;
+	};
 }
 
 #endif /* __GC__ */

@@ -49,15 +49,25 @@ class RunTests (RunTestLib):
         r.compile("testdata/readline.as")
         r.compile("testdata/trace1.as")
         r.compile("testdata/write.as")
+        r.compile("testdata/argv.as")
         # for testAvmShell.py
         r.compile("testdata/sleep.as")
         # for testDebuggerShell.py
         r.compile("testdata/debug.as",None,"-d")
+        # for testMemstats.py
+        r.compile("testdata/memstats.as",None)
+        # for testLanguage.py
+        r.compile("testdata/rt_error.as",None)
 
     def runAll(self):
         list=os.listdir(".")
         for f in list:
             if re.match("test.*\.py$",f):
+                if self.testconfig.has_key(f):
+                    (type,notes)=self.testconfig[f]
+                    if type=='skip':
+                        print "%-30s SKIPPED, %s" % (f,notes)
+                        continue
                 cl=f[0:f.rindex('.')]
                 exec "import " + cl
                 print "%s.run()" % cl
